@@ -137,8 +137,8 @@
   [prefix-len ip-u32]
   (let [buf (ByteBuffer/allocate 8)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.putInt buf prefix-len)
-    (.putInt buf ip-u32)
+    (.putInt buf (unchecked-int prefix-len))
+    (.putInt buf (unchecked-int ip-u32))
     (.array buf)))
 
 (defn decode-lpm-key
@@ -147,7 +147,7 @@
   (let [buf (ByteBuffer/wrap b)]
     (.order buf ByteOrder/BIG_ENDIAN)
     {:prefix-len (.getInt buf)
-     :ip (.getInt buf)}))
+     :ip (Integer/toUnsignedLong (.getInt buf))}))
 
 (defn encode-listen-key
   "Encode listen map key: {ifindex (4 bytes) + port (2 bytes) + padding (2 bytes)}.
@@ -155,8 +155,8 @@
   [ifindex port]
   (let [buf (ByteBuffer/allocate 8)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.putInt buf ifindex)
-    (.putShort buf (short port))
+    (.putInt buf (unchecked-int ifindex))
+    (.putShort buf (unchecked-short port))
     (.putShort buf (short 0))  ; padding
     (.array buf)))
 
@@ -174,9 +174,9 @@
   [target-ip target-port flags]
   (let [buf (ByteBuffer/allocate 8)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.putInt buf target-ip)
-    (.putShort buf (short target-port))
-    (.putShort buf (short flags))
+    (.putInt buf (unchecked-int target-ip))
+    (.putShort buf (unchecked-short target-port))
+    (.putShort buf (unchecked-short flags))
     (.array buf)))
 
 (defn decode-route-value
@@ -184,7 +184,7 @@
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    {:target-ip (.getInt buf)
+    {:target-ip (Integer/toUnsignedLong (.getInt buf))
      :target-port (bit-and (.getShort buf) 0xFFFF)
      :flags (bit-and (.getShort buf) 0xFFFF)}))
 
@@ -195,11 +195,11 @@
   [{:keys [src-ip dst-ip src-port dst-port protocol]}]
   (let [buf (ByteBuffer/allocate 16)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.putInt buf src-ip)
-    (.putInt buf dst-ip)
-    (.putShort buf (short src-port))
-    (.putShort buf (short dst-port))
-    (.put buf (byte protocol))
+    (.putInt buf (unchecked-int src-ip))
+    (.putInt buf (unchecked-int dst-ip))
+    (.putShort buf (unchecked-short src-port))
+    (.putShort buf (unchecked-short dst-port))
+    (.put buf (unchecked-byte protocol))
     (.put buf (byte 0))  ; padding
     (.putShort buf (short 0))  ; padding
     (.array buf)))
@@ -209,26 +209,26 @@
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    {:src-ip (.getInt buf)
-     :dst-ip (.getInt buf)
+    {:src-ip (Integer/toUnsignedLong (.getInt buf))
+     :dst-ip (Integer/toUnsignedLong (.getInt buf))
      :src-port (bit-and (.getShort buf) 0xFFFF)
      :dst-port (bit-and (.getShort buf) 0xFFFF)
      :protocol (bit-and (.get buf) 0xFF)}))
 
 (defn encode-conntrack-value
   "Encode connection tracking value.
-   {orig_dst_ip (4) + orig_dst_port (2) + nat_dst_ip (4) + nat_dst_port (2) +
+   {orig_dst_ip (4) + orig_dst_port (2) + padding (2) + nat_dst_ip (4) + nat_dst_port (2) + padding (2) +
     last_seen (8) + packets_fwd (8) + bytes_fwd (8) + packets_rev (8) + bytes_rev (8)}
    Total: 56 bytes."
   [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
            last-seen packets-fwd bytes-fwd packets-rev bytes-rev]}]
   (let [buf (ByteBuffer/allocate 56)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.putInt buf (or orig-dst-ip 0))
-    (.putShort buf (short (or orig-dst-port 0)))
+    (.putInt buf (unchecked-int (or orig-dst-ip 0)))
+    (.putShort buf (unchecked-short (or orig-dst-port 0)))
     (.putShort buf (short 0))  ; padding
-    (.putInt buf (or nat-dst-ip 0))
-    (.putShort buf (short (or nat-dst-port 0)))
+    (.putInt buf (unchecked-int (or nat-dst-ip 0)))
+    (.putShort buf (unchecked-short (or nat-dst-port 0)))
     (.putShort buf (short 0))  ; padding
     (.putLong buf (or last-seen 0))
     (.putLong buf (or packets-fwd 0))
@@ -242,27 +242,10 @@
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    {:orig-dst-ip (.getInt buf)
-     :orig-dst-port (do (.getShort buf) ; skip padding after reading
-                        (bit-and (- (.position buf) 2) 0xFFFF))
-     :nat-dst-ip (do (.position buf 8) (.getInt buf))
-     :nat-dst-port (bit-and (.getShort buf) 0xFFFF)
-     :last-seen (do (.getShort buf) (.getLong buf))  ; skip padding
-     :packets-fwd (.getLong buf)
-     :bytes-fwd (.getLong buf)
-     :packets-rev (.getLong buf)
-     :bytes-rev (.getLong buf)}))
-
-;; Simpler version of decode-conntrack-value
-(defn decode-conntrack-value
-  "Decode connection tracking value from byte array."
-  [^bytes b]
-  (let [buf (ByteBuffer/wrap b)]
-    (.order buf ByteOrder/BIG_ENDIAN)
-    (let [orig-dst-ip (.getInt buf)
+    (let [orig-dst-ip (Integer/toUnsignedLong (.getInt buf))
           orig-dst-port (bit-and (.getShort buf) 0xFFFF)
           _ (.getShort buf)  ; padding
-          nat-dst-ip (.getInt buf)
+          nat-dst-ip (Integer/toUnsignedLong (.getInt buf))
           nat-dst-port (bit-and (.getShort buf) 0xFFFF)
           _ (.getShort buf)  ; padding
           last-seen (.getLong buf)
@@ -295,16 +278,16 @@
                      :periodic-stats 3
                      0)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.put buf (byte event-code))
+    (.put buf (unchecked-byte event-code))
     (.put buf (byte 0))
     (.putShort buf (short 0))  ; padding
     (.putLong buf (or timestamp 0))
-    (.putInt buf (or src-ip 0))
-    (.putInt buf (or dst-ip 0))
-    (.putShort buf (short (or src-port 0)))
-    (.putShort buf (short (or dst-port 0)))
-    (.putInt buf (or target-ip 0))
-    (.putShort buf (short (or target-port 0)))
+    (.putInt buf (unchecked-int (or src-ip 0)))
+    (.putInt buf (unchecked-int (or dst-ip 0)))
+    (.putShort buf (unchecked-short (or src-port 0)))
+    (.putShort buf (unchecked-short (or dst-port 0)))
+    (.putInt buf (unchecked-int (or target-ip 0)))
+    (.putShort buf (unchecked-short (or target-port 0)))
     (.putShort buf (short 0))  ; padding
     (.putLong buf (or packets-fwd 0))
     (.putLong buf (or bytes-fwd 0))
@@ -321,11 +304,11 @@
           _ (.get buf)  ; padding
           _ (.getShort buf)  ; padding
           timestamp (.getLong buf)
-          src-ip (.getInt buf)
-          dst-ip (.getInt buf)
+          src-ip (Integer/toUnsignedLong (.getInt buf))
+          dst-ip (Integer/toUnsignedLong (.getInt buf))
           src-port (bit-and (.getShort buf) 0xFFFF)
           dst-port (bit-and (.getShort buf) 0xFFFF)
-          target-ip (.getInt buf)
+          target-ip (Integer/toUnsignedLong (.getInt buf))
           target-port (bit-and (.getShort buf) 0xFFFF)
           _ (.getShort buf)  ; padding
           packets-fwd (.getLong buf)

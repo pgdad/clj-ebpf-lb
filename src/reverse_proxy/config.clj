@@ -156,13 +156,6 @@
     (catch java.io.FileNotFoundException _
       (throw (ex-info "Configuration file not found" {:path path})))))
 
-(defn save-config-file
-  "Save configuration to an EDN file."
-  [config path]
-  (log/info "Saving configuration to:" path)
-  (let [config-map (config->map config)]
-    (spit path (pr-str config-map))))
-
 (defn config->map
   "Convert parsed Config back to plain EDN map."
   [^Config config]
@@ -184,6 +177,13 @@
    {:stats-enabled (get-in config [:settings :stats-enabled])
     :connection-timeout-sec (get-in config [:settings :connection-timeout-sec])
     :max-connections (get-in config [:settings :max-connections])}})
+
+(defn save-config-file
+  "Save configuration to an EDN file."
+  [config path]
+  (log/info "Saving configuration to:" path)
+  (let [config-map (config->map config)]
+    (spit path (pr-str config-map))))
 
 ;;; =============================================================================
 ;;; Default Configuration
