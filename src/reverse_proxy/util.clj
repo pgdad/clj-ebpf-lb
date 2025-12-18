@@ -1,0 +1,403 @@
+(ns reverse-proxy.util
+  "Utility functions for IP address conversion, CIDR parsing, and binary encoding."
+  (:require [clojure.string :as str])
+  (:import [java.nio ByteBuffer ByteOrder]
+           [java.net InetAddress UnknownHostException]))
+
+;;; =============================================================================
+;;; IP Address Conversion
+;;; =============================================================================
+
+(defn ip-string->u32
+  "Convert dotted-decimal IP string to network byte order u32.
+   Example: \"192.168.1.1\" => 0xC0A80101 (3232235777)"
+  [ip-str]
+  (let [octets (str/split ip-str #"\.")
+        _ (when (not= 4 (count octets))
+            (throw (ex-info "Invalid IP address format" {:ip ip-str})))
+        bytes (mapv #(let [n (Integer/parseInt %)]
+                       (when (or (< n 0) (> n 255))
+                         (throw (ex-info "Invalid IP octet" {:ip ip-str :octet %})))
+                       n)
+                    octets)]
+    (bit-or (bit-shift-left (nth bytes 0) 24)
+            (bit-shift-left (nth bytes 1) 16)
+            (bit-shift-left (nth bytes 2) 8)
+            (nth bytes 3))))
+
+(defn u32->ip-string
+  "Convert network byte order u32 to dotted-decimal IP string.
+   Example: 0xC0A80101 => \"192.168.1.1\""
+  [n]
+  (format "%d.%d.%d.%d"
+          (bit-and (unsigned-bit-shift-right n 24) 0xFF)
+          (bit-and (unsigned-bit-shift-right n 16) 0xFF)
+          (bit-and (unsigned-bit-shift-right n 8) 0xFF)
+          (bit-and n 0xFF)))
+
+(defn ip->bytes
+  "Convert IP u32 to byte array (4 bytes, big-endian)."
+  [ip-u32]
+  (let [buf (ByteBuffer/allocate 4)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf ip-u32)
+    (.array buf)))
+
+(defn bytes->ip
+  "Convert 4-byte array to IP u32."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.getInt buf)))
+
+;;; =============================================================================
+;;; CIDR Parsing
+;;; =============================================================================
+
+(defn parse-cidr
+  "Parse CIDR notation string to {:ip <u32> :prefix-len <int>}.
+   Supports both CIDR (e.g., \"192.168.1.0/24\") and single IP (e.g., \"192.168.1.1\").
+   Single IPs are treated as /32."
+  [cidr-str]
+  (if (str/includes? cidr-str "/")
+    (let [[ip-part prefix-part] (str/split cidr-str #"/")
+          prefix-len (Integer/parseInt prefix-part)]
+      (when (or (< prefix-len 0) (> prefix-len 32))
+        (throw (ex-info "Invalid prefix length" {:cidr cidr-str :prefix prefix-len})))
+      {:ip (ip-string->u32 ip-part)
+       :prefix-len prefix-len})
+    {:ip (ip-string->u32 cidr-str)
+     :prefix-len 32}))
+
+(defn cidr->string
+  "Convert {:ip <u32> :prefix-len <int>} back to CIDR string."
+  [{:keys [ip prefix-len]}]
+  (str (u32->ip-string ip) "/" prefix-len))
+
+(defn ip-in-cidr?
+  "Check if an IP address (u32) falls within a CIDR range."
+  [ip-u32 {:keys [ip prefix-len]}]
+  (if (= prefix-len 0)
+    true  ; /0 matches everything
+    (let [mask (bit-shift-left 0xFFFFFFFF (- 32 prefix-len))]
+      (= (bit-and ip-u32 mask)
+         (bit-and ip mask)))))
+
+;;; =============================================================================
+;;; Hostname Resolution
+;;; =============================================================================
+
+(defn resolve-hostname
+  "Resolve hostname to IP address (u32).
+   Returns nil if resolution fails."
+  [hostname]
+  (try
+    (-> (InetAddress/getByName hostname)
+        (.getAddress)
+        (bytes->ip))
+    (catch UnknownHostException _
+      nil)))
+
+(defn resolve-to-ip
+  "Resolve a source specification to IP.
+   Accepts: IP string, CIDR string, or hostname.
+   Returns {:ip <u32> :prefix-len <int>} or nil on failure."
+  [source-spec]
+  (cond
+    ;; Already looks like IP or CIDR
+    (re-matches #"\d+\.\d+\.\d+\.\d+(/\d+)?" source-spec)
+    (parse-cidr source-spec)
+
+    ;; Try hostname resolution
+    :else
+    (when-let [ip (resolve-hostname source-spec)]
+      {:ip ip :prefix-len 32})))
+
+;;; =============================================================================
+;;; Port Utilities
+;;; =============================================================================
+
+(defn port-valid?
+  "Check if port number is valid (1-65535)."
+  [port]
+  (and (integer? port) (>= port 1) (<= port 65535)))
+
+(defn port->u16
+  "Convert port to unsigned 16-bit value."
+  [port]
+  (bit-and port 0xFFFF))
+
+;;; =============================================================================
+;;; Binary Encoding for eBPF Maps
+;;; =============================================================================
+
+(defn encode-lpm-key
+  "Encode LPM trie key: {prefix_len (4 bytes) + ip (4 bytes)}.
+   Total: 8 bytes."
+  [prefix-len ip-u32]
+  (let [buf (ByteBuffer/allocate 8)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf prefix-len)
+    (.putInt buf ip-u32)
+    (.array buf)))
+
+(defn decode-lpm-key
+  "Decode LPM trie key from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    {:prefix-len (.getInt buf)
+     :ip (.getInt buf)}))
+
+(defn encode-listen-key
+  "Encode listen map key: {ifindex (4 bytes) + port (2 bytes) + padding (2 bytes)}.
+   Total: 8 bytes (aligned)."
+  [ifindex port]
+  (let [buf (ByteBuffer/allocate 8)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf ifindex)
+    (.putShort buf (short port))
+    (.putShort buf (short 0))  ; padding
+    (.array buf)))
+
+(defn decode-listen-key
+  "Decode listen map key from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    {:ifindex (.getInt buf)
+     :port (bit-and (.getShort buf) 0xFFFF)}))
+
+(defn encode-route-value
+  "Encode route value: {target_ip (4 bytes) + target_port (2 bytes) + flags (2 bytes)}.
+   Total: 8 bytes."
+  [target-ip target-port flags]
+  (let [buf (ByteBuffer/allocate 8)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf target-ip)
+    (.putShort buf (short target-port))
+    (.putShort buf (short flags))
+    (.array buf)))
+
+(defn decode-route-value
+  "Decode route value from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    {:target-ip (.getInt buf)
+     :target-port (bit-and (.getShort buf) 0xFFFF)
+     :flags (bit-and (.getShort buf) 0xFFFF)}))
+
+(defn encode-conntrack-key
+  "Encode connection tracking 5-tuple key.
+   {src_ip (4) + dst_ip (4) + src_port (2) + dst_port (2) + protocol (1) + padding (3)}
+   Total: 16 bytes (aligned)."
+  [{:keys [src-ip dst-ip src-port dst-port protocol]}]
+  (let [buf (ByteBuffer/allocate 16)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf src-ip)
+    (.putInt buf dst-ip)
+    (.putShort buf (short src-port))
+    (.putShort buf (short dst-port))
+    (.put buf (byte protocol))
+    (.put buf (byte 0))  ; padding
+    (.putShort buf (short 0))  ; padding
+    (.array buf)))
+
+(defn decode-conntrack-key
+  "Decode connection tracking key from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    {:src-ip (.getInt buf)
+     :dst-ip (.getInt buf)
+     :src-port (bit-and (.getShort buf) 0xFFFF)
+     :dst-port (bit-and (.getShort buf) 0xFFFF)
+     :protocol (bit-and (.get buf) 0xFF)}))
+
+(defn encode-conntrack-value
+  "Encode connection tracking value.
+   {orig_dst_ip (4) + orig_dst_port (2) + nat_dst_ip (4) + nat_dst_port (2) +
+    last_seen (8) + packets_fwd (8) + bytes_fwd (8) + packets_rev (8) + bytes_rev (8)}
+   Total: 56 bytes."
+  [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
+           last-seen packets-fwd bytes-fwd packets-rev bytes-rev]}]
+  (let [buf (ByteBuffer/allocate 56)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf (or orig-dst-ip 0))
+    (.putShort buf (short (or orig-dst-port 0)))
+    (.putShort buf (short 0))  ; padding
+    (.putInt buf (or nat-dst-ip 0))
+    (.putShort buf (short (or nat-dst-port 0)))
+    (.putShort buf (short 0))  ; padding
+    (.putLong buf (or last-seen 0))
+    (.putLong buf (or packets-fwd 0))
+    (.putLong buf (or bytes-fwd 0))
+    (.putLong buf (or packets-rev 0))
+    (.putLong buf (or bytes-rev 0))
+    (.array buf)))
+
+(defn decode-conntrack-value
+  "Decode connection tracking value from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    {:orig-dst-ip (.getInt buf)
+     :orig-dst-port (do (.getShort buf) ; skip padding after reading
+                        (bit-and (- (.position buf) 2) 0xFFFF))
+     :nat-dst-ip (do (.position buf 8) (.getInt buf))
+     :nat-dst-port (bit-and (.getShort buf) 0xFFFF)
+     :last-seen (do (.getShort buf) (.getLong buf))  ; skip padding
+     :packets-fwd (.getLong buf)
+     :bytes-fwd (.getLong buf)
+     :packets-rev (.getLong buf)
+     :bytes-rev (.getLong buf)}))
+
+;; Simpler version of decode-conntrack-value
+(defn decode-conntrack-value
+  "Decode connection tracking value from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (let [orig-dst-ip (.getInt buf)
+          orig-dst-port (bit-and (.getShort buf) 0xFFFF)
+          _ (.getShort buf)  ; padding
+          nat-dst-ip (.getInt buf)
+          nat-dst-port (bit-and (.getShort buf) 0xFFFF)
+          _ (.getShort buf)  ; padding
+          last-seen (.getLong buf)
+          packets-fwd (.getLong buf)
+          bytes-fwd (.getLong buf)
+          packets-rev (.getLong buf)
+          bytes-rev (.getLong buf)]
+      {:orig-dst-ip orig-dst-ip
+       :orig-dst-port orig-dst-port
+       :nat-dst-ip nat-dst-ip
+       :nat-dst-port nat-dst-port
+       :last-seen last-seen
+       :packets-fwd packets-fwd
+       :bytes-fwd bytes-fwd
+       :packets-rev packets-rev
+       :bytes-rev bytes-rev})))
+
+(defn encode-stats-event
+  "Encode a stats event for ring buffer.
+   {event_type (1) + padding (3) + timestamp (8) + src_ip (4) + dst_ip (4) +
+    src_port (2) + dst_port (2) + target_ip (4) + target_port (2) + padding (2) +
+    packets_fwd (8) + bytes_fwd (8) + packets_rev (8) + bytes_rev (8)}
+   Total: 64 bytes."
+  [{:keys [event-type timestamp src-ip dst-ip src-port dst-port
+           target-ip target-port packets-fwd bytes-fwd packets-rev bytes-rev]}]
+  (let [buf (ByteBuffer/allocate 64)
+        event-code (case event-type
+                     :new-conn 1
+                     :conn-closed 2
+                     :periodic-stats 3
+                     0)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.put buf (byte event-code))
+    (.put buf (byte 0))
+    (.putShort buf (short 0))  ; padding
+    (.putLong buf (or timestamp 0))
+    (.putInt buf (or src-ip 0))
+    (.putInt buf (or dst-ip 0))
+    (.putShort buf (short (or src-port 0)))
+    (.putShort buf (short (or dst-port 0)))
+    (.putInt buf (or target-ip 0))
+    (.putShort buf (short (or target-port 0)))
+    (.putShort buf (short 0))  ; padding
+    (.putLong buf (or packets-fwd 0))
+    (.putLong buf (or bytes-fwd 0))
+    (.putLong buf (or packets-rev 0))
+    (.putLong buf (or bytes-rev 0))
+    (.array buf)))
+
+(defn decode-stats-event
+  "Decode stats event from ring buffer."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (let [event-code (bit-and (.get buf) 0xFF)
+          _ (.get buf)  ; padding
+          _ (.getShort buf)  ; padding
+          timestamp (.getLong buf)
+          src-ip (.getInt buf)
+          dst-ip (.getInt buf)
+          src-port (bit-and (.getShort buf) 0xFFFF)
+          dst-port (bit-and (.getShort buf) 0xFFFF)
+          target-ip (.getInt buf)
+          target-port (bit-and (.getShort buf) 0xFFFF)
+          _ (.getShort buf)  ; padding
+          packets-fwd (.getLong buf)
+          bytes-fwd (.getLong buf)
+          packets-rev (.getLong buf)
+          bytes-rev (.getLong buf)]
+      {:event-type (case event-code
+                     1 :new-conn
+                     2 :conn-closed
+                     3 :periodic-stats
+                     :unknown)
+       :timestamp timestamp
+       :src-ip src-ip
+       :dst-ip dst-ip
+       :src-port src-port
+       :dst-port dst-port
+       :target-ip target-ip
+       :target-port target-port
+       :packets-fwd packets-fwd
+       :bytes-fwd bytes-fwd
+       :packets-rev packets-rev
+       :bytes-rev bytes-rev})))
+
+;;; =============================================================================
+;;; Network Interface Utilities
+;;; =============================================================================
+
+(defn get-interface-index
+  "Get interface index by name using /sys/class/net.
+   Returns nil if interface not found."
+  [iface-name]
+  (try
+    (let [path (str "/sys/class/net/" iface-name "/ifindex")]
+      (Integer/parseInt (str/trim (slurp path))))
+    (catch Exception _
+      nil)))
+
+(defn list-interfaces
+  "List all network interface names."
+  []
+  (try
+    (let [net-dir (java.io.File. "/sys/class/net")]
+      (when (.isDirectory net-dir)
+        (vec (.list net-dir))))
+    (catch Exception _
+      [])))
+
+;;; =============================================================================
+;;; Protocol Constants
+;;; =============================================================================
+
+(def ETH-P-IP 0x0800)
+(def ETH-P-IPV6 0x86DD)
+(def ETH-P-ARP 0x0806)
+
+(def IPPROTO-ICMP 1)
+(def IPPROTO-TCP 6)
+(def IPPROTO-UDP 17)
+
+(def ETH-HLEN 14)
+(def IP-HLEN-MIN 20)
+(def TCP-HLEN-MIN 20)
+(def UDP-HLEN 8)
+
+;; XDP return codes
+(def XDP-ABORTED 0)
+(def XDP-DROP 1)
+(def XDP-PASS 2)
+(def XDP-TX 3)
+(def XDP-REDIRECT 4)
+
+;; TC return codes
+(def TC-ACT-OK 0)
+(def TC-ACT-SHOT 2)
+(def TC-ACT-REDIRECT 7)

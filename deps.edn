@@ -1,0 +1,32 @@
+{:paths ["src" "resources"]
+
+ :deps
+ {org.clojure/clojure {:mvn/version "1.12.0"}
+  org.clojars.pgdad/clj-ebpf {:mvn/version "0.2.2"}
+  org.clojure/core.async {:mvn/version "1.6.681"}
+  org.clojure/tools.cli {:mvn/version "1.1.230"}
+  org.clojure/tools.logging {:mvn/version "1.3.0"}
+  ch.qos.logback/logback-classic {:mvn/version "1.5.6"}}
+
+ :aliases
+ {:dev
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1"
+                                                       :git/sha "dfb30dd"}}}
+
+  :test
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1"
+                                                       :git/sha "dfb30dd"}}
+   :main-opts ["-m" "cognitect.test-runner"]
+   :exec-fn cognitect.test-runner.api/test}
+
+  :run
+  {:main-opts ["-m" "reverse-proxy.core"]}
+
+  :uberjar
+  {:replace-deps {com.github.seancorfield/depstar {:mvn/version "2.1.303"}}
+   :exec-fn hf.depstar/uberjar
+   :exec-args {:jar "target/reverse-proxy.jar"
+               :aot true
+               :main-class reverse-proxy.core}}}}

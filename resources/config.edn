@@ -1,0 +1,36 @@
+;; Example configuration for the eBPF reverse proxy
+;;
+;; This file defines the proxy configuration including:
+;; - Listen interfaces and ports
+;; - Default backend targets
+;; - Source-based routing rules
+;; - Global settings
+
+{:proxies
+ [;; Web traffic proxy
+  {:name "web-proxy"
+   :listen {:interfaces ["eth0"]
+            :port 80}
+   :default-target {:ip "10.0.0.1" :port 8080}
+   :source-routes
+   [;; Route traffic from internal network to different backend
+    {:source "192.168.1.0/24"
+     :target {:ip "10.0.0.2" :port 8080}}
+    ;; Route specific host to dedicated backend
+    {:source "192.168.2.100"
+     :target {:ip "10.0.0.3" :port 8080}}]}
+
+  ;; API traffic proxy
+  {:name "api-proxy"
+   :listen {:interfaces ["eth0"]
+            :port 8080}
+   :default-target {:ip "10.0.1.1" :port 3000}
+   :source-routes
+   [;; Premium customers get dedicated API backend
+    {:source "10.10.0.0/16"
+     :target {:ip "10.0.1.2" :port 3000}}]}]
+
+ :settings
+ {:stats-enabled false              ;; Enable to stream connection statistics
+  :connection-timeout-sec 300       ;; Connection timeout in seconds
+  :max-connections 100000}}         ;; Maximum concurrent connections
