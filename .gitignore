@@ -1,0 +1,19 @@
+# Clojure
+.cpcache/
+.nrepl-port
+*.class
+target/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.calva/
+
+# Logs
+logs/
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
