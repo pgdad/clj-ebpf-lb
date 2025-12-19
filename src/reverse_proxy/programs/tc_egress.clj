@@ -3,6 +3,7 @@
    Handles reply packets from backends: performs SNAT to restore original destination."
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
+            [clj-ebpf.asm :as asm]
             [clj-ebpf.net :as net]
             [clj-ebpf.net.ethernet :as eth]
             [clj-ebpf.net.ipv4 :as ipv4]
@@ -104,21 +105,6 @@
    (dsl/ldx :w data-end-reg ctx-reg 80)]) ; data_end at offset 80
 
 ;;; =============================================================================
-;;; Jump Offset Calculation Helpers
-;;; =============================================================================
-
-(defn calculate-jump-offset
-  "Calculate BPF jump offset from source instruction to target instruction.
-   BPF jump offsets are relative to the NEXT instruction after the jump.
-
-   source-idx: Index of the jump instruction
-   target-idx: Index of the target instruction
-
-   Returns: Number of instructions to skip"
-  [source-idx target-idx]
-  (- target-idx source-idx 1))
-
-;;; =============================================================================
 ;;; Full TC Egress Program with SNAT
 ;;; =============================================================================
 
@@ -136,79 +122,35 @@
    r8 = data_end pointer (callee-saved)
    r9 = IP header pointer / scratch (callee-saved)
 
-   Jump offset calculation:
-   We need to calculate the exact number of instructions between each
-   conditional jump and the PASS label at the end."
+   Uses clj-ebpf.asm label-based assembly for automatic jump offset resolution."
   [_conntrack-map-fd]
-  ;; Build instruction blocks and count them to calculate proper offsets
-  ;;
-  ;; Program structure:
-  ;; Block 0: Save context (1 insn)
-  ;; Block 1: Load data ptrs (2 insns)
-  ;; Block 2: Check ETH bounds (3 insns, last is jump)
-  ;; Block 3: Load ethertype (1 insn)
-  ;; Block 4: Check IPv4 (1 insn, jump)
-  ;; Block 5: Get IP header ptr (2 insns)
-  ;; Block 6: Check IP bounds (3 insns, last is jump)
-  ;; Block 7: PASS - return action (2 insns)
+  (asm/assemble-with-labels
+    (concat
+      ;; Save SKB context to callee-saved register
+      [(dsl/mov-reg :r6 :r1)]
 
-  (let [;; Count instructions in each block
-        block-0-count 1   ; mov-reg :r6 :r1
-        block-1-count 2   ; tc-load-data-ptrs-32
-        block-2-count 3   ; check-bounds (mov-reg, add, jmp-reg)
-        block-3-count 1   ; load-ethertype
-        block-4-count 1   ; is-not-ipv4 (jmp-imm)
-        block-5-count 2   ; get-ip-header-ptr
-        block-6-count 3   ; check-bounds (mov-reg, add, jmp-reg)
-        block-7-count 2   ; return-action (mov, exit)
+      ;; Load data and data_end pointers from SKB context
+      ;; Using 32-bit loads as required by the kernel
+      (tc-load-data-ptrs-32 :r7 :r8 :r1)
 
-        ;; Calculate instruction indices (0-based)
-        block-0-start 0
-        block-1-start (+ block-0-start block-0-count)  ; 1
-        block-2-start (+ block-1-start block-1-count)  ; 3
-        block-3-start (+ block-2-start block-2-count)  ; 6
-        block-4-start (+ block-3-start block-3-count)  ; 7
-        block-5-start (+ block-4-start block-4-count)  ; 8
-        block-6-start (+ block-5-start block-5-count)  ; 10
-        block-7-start (+ block-6-start block-6-count)  ; 13 (PASS label)
+      ;; Check Ethernet header bounds - jump to :pass if out of bounds
+      (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass :r9)
 
-        ;; Jump sources (index of the jump instruction)
-        jump-2-idx (+ block-2-start 2)  ; 5
-        jump-4-idx block-4-start        ; 7
-        jump-6-idx (+ block-6-start 2)  ; 12
+      ;; Load ethertype
+      (eth/load-ethertype :r9 :r7)
 
-        ;; Calculate offsets to PASS label (block-7-start = 13)
-        pass-label block-7-start
-        offset-from-jump-2 (calculate-jump-offset jump-2-idx pass-label)  ; 13-5-1 = 7
-        offset-from-jump-4 (calculate-jump-offset jump-4-idx pass-label)  ; 13-7-1 = 5
-        offset-from-jump-6 (calculate-jump-offset jump-6-idx pass-label)] ; 13-12-1 = 0
+      ;; Check for IPv4 - jump to :pass if not IPv4
+      [(asm/jmp-imm :jne :r9 eth/ETH-P-IP-BE :pass)]
 
-    (bpf/assemble
-      (concat
-        ;; Block 0: Save SKB context to callee-saved register
-        [(dsl/mov-reg :r6 :r1)]
+      ;; Calculate IP header pointer: data + ETH_HLEN
+      (eth/get-ip-header-ptr :r9 :r7)
 
-        ;; Block 1: Load data and data_end pointers from SKB context
-        ;; Using 32-bit loads as required by the kernel
-        (tc-load-data-ptrs-32 :r7 :r8 :r1)
+      ;; Check IP header bounds - jump to :pass if out of bounds
+      (asm/check-bounds :r9 :r8 net/IPV4-MIN-HLEN :pass :r0)
 
-        ;; Block 2: Check Ethernet header bounds
-        (net/check-bounds :r7 :r8 net/ETH-HLEN offset-from-jump-2 :r9)
-
-        ;; Block 3: Load ethertype
-        (eth/load-ethertype :r9 :r7)
-
-        ;; Block 4: Check for IPv4
-        (eth/is-not-ipv4 :r9 offset-from-jump-4)
-
-        ;; Block 5: Calculate IP header pointer: data + ETH_HLEN
-        (eth/get-ip-header-ptr :r9 :r7)
-
-        ;; Block 6: Check IP header bounds
-        (net/check-bounds :r9 :r8 net/IPV4-MIN-HLEN offset-from-jump-6 :r0)
-
-        ;; Block 7: PASS - return TC_ACT_OK
-        (net/return-action net/TC-ACT-OK)))))
+      ;; PASS label - return TC_ACT_OK
+      [(asm/label :pass)]
+      (net/return-action net/TC-ACT-OK))))
 
 (defn build-tc-egress-program
   "Build the TC egress program.
