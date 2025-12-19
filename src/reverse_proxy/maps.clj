@@ -52,14 +52,16 @@
   "Create per-CPU hash map for connection tracking.
    Using per-CPU variant for lock-free concurrent access.
    Key: 5-tuple (16 bytes aligned)
-   Value: conntrack state (56 bytes)"
+   Value: conntrack state (64 bytes):
+     orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2) +
+     created_ns(8) + last_seen_ns(8) + packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8)"
   [{:keys [max-connections] :or {max-connections (:max-connections default-config)}}]
   (log/info "Creating conntrack per-CPU hash map with max-entries:" max-connections)
   ;; Use create-map directly to get identity serializers for byte arrays
   ;; Note: For per-CPU maps, the actual value size is value-size * num-cpus
   (bpf/create-map {:map-type :percpu-hash
                    :key-size 16
-                   :value-size 56
+                   :value-size 64
                    :max-entries max-connections
                    :map-name "proxy_conntrack"}))
 
