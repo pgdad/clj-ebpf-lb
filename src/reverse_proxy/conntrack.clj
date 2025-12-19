@@ -13,7 +13,7 @@
 (defrecord Connection
   [src-ip dst-ip src-port dst-port protocol
    orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
-   last-seen packets-fwd bytes-fwd packets-rev bytes-rev])
+   created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev])
 
 (defn connection->map
   "Convert a Connection to a human-readable map."
@@ -31,9 +31,10 @@
          :nat-dst {:ip (util/u32->ip-string (:nat-dst-ip conn))
                    :port (:nat-dst-port conn)}}
    :stats {:packets-forward (:packets-fwd conn)
-           :bytes-forward (:bytes-fwd conn)
            :packets-reverse (:packets-rev conn)
+           :bytes-forward (:bytes-fwd conn)
            :bytes-reverse (:bytes-rev conn)}
+   :created-ns (:created-ns conn)
    :last-seen-ns (:last-seen conn)})
 
 (defn raw-entry->connection
@@ -41,6 +42,43 @@
   [{:keys [key value]}]
   (map->Connection
     (merge key value)))
+
+;;; =============================================================================
+;;; Connection Age and Time Helpers
+;;; =============================================================================
+
+(defn connection-age-ns
+  "Get the age of a connection in nanoseconds.
+   Returns nil if created-ns is 0 (not set)."
+  [^Connection conn current-time-ns]
+  (let [created (:created-ns conn)]
+    (when (and created (pos? created))
+      (- current-time-ns created))))
+
+(defn connection-age-seconds
+  "Get the age of a connection in seconds."
+  [^Connection conn current-time-ns]
+  (when-let [age-ns (connection-age-ns conn current-time-ns)]
+    (/ age-ns 1000000000.0)))
+
+(defn connection-idle-ns
+  "Get the idle time of a connection in nanoseconds (time since last packet)."
+  [^Connection conn current-time-ns]
+  (let [last-seen (:last-seen conn)]
+    (when (and last-seen (pos? last-seen))
+      (- current-time-ns last-seen))))
+
+(defn connection-idle-seconds
+  "Get the idle time of a connection in seconds."
+  [^Connection conn current-time-ns]
+  (when-let [idle-ns (connection-idle-ns conn current-time-ns)]
+    (/ idle-ns 1000000000.0)))
+
+(defn connection-expired?
+  "Check if a connection has expired based on idle timeout."
+  [^Connection conn current-time-ns timeout-ns]
+  (let [idle (connection-idle-ns conn current-time-ns)]
+    (and idle (> idle timeout-ns))))
 
 ;;; =============================================================================
 ;;; Connection Queries
@@ -97,9 +135,8 @@
 (defn get-stale-connections
   "Get connections that haven't been seen within the timeout period."
   [conntrack-map current-time-ns timeout-ns]
-  (let [cutoff (- current-time-ns timeout-ns)]
-    (->> (get-all-connections conntrack-map)
-         (filter #(< (:last-seen %) cutoff)))))
+  (->> (get-all-connections conntrack-map)
+       (filter #(connection-expired? % current-time-ns timeout-ns))))
 
 (defn cleanup-stale-connections!
   "Remove connections older than the timeout.
@@ -235,31 +272,47 @@
 ;;; Connection Display
 ;;; =============================================================================
 
+(defn format-duration
+  "Format a duration in seconds to a human-readable string."
+  [seconds]
+  (cond
+    (nil? seconds) "N/A"
+    (< seconds 60) (format "%.1fs" (double seconds))
+    (< seconds 3600) (format "%.1fm" (/ seconds 60.0))
+    :else (format "%.1fh" (/ seconds 3600.0))))
+
 (defn format-connection
   "Format a connection for display."
-  [^Connection conn]
-  (let [proto (case (:protocol conn) 6 "TCP" 17 "UDP" (str (:protocol conn)))]
-    (format "%s %s:%d -> %s:%d (NAT: %s:%d) [%d/%d pkts, %d/%d bytes]"
-            proto
-            (util/u32->ip-string (:src-ip conn))
-            (:src-port conn)
-            (util/u32->ip-string (:orig-dst-ip conn))
-            (:orig-dst-port conn)
-            (util/u32->ip-string (:nat-dst-ip conn))
-            (:nat-dst-port conn)
-            (:packets-fwd conn)
-            (:packets-rev conn)
-            (:bytes-fwd conn)
-            (:bytes-rev conn))))
+  ([^Connection conn]
+   (format-connection conn (System/nanoTime)))
+  ([^Connection conn current-time-ns]
+   (let [proto (case (:protocol conn) 6 "TCP" 17 "UDP" (str (:protocol conn)))
+         age-sec (connection-age-seconds conn current-time-ns)
+         idle-sec (connection-idle-seconds conn current-time-ns)]
+     (format "%s %s:%d -> %s:%d (NAT: %s:%d) [%d/%d pkts, %d/%d bytes] age=%s idle=%s"
+             proto
+             (util/u32->ip-string (:src-ip conn))
+             (:src-port conn)
+             (util/u32->ip-string (:orig-dst-ip conn))
+             (:orig-dst-port conn)
+             (util/u32->ip-string (:nat-dst-ip conn))
+             (:nat-dst-port conn)
+             (:packets-fwd conn)
+             (:packets-rev conn)
+             (:bytes-fwd conn)
+             (:bytes-rev conn)
+             (format-duration age-sec)
+             (format-duration idle-sec)))))
 
 (defn print-connections
   "Print all connections to stdout."
   [conntrack-map]
-  (let [connections (get-all-connections conntrack-map)]
+  (let [connections (get-all-connections conntrack-map)
+        current-ns (System/nanoTime)]
     (println (format "Active connections: %d" (count connections)))
     (println "---")
     (doseq [conn (sort-by :last-seen > connections)]
-      (println (format-connection conn)))))
+      (println (format-connection conn current-ns)))))
 
 (defn print-connection-stats
   "Print aggregated connection statistics."

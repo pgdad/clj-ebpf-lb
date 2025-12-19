@@ -218,11 +218,11 @@
 (defn encode-conntrack-value
   "Encode connection tracking value.
    {orig_dst_ip (4) + orig_dst_port (2) + padding (2) + nat_dst_ip (4) + nat_dst_port (2) + padding (2) +
-    last_seen (8) + packets_fwd (8) + bytes_fwd (8) + packets_rev (8) + bytes_rev (8)}
-   Total: 56 bytes."
+    created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
+   Total: 64 bytes."
   [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
-           last-seen packets-fwd bytes-fwd packets-rev bytes-rev]}]
-  (let [buf (ByteBuffer/allocate 56)]
+           created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev]}]
+  (let [buf (ByteBuffer/allocate 64)]
     (.order buf ByteOrder/BIG_ENDIAN)
     (.putInt buf (unchecked-int (or orig-dst-ip 0)))
     (.putShort buf (unchecked-short (or orig-dst-port 0)))
@@ -230,15 +230,16 @@
     (.putInt buf (unchecked-int (or nat-dst-ip 0)))
     (.putShort buf (unchecked-short (or nat-dst-port 0)))
     (.putShort buf (short 0))  ; padding
+    (.putLong buf (or created-ns 0))
     (.putLong buf (or last-seen 0))
     (.putLong buf (or packets-fwd 0))
-    (.putLong buf (or bytes-fwd 0))
     (.putLong buf (or packets-rev 0))
+    (.putLong buf (or bytes-fwd 0))
     (.putLong buf (or bytes-rev 0))
     (.array buf)))
 
 (defn decode-conntrack-value
-  "Decode connection tracking value from byte array."
+  "Decode connection tracking value from byte array (64 bytes)."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
     (.order buf ByteOrder/BIG_ENDIAN)
@@ -248,19 +249,21 @@
           nat-dst-ip (Integer/toUnsignedLong (.getInt buf))
           nat-dst-port (bit-and (.getShort buf) 0xFFFF)
           _ (.getShort buf)  ; padding
+          created-ns (.getLong buf)
           last-seen (.getLong buf)
           packets-fwd (.getLong buf)
-          bytes-fwd (.getLong buf)
           packets-rev (.getLong buf)
+          bytes-fwd (.getLong buf)
           bytes-rev (.getLong buf)]
       {:orig-dst-ip orig-dst-ip
        :orig-dst-port orig-dst-port
        :nat-dst-ip nat-dst-ip
        :nat-dst-port nat-dst-port
+       :created-ns created-ns
        :last-seen last-seen
        :packets-fwd packets-fwd
-       :bytes-fwd bytes-fwd
        :packets-rev packets-rev
+       :bytes-fwd bytes-fwd
        :bytes-rev bytes-rev})))
 
 (defn encode-stats-event
