@@ -1,6 +1,7 @@
 (ns reverse-proxy.programs.common
   "Common eBPF program fragments and DSL utilities shared between XDP and TC programs."
-  (:require [clj-ebpf.core :as bpf]))
+  (:require [clj-ebpf.core :as bpf]
+            [clj-ebpf.dsl :as dsl]))
 
 ;;; =============================================================================
 ;;; BPF Constants
@@ -75,72 +76,76 @@
 (defn mov-imm
   "Move immediate value to register."
   [dst imm]
-  (bpf/mov dst imm))
+  (dsl/mov dst imm))
 
 (defn mov-reg
   "Move register to register."
   [dst src]
-  (bpf/mov-reg dst src))
+  (dsl/mov-reg dst src))
 
 (defn add-imm
   "Add immediate to register."
   [dst imm]
-  (bpf/add dst imm))
+  (dsl/add dst imm))
 
 (defn add-reg
   "Add register to register."
   [dst src]
-  (bpf/add-reg dst src))
+  (dsl/add-reg dst src))
 
 (defn sub-imm
   "Subtract immediate from register."
   [dst imm]
-  (bpf/sub dst imm))
+  (dsl/sub dst imm))
 
 (defn sub-reg
   "Subtract register from register."
   [dst src]
-  (bpf/sub-reg dst src))
+  (dsl/sub-reg dst src))
 
 (defn ldx-b
   "Load byte from memory."
   [dst src off]
-  (bpf/ldx :b dst src off))
+  (dsl/ldx :b dst src off))
 
 (defn ldx-h
   "Load half-word (2 bytes) from memory."
   [dst src off]
-  (bpf/ldx :h dst src off))
+  (dsl/ldx :h dst src off))
 
 (defn ldx-w
   "Load word (4 bytes) from memory."
   [dst src off]
-  (bpf/ldx :w dst src off))
+  (dsl/ldx :w dst src off))
 
 (defn ldx-dw
   "Load double-word (8 bytes) from memory."
   [dst src off]
-  (bpf/ldx :dw dst src off))
+  (dsl/ldx :dw dst src off))
 
 (defn stx-b
-  "Store byte to memory."
-  [dst off src]
-  (bpf/stx :b dst off src))
+  "Store byte to memory.
+   Signature: *(dst + off) = src"
+  [dst src off]
+  (dsl/stx :b dst src off))
 
 (defn stx-h
-  "Store half-word to memory."
-  [dst off src]
-  (bpf/stx :h dst off src))
+  "Store half-word to memory.
+   Signature: *(dst + off) = src"
+  [dst src off]
+  (dsl/stx :h dst src off))
 
 (defn stx-w
-  "Store word to memory."
-  [dst off src]
-  (bpf/stx :w dst off src))
+  "Store word to memory.
+   Signature: *(dst + off) = src"
+  [dst src off]
+  (dsl/stx :w dst src off))
 
 (defn stx-dw
-  "Store double-word to memory."
-  [dst off src]
-  (bpf/stx :dw dst off src))
+  "Store double-word to memory.
+   Signature: *(dst + off) = src"
+  [dst src off]
+  (dsl/stx :dw dst src off))
 
 ;;; =============================================================================
 ;;; Packet Parsing Fragments
@@ -155,7 +160,7 @@
   [offset size fail-offset]
   [(mov-reg :r8 :r6)                 ;; r8 = data start
    (add-imm :r8 (+ offset size))     ;; r8 = data + offset + size
-   (bpf/jmp-reg :jgt :r8 :r7 fail-offset)]) ;; if r8 > data_end, jump forward
+   (dsl/jmp-reg :jgt :r8 :r7 fail-offset)]) ;; if r8 > data_end, jump forward
 
 (defn build-parse-eth
   "Parse Ethernet header and check for IPv4.
@@ -170,9 +175,9 @@
     ;; Load ethertype (offset 12 in eth header)
     [(ldx-h :r8 :r6 12)
      ;; Convert from network byte order (big-endian)
-     (bpf/end-to-le :r8 16)
+     (dsl/end-to-le :r8 16)
      ;; Check if IPv4 (0x0800)
-     (bpf/jmp-imm :jne :r8 ETH-P-IP pass-offset)]))
+     (dsl/jmp-imm :jne :r8 ETH-P-IP pass-offset)]))
 
 (defn build-parse-ip
   "Parse IPv4 header, extract protocol and addresses.
@@ -192,24 +197,24 @@
       ;; Load version/IHL byte to get header length
       [(ldx-b :r8 :r6 ip-off)
        ;; IHL is lower 4 bits, multiply by 4 for byte length
-       (bpf/and-op :r8 0x0F)
-       (bpf/lsh :r8 2)          ;; r8 = IP header length in bytes
-       (stx-w :r10 -16 :r8)     ;; store IP header length
+       (dsl/and :r8 0x0F)
+       (dsl/lsh :r8 2)          ;; r8 = IP header length in bytes
+       (stx-w :r10 :r8 -16)     ;; store IP header length
 
        ;; Verify IHL >= 20
-       (bpf/jmp-imm :jlt :r8 IP-HLEN-MIN pass-offset)
+       (dsl/jmp-imm :jlt :r8 IP-HLEN-MIN pass-offset)
 
        ;; Load protocol (offset 9 in IP header)
        (ldx-b :r8 :r6 (+ ip-off 9))
-       (stx-w :r10 -4 :r8)
+       (stx-w :r10 :r8 -4)
 
        ;; Load source IP (offset 12)
        (ldx-w :r8 :r6 (+ ip-off 12))
-       (stx-w :r10 -8 :r8)
+       (stx-w :r10 :r8 -8)
 
        ;; Load destination IP (offset 16)
        (ldx-w :r8 :r6 (+ ip-off 16))
-       (stx-w :r10 -12 :r8)])))
+       (stx-w :r10 :r8 -12)])))
 
 (defn build-parse-l4
   "Parse TCP/UDP header to extract ports.
@@ -228,7 +233,7 @@
    (mov-reg :r8 :r6)
    (add-reg :r8 :r9)
    (add-imm :r8 4)
-   (bpf/jmp-reg :jgt :r8 :r7 pass-offset)
+   (dsl/jmp-reg :jgt :r8 :r7 pass-offset)
 
    ;; Calculate L4 header address: data + L4_offset
    (mov-reg :r8 :r6)
@@ -236,11 +241,11 @@
 
    ;; Load src port (offset 0) - network byte order
    (ldx-h :r9 :r8 0)
-   (stx-h :r10 -20 :r9)
+   (stx-h :r10 :r9 -20)
 
    ;; Load dst port (offset 2) - network byte order
    (ldx-h :r9 :r8 2)
-   (stx-h :r10 -24 :r9)])
+   (stx-h :r10 :r9 -24)])
 
 ;;; =============================================================================
 ;;; Map Lookup Helpers
@@ -255,10 +260,10 @@
 
    Returns: instructions that leave result pointer in r0 (or NULL)"
   [map-fd key-stack-off]
-  [(bpf/ld-map-fd :r1 map-fd)     ;; r1 = map fd
+  [(dsl/ld-map-fd :r1 map-fd)     ;; r1 = map fd
    (mov-reg :r2 :r10)             ;; r2 = frame pointer
    (add-imm :r2 key-stack-off)    ;; r2 = &key
-   (bpf/call BPF-FUNC-map-lookup-elem)])
+   (dsl/call BPF-FUNC-map-lookup-elem)])
 
 (defn build-map-update
   "Generate instructions for bpf_map_update_elem.
@@ -269,13 +274,13 @@
      value-stack-off: Stack offset where value is stored
      flags: Update flags (0 = any, 1 = noexist, 2 = exist)"
   [map-fd key-stack-off value-stack-off flags]
-  [(bpf/ld-map-fd :r1 map-fd)
+  [(dsl/ld-map-fd :r1 map-fd)
    (mov-reg :r2 :r10)
    (add-imm :r2 key-stack-off)
    (mov-reg :r3 :r10)
    (add-imm :r3 value-stack-off)
    (mov-imm :r4 flags)
-   (bpf/call BPF-FUNC-map-update-elem)])
+   (dsl/call BPF-FUNC-map-update-elem)])
 
 ;;; =============================================================================
 ;;; Checksum Helpers
@@ -295,7 +300,7 @@
    (mov-reg :r3 old-reg)
    (mov-reg :r4 new-reg)
    (mov-imm :r5 4)              ;; size = 4 bytes
-   (bpf/call BPF-FUNC-l3-csum-replace)])
+   (dsl/call BPF-FUNC-l3-csum-replace)])
 
 (defn build-l4-csum-replace
   "Generate incremental L4 (TCP/UDP) checksum update.
@@ -311,7 +316,7 @@
    (mov-reg :r3 old-reg)
    (mov-reg :r4 new-reg)
    (mov-imm :r5 flags)
-   (bpf/call BPF-FUNC-l4-csum-replace)])
+   (dsl/call BPF-FUNC-l4-csum-replace)])
 
 ;;; =============================================================================
 ;;; Ring Buffer Helpers
@@ -325,10 +330,10 @@
 
    Returns ptr in r0 (or NULL on failure)"
   [ringbuf-fd size]
-  [(bpf/ld-map-fd :r1 ringbuf-fd)
+  [(dsl/ld-map-fd :r1 ringbuf-fd)
    (mov-imm :r2 size)
    (mov-imm :r3 0)              ;; flags
-   (bpf/call BPF-FUNC-ringbuf-reserve)])
+   (dsl/call BPF-FUNC-ringbuf-reserve)])
 
 (defn build-ringbuf-submit
   "Submit ring buffer entry.
@@ -337,7 +342,7 @@
   [ptr-reg]
   [(mov-reg :r1 ptr-reg)
    (mov-imm :r2 0)              ;; flags
-   (bpf/call BPF-FUNC-ringbuf-submit)])
+   (dsl/call BPF-FUNC-ringbuf-submit)])
 
 (defn build-ringbuf-discard
   "Discard ring buffer reservation.
@@ -346,7 +351,7 @@
   [ptr-reg]
   [(mov-reg :r1 ptr-reg)
    (mov-imm :r2 0)
-   (bpf/call BPF-FUNC-ringbuf-discard)])
+   (dsl/call BPF-FUNC-ringbuf-discard)])
 
 ;;; =============================================================================
 ;;; Time Helper
@@ -356,7 +361,24 @@
   "Get current time in nanoseconds.
    Result in r0."
   []
-  [(bpf/call BPF-FUNC-ktime-get-ns)])
+  [(dsl/call BPF-FUNC-ktime-get-ns)])
+
+;;; =============================================================================
+;;; Map Utilities
+;;; =============================================================================
+
+(defn map-fd
+  "Get the raw file descriptor for a map.
+   This is needed when building eBPF programs that reference maps."
+  [m]
+  (cond
+    ;; If it's a number, assume it's already an FD
+    (number? m) m
+    ;; If it's a map with an :fd key
+    (and (map? m) (:fd m)) (:fd m)
+    ;; If the map object has a method to get the fd
+    (instance? clojure.lang.ILookup m) (or (:fd m) (:file-descriptor m) m)
+    :else (throw (ex-info "Cannot get file descriptor from map" {:map m :type (type m)}))))
 
 ;;; =============================================================================
 ;;; Program Assembly
@@ -384,15 +406,15 @@
    Useful for testing XDP attachment."
   []
   (bpf/assemble
-    [(bpf/mov :r0 (:pass bpf/xdp-action))
-     (bpf/exit-insn)]))
+    [(dsl/mov :r0 XDP-PASS)
+     (dsl/exit-insn)]))
 
 (defn xdp-drop-all
   "Simple XDP program that drops all packets."
   []
   (bpf/assemble
-    [(bpf/mov :r0 (:drop bpf/xdp-action))
-     (bpf/exit-insn)]))
+    [(dsl/mov :r0 XDP-DROP)
+     (dsl/exit-insn)]))
 
 ;;; =============================================================================
 ;;; Simple TC Programs
@@ -402,12 +424,12 @@
   "Simple TC program that passes all packets."
   []
   (bpf/assemble
-    [(bpf/mov :r0 TC-ACT-OK)
-     (bpf/exit-insn)]))
+    [(dsl/mov :r0 TC-ACT-OK)
+     (dsl/exit-insn)]))
 
 (defn tc-drop-all
   "Simple TC program that drops all packets."
   []
   (bpf/assemble
-    [(bpf/mov :r0 TC-ACT-SHOT)
-     (bpf/exit-insn)]))
+    [(dsl/mov :r0 TC-ACT-SHOT)
+     (dsl/exit-insn)]))
