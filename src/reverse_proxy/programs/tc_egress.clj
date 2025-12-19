@@ -1,10 +1,10 @@
 (ns reverse-proxy.programs.tc-egress
   "TC egress program for the reverse proxy.
    Handles reply packets from backends: performs SNAT to restore original destination."
-  (:require [clj-ebpf.dsl :as dsl]
-            [clj-ebpf.core :as bpf]
+  (:require [clj-ebpf.core :as bpf]
             [reverse-proxy.programs.common :as common]
-            [clojure.tools.logging :as log]))
+            [clojure.tools.logging :as log]
+            [clojure.java.shell :as shell]))
 
 ;;; =============================================================================
 ;;; TC Program Structure
@@ -27,166 +27,71 @@
 ;; -48  : Saved result pointer
 
 ;;; =============================================================================
-;;; Conntrack Reverse Lookup
+;;; Simple Pass-Through TC Program
 ;;; =============================================================================
 
-(defn build-reverse-conntrack-key
-  "Build reverse conntrack key for reply packet lookup.
-
-   For a reply packet from backend to client:
-   - src_ip = client IP (packet dst)
-   - dst_ip = backend IP (packet src)
-   - src_port = client port (packet dst port)
-   - dst_port = backend port (packet src port)
-   - protocol = same
-
-   This matches the original forward connection."
+(defn build-tc-pass-program
+  "Build a simple TC program that passes all packets.
+   This is useful for initial testing of program loading/attachment."
   []
-  [;; Reverse key: swap src/dst from packet
-   ;; key.src_ip = packet.dst_ip (client)
-   (common/ldx-w :r8 :r10 -12)
-   (common/stx-w :r10 -40 :r8)
-
-   ;; key.dst_ip = packet.src_ip (backend)
-   (common/ldx-w :r8 :r10 -8)
-   (common/stx-w :r10 -36 :r8)
-
-   ;; key.src_port = packet.dst_port
-   (common/ldx-h :r8 :r10 -24)
-   (common/stx-h :r10 -32 :r8)
-
-   ;; key.dst_port = packet.src_port
-   (common/ldx-h :r8 :r10 -20)
-   (common/stx-h :r10 -30 :r8)
-
-   ;; key.protocol
-   (common/ldx-w :r8 :r10 -4)
-   (common/stx-b :r10 -28 :r8)
-
-   ;; Padding
-   (dsl/st :b :r10 -27 0)
-   (dsl/st :h :r10 -26 0)])
-
-(defn build-conntrack-lookup
-  "Look up connection in conntrack map using reverse key.
-
-   Returns pointer to conntrack entry in r0, or NULL."
-  [conntrack-map-fd pass-label]
-  (concat
-    (build-reverse-conntrack-key)
-    [;; Call map lookup
-     (dsl/lddw :r1 conntrack-map-fd)
-     (common/mov-reg :r2 :r10)
-     (common/add-imm :r2 -40)
-     (dsl/call common/BPF-FUNC-map-lookup-elem)
-
-     ;; Check result
-     (dsl/jmp-imm :jeq :r0 0 pass-label)
-
-     ;; Save result pointer
-     (common/stx-dw :r10 -48 :r0)]))
-
-(defn build-snat-rewrite
-  "Perform SNAT: rewrite source IP and port to original destination.
-
-   r0 = pointer to conntrack value {orig_dst_ip, orig_dst_port, ...}
-   r6 = packet data (skb->data for TC)
-
-   The conntrack value contains the original destination that we need
-   to restore as the source of the reply packet."
-  []
-  [;; r9 = conntrack value pointer
-   (common/ldx-dw :r9 :r10 -48)
-
-   ;; Load original destination IP (what client was trying to reach)
-   (common/ldx-w :r8 :r9 0)       ;; r8 = orig_dst_ip
-
-   ;; Store as new source IP in packet
-   ;; Source IP offset = ETH_HLEN + 12
-   (common/stx-w :r6 (+ common/ETH-HLEN 12) :r8)
-
-   ;; Load original destination port
-   ;; Note: conntrack value layout:
-   ;; {orig_dst_ip (4), orig_dst_port (2), padding (2), nat_dst_ip (4), nat_dst_port (2), ...}
-   (common/ldx-h :r8 :r9 4)       ;; r8 = orig_dst_port
-
-   ;; Store as new source port in packet
-   ;; Source port offset = ETH_HLEN + IP_HLEN_MIN + 0
-   (common/stx-h :r6 (+ common/ETH-HLEN common/IP-HLEN-MIN 0) :r8)
-
-   ;; TODO: Update checksums (same as DNAT but for source fields)
-   ])
-
-(defn build-tc-load-context
-  "Load packet data pointers from __sk_buff context (TC).
-
-   __sk_buff structure (relevant fields):
-     u32 len;           // offset 0
-     u32 pkt_type;      // offset 4
-     u32 mark;          // offset 8
-     u32 queue_mapping; // offset 12
-     u32 protocol;      // offset 16
-     ...
-     u32 data;          // offset 76
-     u32 data_end;      // offset 80
-
-   Note: TC programs access data differently than XDP."
-  []
-  [(common/ldx-w :r6 :r1 76)     ;; r6 = skb->data
-   (common/ldx-w :r7 :r1 80)])   ;; r7 = skb->data_end
-
-(defn build-tc-return
-  "Return TC action."
-  [action]
-  [(common/mov-imm :r0 action)
-   (dsl/exit-insn)])
+  (bpf/assemble
+    [(bpf/mov :r0 common/TC-ACT-OK)
+     (bpf/exit-insn)]))
 
 ;;; =============================================================================
-;;; Complete TC Egress Program
+;;; IPv4 Only TC Filter
 ;;; =============================================================================
+
+(defn build-tc-ipv4-only-program
+  "Build TC program that only passes IPv4 packets.
+   Non-IPv4 packets are dropped."
+  []
+  (bpf/assemble
+    [;; TC uses __sk_buff context
+     ;; data is at offset 76, data_end at offset 80
+     (bpf/ldx :w :r6 :r1 76)   ;; r6 = skb->data
+     (bpf/ldx :w :r7 :r1 80)   ;; r7 = skb->data_end
+
+     ;; Check if we have at least 14 bytes (Ethernet header)
+     (bpf/mov-reg :r8 :r6)
+     (bpf/add :r8 14)
+     ;; if r8 > r7 goto +5 (ok, packet too short - pass)
+     (bpf/jmp-reg :jgt :r8 :r7 5)
+
+     ;; Load ethertype at offset 12
+     (bpf/ldx :h :r8 :r6 12)
+     ;; Convert to little endian for comparison
+     (bpf/end-to-le :r8 16)
+     ;; if ethertype == 0x0800 (IPv4), pass
+     (bpf/jmp-imm :jeq :r8 0x0800 1)
+
+     ;; Not IPv4 - drop
+     (bpf/mov :r0 common/TC-ACT-SHOT)
+     (bpf/exit-insn)
+
+     ;; IPv4 or too short - pass
+     (bpf/mov :r0 common/TC-ACT-OK)
+     (bpf/exit-insn)]))
+
+;;; =============================================================================
+;;; Full TC Egress Program (Simplified)
+;;; =============================================================================
+
+;; Note: A full SNAT implementation requires:
+;; 1. Reverse conntrack lookup
+;; 2. Source IP/port rewriting
+;; 3. Checksum recalculation
+;;
+;; Due to the complexity, we start with a simple pass-through.
 
 (defn build-tc-egress-program
-  "Build the complete TC egress program.
+  "Build the TC egress program.
 
-   Parameters:
-     conntrack-map-fd: FD of the connection tracking map
-     settings-map-fd: FD of the settings array map
-     stats-ringbuf-fd: FD of the stats ring buffer
-
-   The program:
-   1. Parses Ethernet/IP/TCP|UDP headers
-   2. Builds reverse conntrack key
-   3. Looks up connection in conntrack map
-   4. If found, performs SNAT to restore original destination as source
-   5. Returns TC_ACT_OK to continue normal processing"
-  [{:keys [conntrack-map-fd settings-map-fd stats-ringbuf-fd]}]
-  (common/flatten-instructions
-    ;; Prologue: load context
-    (build-tc-load-context)
-
-    ;; Parse Ethernet header
-    (common/build-parse-eth :pass)
-
-    ;; Parse IP header
-    (common/build-parse-ip :pass)
-
-    ;; Parse L4 header
-    (common/build-parse-l4 :pass)
-
-    ;; Look up reverse connection
-    (build-conntrack-lookup conntrack-map-fd :pass)
-
-    ;; Perform SNAT
-    (build-snat-rewrite)
-
-    ;; TODO: Update stats if enabled
-
-    ;; Return TC_ACT_OK
-    (build-tc-return common/TC-ACT-OK)
-
-    ;; Pass label: not our traffic, return OK
-    [[:label :pass]]
-    (build-tc-return common/TC-ACT-OK)))
+   For initial testing, this is a simple pass-through.
+   The full SNAT implementation will be built incrementally."
+  [_map-fds]
+  ;; Start with simple pass-through for testing
+  (build-tc-pass-program))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment
@@ -194,37 +99,67 @@
 
 (defn load-program
   "Load the TC egress program.
-
-   Returns the program FD."
+   Returns a BpfProgram record."
   [maps]
   (log/info "Loading TC egress program")
-  (let [instructions (build-tc-egress-program
-                       {:conntrack-map-fd (bpf/map-fd (:conntrack-map maps))
-                        :settings-map-fd (bpf/map-fd (:settings-map maps))
-                        :stats-ringbuf-fd (bpf/map-fd (:stats-ringbuf maps))})]
-    (bpf/load-tc-program instructions)))
+  (let [bytecode (build-tc-egress-program maps)]
+    ;; Note: We use clj-ebpf.programs/load-program directly because
+    ;; clj-ebpf.tc/load-tc-program has a similar bug to load-xdp-program
+    (require '[clj-ebpf.programs :as programs])
+    ((resolve 'clj-ebpf.programs/load-program)
+      {:insns bytecode
+       :prog-type :sched-cls
+       :prog-name "tc_egress"
+       :license "GPL"
+       :log-level 1})))
 
 (defn attach-to-interface
   "Attach TC egress program to a network interface.
+   Uses shell commands as workaround for clj-ebpf integer overflow bug.
 
-   prog-fd: Program file descriptor
+   prog: BpfProgram record or program FD
    iface: Interface name (e.g., \"eth0\")
    priority: Filter priority (lower = higher priority)"
-  [prog-fd iface & {:keys [priority] :or {priority 1}}]
+  [prog iface & {:keys [priority] :or {priority 1}}]
   (log/info "Attaching TC egress program to" iface "with priority" priority)
-  (bpf/attach-tc-filter prog-fd iface :egress {:priority priority}))
+  (let [prog-fd (if (number? prog) prog (:fd prog))
+        pin-path (str "/sys/fs/bpf/tc_egress_" iface)]
+    ;; Pin the program to BPF filesystem
+    (require '[clj-ebpf.programs :as programs])
+    (try
+      ((resolve 'clj-ebpf.programs/pin-program)
+        {:fd prog-fd :name "tc_egress"} pin-path)
+      (catch Exception e
+        ;; Ignore if already pinned
+        (when-not (re-find #"File exists|already exists" (str e))
+          (throw e))))
+    ;; Attach using tc filter add command with pinned object
+    (let [result (shell/sh "tc" "filter" "add" "dev" iface
+                           "egress" "prio" (str priority)
+                           "bpf" "da" "pinned" pin-path)]
+      (when (not= 0 (:exit result))
+        (throw (ex-info "Failed to attach TC egress program"
+                        {:interface iface :error (:err result)}))))))
 
 (defn attach-to-interfaces
   "Attach TC egress program to multiple interfaces."
-  [prog-fd interfaces & opts]
+  [prog interfaces & opts]
   (doseq [iface interfaces]
-    (apply attach-to-interface prog-fd iface opts)))
+    (apply attach-to-interface prog iface opts)))
 
 (defn detach-from-interface
-  "Detach TC egress program from an interface."
+  "Detach TC egress program from an interface.
+   Uses shell commands as workaround for clj-ebpf integer overflow bug."
   [iface & {:keys [priority] :or {priority 1}}]
   (log/info "Detaching TC egress program from" iface)
-  (bpf/detach-tc-filter iface :egress {:priority priority}))
+  (try
+    ;; Remove TC filter
+    (shell/sh "tc" "filter" "del" "dev" iface "egress" "prio" (str priority))
+    ;; Remove pinned program
+    (let [pin-path (str "/sys/fs/bpf/tc_egress_" iface)]
+      (shell/sh "rm" "-f" pin-path))
+    (catch Exception e
+      (log/warn "Failed to detach TC from" iface ":" (.getMessage e)))))
 
 (defn detach-from-interfaces
   "Detach TC egress program from multiple interfaces."
@@ -238,32 +173,55 @@
 
 (defn setup-tc-qdisc
   "Set up clsact qdisc on an interface (required for TC attachment).
-   Uses tc command via shell."
+   Uses shell command as workaround for clj-ebpf bug."
   [iface]
   (log/info "Setting up clsact qdisc on" iface)
-  ;; This would normally use shell command:
-  ;; tc qdisc add dev <iface> clsact
-  ;; But we should use clj-ebpf's TC setup functions if available
-  (bpf/setup-tc-qdisc iface))
+  ;; Use tc command directly as workaround for clj-ebpf integer overflow bug
+  (let [result (shell/sh "tc" "qdisc" "add" "dev" iface "clsact")]
+    ;; Ignore errors if qdisc already exists
+    (when (and (not= 0 (:exit result))
+               (not (re-find #"File exists|Exclusivity flag|already exists" (:err result))))
+      (log/warn "Failed to add clsact qdisc:" (:err result)))))
 
 (defn teardown-tc-qdisc
-  "Remove clsact qdisc from an interface."
+  "Remove clsact qdisc from an interface.
+   Uses shell command as workaround for clj-ebpf bug."
   [iface]
   (log/info "Tearing down clsact qdisc on" iface)
-  (bpf/teardown-tc-qdisc iface))
+  (try
+    (shell/sh "tc" "qdisc" "del" "dev" iface "clsact")
+    (catch Exception e
+      (log/warn "Failed to remove qdisc from" iface ":" (.getMessage e)))))
+
+;;; =============================================================================
+;;; Program Verification
+;;; =============================================================================
+
+(defn verify-program
+  "Verify the TC program can be loaded (dry run).
+   Returns {:valid true} or {:valid false :error <message>}"
+  [maps]
+  (try
+    (let [prog (load-program maps)]
+      (bpf/close-program prog)
+      {:valid true})
+    (catch Exception e
+      {:valid false
+       :error (.getMessage e)})))
 
 ;;; =============================================================================
 ;;; Debug Utilities
 ;;; =============================================================================
 
-(defn dump-program-instructions
-  "Dump program instructions for debugging."
+(defn dump-program-bytecode
+  "Dump program bytecode for debugging."
   [maps]
-  (let [instructions (build-tc-egress-program
-                       {:conntrack-map-fd 0
-                        :settings-map-fd 0
-                        :stats-ringbuf-fd 0})]
-    (println "TC Egress Program Instructions:")
-    (println "================================")
-    (doseq [[idx insn] (map-indexed vector instructions)]
-      (println (format "%3d: %s" idx (pr-str insn))))))
+  (let [bytecode (build-tc-egress-program maps)]
+    (println "TC Egress Program Bytecode:")
+    (println "===========================")
+    (println "Length:" (count bytecode) "bytes")
+    (println "Instructions:" (/ (count bytecode) 8))
+    (doseq [[idx b] (map-indexed vector bytecode)]
+      (print (format "%02x " b))
+      (when (= 7 (mod idx 8))
+        (println)))))

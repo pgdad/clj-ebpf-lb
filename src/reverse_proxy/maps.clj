@@ -27,11 +27,13 @@
    Value: {target_ip (4 bytes) + target_port (2 bytes) + flags (2 bytes)} = 8 bytes"
   [{:keys [max-routes] :or {max-routes (:max-routes default-config)}}]
   (log/info "Creating config LPM trie map with max-entries:" max-routes)
-  (bpf/create-lpm-trie-map
-    {:key-size 8
-     :value-size 8
-     :max-entries max-routes
-     :map-name "proxy_config"}))
+  ;; Use create-map directly to get identity serializers for byte arrays
+  (bpf/create-map {:map-type :lpm-trie
+                   :key-size 8
+                   :value-size 8
+                   :max-entries max-routes
+                   :map-flags 1  ; BPF_F_NO_PREALLOC required for LPM
+                   :map-name "proxy_config"}))
 
 (defn create-listen-map
   "Create hash map for listen interface/port -> default target.
@@ -39,11 +41,12 @@
    Value: {target_ip (4 bytes) + target_port (2 bytes) + flags (2 bytes)} = 8 bytes"
   [{:keys [max-listen-ports] :or {max-listen-ports (:max-listen-ports default-config)}}]
   (log/info "Creating listen hash map with max-entries:" max-listen-ports)
-  (bpf/create-hash-map
-    {:key-size 8
-     :value-size 8
-     :max-entries max-listen-ports
-     :map-name "proxy_listen"}))
+  ;; Use create-map directly to get identity serializers for byte arrays
+  (bpf/create-map {:map-type :hash
+                   :key-size 8
+                   :value-size 8
+                   :max-entries max-listen-ports
+                   :map-name "proxy_listen"}))
 
 (defn create-conntrack-map
   "Create per-CPU hash map for connection tracking.
@@ -52,33 +55,37 @@
    Value: conntrack state (56 bytes)"
   [{:keys [max-connections] :or {max-connections (:max-connections default-config)}}]
   (log/info "Creating conntrack per-CPU hash map with max-entries:" max-connections)
-  (bpf/create-percpu-hash-map
-    {:key-size 16
-     :value-size 56
-     :max-entries max-connections
-     :map-name "proxy_conntrack"}))
+  ;; Use create-map directly to get identity serializers for byte arrays
+  ;; Note: For per-CPU maps, the actual value size is value-size * num-cpus
+  (bpf/create-map {:map-type :percpu-hash
+                   :key-size 16
+                   :value-size 56
+                   :max-entries max-connections
+                   :map-name "proxy_conntrack"}))
 
 (defn create-settings-map
   "Create array map for global settings.
    Index 0: stats enabled (0/1)
    Index 1: connection timeout (seconds)
    Index 2: reserved
-   ..."
+   ...
+   Note: Using default 4-byte values since clj-ebpf array maps
+   use integer serializers."
   [{:keys [settings-entries] :or {settings-entries (:settings-entries default-config)}}]
   (log/info "Creating settings array map with" settings-entries "entries")
-  (bpf/create-array-map
-    {:value-size 8  ; 64-bit values
-     :max-entries settings-entries
-     :map-name "proxy_settings"}))
+  (bpf/create-array-map settings-entries
+    :map-name "proxy_settings"))
 
 (defn create-stats-ringbuf
   "Create ring buffer for streaming statistics events.
    Size must be a power of 2."
   [{:keys [ringbuf-size] :or {ringbuf-size (:ringbuf-size default-config)}}]
   (log/info "Creating stats ring buffer with size:" ringbuf-size)
-  (bpf/create-ringbuf-map
-    {:size ringbuf-size
-     :map-name "proxy_stats"}))
+  (bpf/create-map {:map-type :ringbuf
+                   :key-size 0
+                   :value-size 0
+                   :max-entries ringbuf-size
+                   :map-name "proxy_stats"}))
 
 (defn create-all-maps
   "Create all maps required for the reverse proxy.
@@ -256,40 +263,20 @@
 (def ^:const SETTING-CONN-TIMEOUT 1)
 (def ^:const SETTING-MAX-CONNS 2)
 
-(defn- encode-setting-value
-  "Encode a 64-bit setting value."
-  [value]
-  (let [buf (java.nio.ByteBuffer/allocate 8)]
-    (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)  ; Array maps typically use native byte order
-    (.putLong buf value)
-    (.array buf)))
-
-(defn- decode-setting-value
-  "Decode a 64-bit setting value."
-  [^bytes b]
-  (let [buf (java.nio.ByteBuffer/wrap b)]
-    (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)
-    (.getLong buf)))
+;; Note: clj-ebpf array maps use integer serializers by default,
+;; so we pass integers directly rather than byte arrays.
 
 (defn set-setting
   "Set a global setting by index."
   [settings-map index value]
-  (let [key-bytes (let [buf (java.nio.ByteBuffer/allocate 4)]
-                    (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)
-                    (.putInt buf index)
-                    (.array buf))
-        value-bytes (encode-setting-value value)]
-    (bpf/map-update settings-map key-bytes value-bytes)))
+  ;; clj-ebpf array maps expect integers for key and value
+  (bpf/map-update settings-map index (int value)))
 
 (defn get-setting
   "Get a global setting by index."
   [settings-map index]
-  (let [key-bytes (let [buf (java.nio.ByteBuffer/allocate 4)]
-                    (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)
-                    (.putInt buf index)
-                    (.array buf))]
-    (when-let [value-bytes (bpf/map-lookup settings-map key-bytes)]
-      (decode-setting-value value-bytes))))
+  ;; clj-ebpf array maps return integers
+  (bpf/map-lookup settings-map index))
 
 (defn enable-stats
   "Enable statistics collection in eBPF program."
@@ -328,15 +315,14 @@
    This is needed when building eBPF programs that reference maps."
   [m]
   ;; The actual implementation depends on how clj-ebpf exposes map FDs
-  ;; This may need to access internal state or use a specific API
-  (if (satisfies? bpf/IMapFD m)
-    (bpf/get-fd m)
-    ;; Fallback: assume the map object has an :fd key or is the fd itself
-    (cond
-      (map? m) (:fd m)
-      (number? m) m
-      :else (throw (ex-info "Cannot get file descriptor from map" {:map m})))))
-
-;; Define protocol for map FD access if not in clj-ebpf
-(defprotocol IMapFD
-  (get-fd [m] "Get the file descriptor for this map"))
+  ;; Try different approaches based on what the map object looks like
+  (cond
+    ;; If it's a number, assume it's already an FD
+    (number? m) m
+    ;; If it's a map with an :fd key
+    (and (map? m) (:fd m)) (:fd m)
+    ;; If clj-ebpf provides a get-fd function
+    (fn? (resolve 'clj-ebpf.core/get-fd)) ((resolve 'clj-ebpf.core/get-fd) m)
+    ;; If the map object has a method to get the fd
+    (instance? clojure.lang.ILookup m) (or (:fd m) (:file-descriptor m) m)
+    :else (throw (ex-info "Cannot get file descriptor from map" {:map m :type (type m)}))))

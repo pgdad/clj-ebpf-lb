@@ -14,11 +14,17 @@
   (:gen-class))
 
 ;;; =============================================================================
+;;; Forward Declarations
+;;; =============================================================================
+
+(declare apply-config! attach-interfaces! detach-interfaces!)
+
+;;; =============================================================================
 ;;; Proxy State
 ;;; =============================================================================
 
 (defonce ^:private proxy-state
-  "Global proxy state atom."
+  ;; Global proxy state atom.
   (atom nil))
 
 (defn get-state
