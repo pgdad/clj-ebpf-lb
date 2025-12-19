@@ -41,6 +41,21 @@
 ;; -28  : protocol (1 byte) + padding (3 bytes)
 ;; -32  : L4 header offset from data (4 bytes)
 ;; -40  : scratch space (8 bytes)
+;; -48  : packet length (8 bytes) - saved for stats update
+;;
+;; Conntrack value structure (64 bytes, from XDP):
+;;   offset 0:  orig_dst_ip (4) - for SNAT to restore as source
+;;   offset 4:  orig_dst_port (2)
+;;   offset 6:  pad (2)
+;;   offset 8:  nat_dst_ip (4)
+;;   offset 12: nat_dst_port (2)
+;;   offset 14: pad (2)
+;;   offset 16: created_ns (8)
+;;   offset 24: last_seen_ns (8) - updated by TC
+;;   offset 32: packets_fwd (8)
+;;   offset 40: packets_rev (8) - incremented by TC
+;;   offset 48: bytes_fwd (8)
+;;   offset 56: bytes_rev (8) - updated by TC
 
 ;;; =============================================================================
 ;;; Simple Pass-Through TC Program
@@ -110,6 +125,8 @@
 ;;; BPF Helper Constants for TC
 ;;; =============================================================================
 
+;; BPF helper function IDs
+(def ^:const BPF-FUNC-ktime-get-ns 5)
 ;; TC programs can use these checksum helpers (unlike XDP)
 (def ^:const BPF-FUNC-l3-csum-replace 10)
 (def ^:const BPF-FUNC-l4-csum-replace 11)
@@ -293,15 +310,32 @@
         [(asm/jmp :pass)])
 
       ;; =====================================================================
-      ;; PHASE 5: Perform SNAT
+      ;; PHASE 5: Update Conntrack Stats and Perform SNAT
       ;; =====================================================================
       [(asm/label :do_snat)]
 
-      ;; r9 = pointer to conntrack value:
-      ;; {orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + ...}
-      ;; We want to rewrite: src_ip -> orig_dst_ip, src_port -> orig_dst_port
+      ;; r9 = pointer to conntrack value (64 bytes, see layout in header)
+      ;; We want to:
+      ;; 1. Update timestamps and stats
+      ;; 2. Rewrite: src_ip -> orig_dst_ip, src_port -> orig_dst_port
 
-      ;; Load the new source values from conntrack
+      ;; --- Update last_seen_ns timestamp ---
+      [(dsl/call BPF-FUNC-ktime-get-ns)   ; r0 = current time in ns
+       (dsl/stx :dw :r9 :r0 24)]          ; value->last_seen_ns (offset 24)
+
+      ;; --- Increment packets_rev counter ---
+      [(dsl/ldx :dw :r0 :r9 40)           ; r0 = value->packets_rev
+       (dsl/add :r0 1)                    ; r0++
+       (dsl/stx :dw :r9 :r0 40)]          ; value->packets_rev = r0
+
+      ;; --- Add packet length to bytes_rev ---
+      ;; Get packet length from SKB->len (offset 0 in __sk_buff)
+      [(dsl/ldx :w :r1 :r6 0)             ; r1 = skb->len
+       (dsl/ldx :dw :r0 :r9 56)           ; r0 = value->bytes_rev
+       (dsl/add-reg :r0 :r1)              ; r0 += packet_len
+       (dsl/stx :dw :r9 :r0 56)]          ; value->bytes_rev = r0
+
+      ;; --- Load the new source values from conntrack ---
       ;; new_src_ip = orig_dst_ip (offset 0)
       ;; new_src_port = orig_dst_port (offset 4)
       [(dsl/ldx :w :r1 :r9 0)           ; r1 = new_src_ip (orig_dst_ip)

@@ -42,7 +42,19 @@
 ;; -64  : checksum scratch (8 bytes)
 ;; -72  : additional scratch (8 bytes)
 ;; -88  : Conntrack key (16 bytes: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3))
-;; -104 : Conntrack value (16 bytes: orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2))
+;; -152 : Conntrack value (64 bytes):
+;;        offset 0:  orig_dst_ip (4) - proxy's IP for SNAT to restore
+;;        offset 4:  orig_dst_port (2) - proxy's port
+;;        offset 6:  pad (2)
+;;        offset 8:  nat_dst_ip (4) - backend's IP
+;;        offset 12: nat_dst_port (2) - backend's port
+;;        offset 14: pad (2)
+;;        offset 16: created_ns (8) - entry creation timestamp
+;;        offset 24: last_seen_ns (8) - last packet timestamp
+;;        offset 32: packets_fwd (8) - forward direction packet count
+;;        offset 40: packets_rev (8) - reverse direction packet count
+;;        offset 48: bytes_fwd (8) - forward direction byte count
+;;        offset 56: bytes_rev (8) - reverse direction byte count
 
 ;;; =============================================================================
 ;;; Simple Pass-Through XDP Program
@@ -116,7 +128,8 @@
 ;;; XDP Checksum Helpers
 ;;; =============================================================================
 
-;; BPF helper function ID for csum_diff
+;; BPF helper function IDs
+(def ^:const BPF-FUNC-ktime-get-ns 5)
 (def ^:const BPF-FUNC-csum-diff 28)
 
 (defn xdp-fold-csum
@@ -530,20 +543,40 @@
        (dsl/stx :b :r10 :r0 -75)          ; key.pad[0]
        (dsl/stx :h :r10 :r0 -74)]         ; key.pad[1-2]
 
-      ;; Build conntrack value at stack[-104] (16 bytes)
-      ;; Value layout: orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2)
+      ;; Build conntrack value at stack[-152] (64 bytes)
+      ;; Value layout: see stack layout comment at top of file
+
+      ;; NAT mapping info (offsets 0-15)
       [(dsl/ldx :w :r0 :r10 -24)          ; r0 = old_dst_ip (for SNAT to restore)
-       (dsl/stx :w :r10 :r0 -104)         ; value.orig_dst_ip
+       (dsl/stx :w :r10 :r0 -152)         ; value.orig_dst_ip (offset 0)
        (dsl/ldx :h :r0 :r10 -28)          ; r0 = old_dst_port
-       (dsl/stx :h :r10 :r0 -100)         ; value.orig_dst_port
+       (dsl/stx :h :r10 :r0 -148)         ; value.orig_dst_port (offset 4)
        (dsl/mov :r0 0)
-       (dsl/stx :h :r10 :r0 -98)          ; value.pad
+       (dsl/stx :h :r10 :r0 -146)         ; value.pad (offset 6)
        (dsl/ldx :w :r0 :r10 -32)          ; r0 = nat_dst_ip (backend IP)
-       (dsl/stx :w :r10 :r0 -96)          ; value.nat_dst_ip
+       (dsl/stx :w :r10 :r0 -144)         ; value.nat_dst_ip (offset 8)
        (dsl/ldx :h :r0 :r10 -36)          ; r0 = nat_dst_port
-       (dsl/stx :h :r10 :r0 -92)          ; value.nat_dst_port
+       (dsl/stx :h :r10 :r0 -140)         ; value.nat_dst_port (offset 12)
        (dsl/mov :r0 0)
-       (dsl/stx :h :r10 :r0 -90)]         ; value.pad
+       (dsl/stx :h :r10 :r0 -138)]        ; value.pad (offset 14)
+
+      ;; Get current timestamp for created_ns and last_seen_ns
+      [(dsl/call BPF-FUNC-ktime-get-ns)   ; r0 = current time in ns
+       (dsl/stx :dw :r10 :r0 -136)        ; value.created_ns (offset 16)
+       (dsl/stx :dw :r10 :r0 -128)]       ; value.last_seen_ns (offset 24)
+
+      ;; Initialize packet counters: packets_fwd = 1, packets_rev = 0
+      [(dsl/mov :r0 1)
+       (dsl/stx :dw :r10 :r0 -120)        ; value.packets_fwd = 1 (offset 32)
+       (dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -112)]       ; value.packets_rev = 0 (offset 40)
+
+      ;; Calculate packet length: bytes_fwd = data_end - data
+      [(dsl/mov-reg :r0 :r8)              ; r0 = data_end
+       (dsl/sub-reg :r0 :r7)              ; r0 = data_end - data = packet length
+       (dsl/stx :dw :r10 :r0 -104)        ; value.bytes_fwd (offset 48)
+       (dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -96)]        ; value.bytes_rev = 0 (offset 56)
 
       ;; Call bpf_map_update_elem(conntrack_map, &key, &value, BPF_ANY)
       (if conntrack-map-fd
@@ -551,7 +584,7 @@
          (dsl/mov-reg :r2 :r10)
          (dsl/add :r2 -88)                 ; r2 = &key
          (dsl/mov-reg :r3 :r10)
-         (dsl/add :r3 -104)                ; r3 = &value
+         (dsl/add :r3 -152)                ; r3 = &value
          (dsl/mov :r4 0)                   ; r4 = BPF_ANY (0)
          (dsl/call 2)]                     ; bpf_map_update_elem
         ;; No conntrack map - skip update
