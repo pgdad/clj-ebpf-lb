@@ -19,26 +19,28 @@
 ;;; =============================================================================
 
 ;; The TC egress program handles the reply path:
-;; 1. Parse packet headers
-;; 2. Look up reverse connection in conntrack map
-;; 3. If found, rewrite source IP/port to original destination (SNAT)
-;; 4. Update checksums using kernel helpers
-;; 5. Return TC_ACT_OK to continue processing
+;; 1. Parse packet headers (Ethernet, IPv4, TCP/UDP)
+;; 2. Build reverse 5-tuple key from reply packet
+;; 3. Look up connection in conntrack map
+;; 4. If found, perform SNAT (rewrite source IP/port to original destination)
+;; 5. Update checksums using kernel helpers (bpf_l3_csum_replace, bpf_l4_csum_replace)
+;; 6. Return TC_ACT_OK to continue processing
 
 ;; Register allocation:
-;; r1 = SKB context (preserved in r6 after save)
-;; r6 = saved SKB context
-;; r7 = data pointer
-;; r8 = data_end pointer
-;; r9 = scratch / IP header pointer
+;; r1 = SKB context (input, clobbered by helpers)
+;; r6 = saved SKB context (callee-saved)
+;; r7 = data pointer (callee-saved)
+;; r8 = data_end pointer (callee-saved)
+;; r9 = IP header pointer / map value ptr (callee-saved)
+;; r0-r5 = scratch, clobbered by helper calls
 
-;; Stack layout for conntrack key (reverse 5-tuple):
-;; -4   : protocol (4 bytes, padded)
-;; -8   : src IP (from reply = dst of original)
-;; -12  : dst IP (from reply = src of original)
-;; -14  : src port (from reply)
-;; -16  : dst port (from reply)
-;; Total: 16 bytes aligned
+;; Stack layout (negative offsets from r10):
+;; -16  : Conntrack key (16 bytes): {src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3)}
+;; -20  : old_src_ip (4 bytes) - source IP before SNAT
+;; -24  : old_src_port (2 bytes) + padding (2 bytes)
+;; -28  : protocol (1 byte) + padding (3 bytes)
+;; -32  : L4 header offset from data (4 bytes)
+;; -40  : scratch space (8 bytes)
 
 ;;; =============================================================================
 ;;; Simple Pass-Through TC Program
@@ -105,6 +107,18 @@
    (dsl/ldx :w data-end-reg ctx-reg 80)]) ; data_end at offset 80
 
 ;;; =============================================================================
+;;; BPF Helper Constants for TC
+;;; =============================================================================
+
+;; TC programs can use these checksum helpers (unlike XDP)
+(def ^:const BPF-FUNC-l3-csum-replace 10)
+(def ^:const BPF-FUNC-l4-csum-replace 11)
+
+;; Flags for l4_csum_replace
+(def ^:const BPF-F-PSEUDO-HDR 0x10)
+(def ^:const BPF-F-HDR-FIELD-MASK 0xF)
+
+;;; =============================================================================
 ;;; Full TC Egress Program with SNAT
 ;;; =============================================================================
 
@@ -113,60 +127,327 @@
 
    This program:
    1. Parses IPv4/TCP or IPv4/UDP packets
-   2. Validates packet structure
-   3. Passes all valid packets (SNAT logic to be added)
+   2. Builds reverse 5-tuple key from reply packet
+   3. Looks up conntrack map to find original destination
+   4. If found, performs SNAT (rewrites src IP and port to original dest)
+   5. Updates IP and L4 checksums using kernel helpers
+   6. Returns TC_ACT_OK to continue processing
+
+   For a reply packet from backend to client:
+   - Reply: src=backend_ip:backend_port, dst=client_ip:client_port
+   - Reverse key: {client_ip, backend_ip, client_port, backend_port, proto}
+   - This matches the conntrack entry created by XDP DNAT
+   - SNAT rewrites: src=backend -> src=orig_dst (the proxy address)
 
    Register allocation:
    r6 = saved SKB context (callee-saved)
    r7 = data pointer (callee-saved)
    r8 = data_end pointer (callee-saved)
-   r9 = IP header pointer / scratch (callee-saved)
+   r9 = IP header pointer / map value ptr (callee-saved)
+   r0-r5 = scratch, clobbered by helpers
 
    Uses clj-ebpf.asm label-based assembly for automatic jump offset resolution."
-  [_conntrack-map-fd]
+  [conntrack-map-fd]
   (asm/assemble-with-labels
     (concat
+      ;; =====================================================================
+      ;; PHASE 1: Context Setup and Ethernet Parsing
+      ;; =====================================================================
+
       ;; Save SKB context to callee-saved register
       [(dsl/mov-reg :r6 :r1)]
 
       ;; Load data and data_end pointers from SKB context
-      ;; Using 32-bit loads as required by the kernel
       (tc-load-data-ptrs-32 :r7 :r8 :r1)
 
-      ;; Check Ethernet header bounds - jump to :pass if out of bounds
+      ;; Check Ethernet header bounds
       (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass :r9)
 
-      ;; Load ethertype
+      ;; Load and check ethertype for IPv4
       (eth/load-ethertype :r9 :r7)
-
-      ;; Check for IPv4 - jump to :pass if not IPv4
       [(asm/jmp-imm :jne :r9 eth/ETH-P-IP-BE :pass)]
+
+      ;; =====================================================================
+      ;; PHASE 2: IPv4 Header Parsing
+      ;; =====================================================================
 
       ;; Calculate IP header pointer: data + ETH_HLEN
       (eth/get-ip-header-ptr :r9 :r7)
 
-      ;; Check IP header bounds - jump to :pass if out of bounds
+      ;; Check IP header bounds (minimum 20 bytes)
       (asm/check-bounds :r9 :r8 net/IPV4-MIN-HLEN :pass :r0)
 
-      ;; PASS label - return TC_ACT_OK
+      ;; Load and store protocol
+      [(dsl/ldx :b :r0 :r9 9)           ; protocol at offset 9
+       (dsl/stx :b :r10 :r0 -28)]       ; store at stack[-28]
+
+      ;; Load source IP (backend) and destination IP (client)
+      ;; For conntrack key, we need to REVERSE: key.src = client, key.dst = backend
+      [(dsl/ldx :w :r0 :r9 12)          ; src_ip (backend) at offset 12
+       (dsl/stx :w :r10 :r0 -20)        ; store as old_src_ip at stack[-20]
+       (dsl/stx :w :r10 :r0 -12)]       ; store as key.dst_ip at stack[-12]
+
+      [(dsl/ldx :w :r0 :r9 16)          ; dst_ip (client) at offset 16
+       (dsl/stx :w :r10 :r0 -16)]       ; store as key.src_ip at stack[-16]
+
+      ;; =====================================================================
+      ;; PHASE 3: Protocol Branching
+      ;; =====================================================================
+
+      ;; Check protocol and branch
+      [(dsl/ldx :b :r0 :r10 -28)        ; load protocol
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_path)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-UDP :udp_path)
+       (asm/jmp :pass)]                  ; not TCP or UDP, pass through
+
+      ;; =====================================================================
+      ;; TCP Path: Parse TCP header and extract ports
+      ;; =====================================================================
+      [(asm/label :tcp_path)]
+
+      ;; Calculate L4 header offset and store
+      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :w :r10 :r0 -32)]       ; L4 offset at stack[-32]
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
+
+      ;; Check TCP header bounds (need at least 4 bytes for ports)
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 4)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Load TCP ports and build reverse key
+      ;; Reply has: src=backend_port, dst=client_port
+      ;; Key needs: src_port=client_port, dst_port=backend_port
+      [(dsl/ldx :h :r1 :r0 0)           ; src_port (backend)
+       (dsl/stx :h :r10 :r1 -24)        ; store as old_src_port at stack[-24]
+       (dsl/stx :h :r10 :r1 -6)]        ; store as key.dst_port at stack[-6]
+
+      [(dsl/ldx :h :r1 :r0 2)           ; dst_port (client)
+       (dsl/stx :h :r10 :r1 -8)]        ; store as key.src_port at stack[-8]
+
+      ;; Store protocol in key and padding
+      [(dsl/ldx :b :r0 :r10 -28)        ; load protocol
+       (dsl/stx :b :r10 :r0 -4)         ; key.protocol at stack[-4]
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -3)         ; padding
+       (dsl/stx :h :r10 :r0 -2)]        ; padding (2 bytes)
+
+      [(asm/jmp :lookup_conntrack)]
+
+      ;; =====================================================================
+      ;; UDP Path: Parse UDP header and extract ports
+      ;; =====================================================================
+      [(asm/label :udp_path)]
+
+      ;; Calculate L4 header offset
+      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :w :r10 :r0 -32)]
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
+
+      ;; Check UDP header bounds
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 4)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Load UDP ports and build reverse key
+      [(dsl/ldx :h :r1 :r0 0)           ; src_port (backend)
+       (dsl/stx :h :r10 :r1 -24)        ; old_src_port
+       (dsl/stx :h :r10 :r1 -6)]        ; key.dst_port
+
+      [(dsl/ldx :h :r1 :r0 2)           ; dst_port (client)
+       (dsl/stx :h :r10 :r1 -8)]        ; key.src_port
+
+      ;; Store protocol and padding
+      [(dsl/ldx :b :r0 :r10 -28)
+       (dsl/stx :b :r10 :r0 -4)
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -3)
+       (dsl/stx :h :r10 :r0 -2)]
+
+      ;; Fall through to lookup_conntrack
+
+      ;; =====================================================================
+      ;; PHASE 4: Conntrack Lookup
+      ;; =====================================================================
+      [(asm/label :lookup_conntrack)]
+
+      ;; Call bpf_map_lookup_elem(conntrack_map, &key)
+      (if conntrack-map-fd
+        (concat
+          [(dsl/ld-map-fd :r1 conntrack-map-fd)
+           (dsl/mov-reg :r2 :r10)
+           (dsl/add :r2 -16)              ; r2 = &key (stack[-16])
+           (dsl/call 1)]                   ; bpf_map_lookup_elem
+          ;; r0 = value ptr or NULL
+          [(asm/jmp-imm :jeq :r0 0 :pass) ; no entry = not tracked, pass through
+           ;; Save map value pointer in r9
+           (dsl/mov-reg :r9 :r0)
+           (asm/jmp :do_snat)])
+        ;; No conntrack map - pass all traffic
+        [(asm/jmp :pass)])
+
+      ;; =====================================================================
+      ;; PHASE 5: Perform SNAT
+      ;; =====================================================================
+      [(asm/label :do_snat)]
+
+      ;; r9 = pointer to conntrack value:
+      ;; {orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + ...}
+      ;; We want to rewrite: src_ip -> orig_dst_ip, src_port -> orig_dst_port
+
+      ;; Load the new source values from conntrack
+      ;; new_src_ip = orig_dst_ip (offset 0)
+      ;; new_src_port = orig_dst_port (offset 4)
+      [(dsl/ldx :w :r1 :r9 0)           ; r1 = new_src_ip (orig_dst_ip)
+       (dsl/stx :w :r10 :r1 -40)]       ; save at stack[-40]
+
+      [(dsl/ldx :h :r2 :r9 4)           ; r2 = new_src_port (orig_dst_port)
+       (dsl/stx :h :r10 :r2 -38)]       ; save at stack[-38]
+
+      ;; Branch by protocol for checksum calculation
+      [(dsl/ldx :b :r0 :r10 -28)        ; load protocol
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_snat)
+       (asm/jmp :udp_snat)]
+
+      ;; =====================================================================
+      ;; TCP SNAT: Update checksums and write new values
+      ;; =====================================================================
+      [(asm/label :tcp_snat)]
+
+      ;; --- Update IP Checksum for src_ip change ---
+      ;; bpf_l3_csum_replace(skb, csum_offset, old_val, new_val, flags)
+      ;; IP checksum is at ETH_HLEN + 10 = 24
+      [(dsl/mov-reg :r1 :r6)            ; r1 = skb
+       (dsl/mov :r2 (+ net/ETH-HLEN 10)) ; r2 = IP checksum offset (14 + 10 = 24)
+       (dsl/ldx :w :r3 :r10 -20)        ; r3 = old_src_ip
+       (dsl/ldx :w :r4 :r10 -40)        ; r4 = new_src_ip
+       (dsl/mov :r5 4)                  ; r5 = sizeof(u32)
+       (dsl/call BPF-FUNC-l3-csum-replace)]
+
+      ;; --- Update TCP Checksum for src_ip change (pseudo-header) ---
+      ;; TCP checksum is at ETH_HLEN + IPV4_MIN_HLEN + 16 = 50
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 16)) ; TCP checksum offset = 50
+       (dsl/ldx :w :r3 :r10 -20)        ; old_src_ip
+       (dsl/ldx :w :r4 :r10 -40)        ; new_src_ip
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4)) ; flags: pseudo-header + sizeof
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; --- Update TCP Checksum for src_port change ---
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 16)) ; TCP checksum offset
+       (dsl/ldx :h :r3 :r10 -24)        ; old_src_port
+       (dsl/ldx :h :r4 :r10 -38)        ; new_src_port
+       (dsl/mov :r5 2)                  ; sizeof(u16), no pseudo-header for port
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; --- Write new src_ip to IP header ---
+      ;; Need to reload data pointer as it may have changed
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+
+      ;; Get IP header pointer
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)       ; r9 = IP header
+       (dsl/ldx :w :r1 :r10 -40)        ; r1 = new_src_ip
+       (dsl/stx :w :r9 :r1 12)]         ; ip->saddr = new_src_ip
+
+      ;; --- Write new src_port to TCP header ---
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -38)        ; r1 = new_src_port
+       (dsl/stx :h :r0 :r1 0)]          ; tcp->sport = new_src_port
+
+      [(asm/jmp :done)]
+
+      ;; =====================================================================
+      ;; UDP SNAT: Update checksums and write new values
+      ;; =====================================================================
+      [(asm/label :udp_snat)]
+
+      ;; --- Update IP Checksum for src_ip change ---
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN 10))
+       (dsl/ldx :w :r3 :r10 -20)
+       (dsl/ldx :w :r4 :r10 -40)
+       (dsl/mov :r5 4)
+       (dsl/call BPF-FUNC-l3-csum-replace)]
+
+      ;; --- Check if UDP checksum is enabled (non-zero) ---
+      ;; Reload data pointer
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r0 6)]          ; UDP checksum at offset 6
+      [(asm/jmp-imm :jeq :r1 0 :udp_write_values)] ; skip L4 csum if disabled
+
+      ;; --- Update UDP Checksum for src_ip change (pseudo-header) ---
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 6)) ; UDP checksum offset = 40
+       (dsl/ldx :w :r3 :r10 -20)
+       (dsl/ldx :w :r4 :r10 -40)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; --- Update UDP Checksum for src_port change ---
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 6))
+       (dsl/ldx :h :r3 :r10 -24)
+       (dsl/ldx :h :r4 :r10 -38)
+       (dsl/mov :r5 2)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(asm/label :udp_write_values)]
+
+      ;; --- Write new values ---
+      ;; Reload data pointer
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+
+      ;; Write new src_ip to IP header
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -40)
+       (dsl/stx :w :r9 :r1 12)]
+
+      ;; Write new src_port to UDP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -38)
+       (dsl/stx :h :r0 :r1 0)]
+
+      ;; Fall through to done
+
+      ;; =====================================================================
+      ;; Return TC_ACT_OK
+      ;; =====================================================================
+      [(asm/label :done)]
+      (net/return-action net/TC-ACT-OK)
+
       [(asm/label :pass)]
       (net/return-action net/TC-ACT-OK))))
 
 (defn build-tc-egress-program
   "Build the TC egress program.
 
-   Uses the SNAT program with proper jump offset calculation.
-   The program parses Ethernet and IPv4 headers and validates bounds.
+   Performs SNAT on reply packets from backends:
+   1. Parses IPv4/TCP/UDP headers
+   2. Builds reverse 5-tuple key from reply packet
+   3. Looks up conntrack map to find original destination
+   4. If found, rewrites source IP/port to original destination
+   5. Updates checksums using kernel helpers
+   6. Returns TC_ACT_OK
 
-   Map FDs are accepted for future SNAT implementation but currently
-   the program only does packet validation and passes all valid packets."
+   map-fds: Map containing :conntrack-map"
   [map-fds]
-  (if (and (map? map-fds)
-           (:conntrack-map map-fds))
-    (build-tc-snat-program
-      (common/map-fd (:conntrack-map map-fds)))
-    ;; Use SNAT program even without maps (it just passes packets)
-    (build-tc-snat-program nil)))
+  (let [conntrack-map-fd (when (and (map? map-fds) (:conntrack-map map-fds))
+                           (common/map-fd (:conntrack-map map-fds)))]
+    (build-tc-snat-program conntrack-map-fd)))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment
