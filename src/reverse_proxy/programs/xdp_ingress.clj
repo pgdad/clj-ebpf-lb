@@ -287,9 +287,9 @@
       [(dsl/mov-reg :r0 :r7)
        (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
 
-      ;; Check TCP header bounds (need at least 4 bytes for ports)
+      ;; Check TCP header bounds (need at least 20 bytes for checksum access at offset 16)
       [(dsl/mov-reg :r1 :r0)
-       (dsl/add :r1 4)
+       (dsl/add :r1 20)
        (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       ;; Load TCP ports
@@ -314,9 +314,9 @@
       [(dsl/mov-reg :r0 :r7)
        (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
 
-      ;; Check UDP header bounds (need at least 4 bytes for ports)
+      ;; Check UDP header bounds (need at least 8 bytes for checksum access at offset 6)
       [(dsl/mov-reg :r1 :r0)
-       (dsl/add :r1 4)
+       (dsl/add :r1 8)
        (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       ;; Load UDP ports
@@ -381,6 +381,15 @@
       ;; =====================================================================
       [(asm/label :tcp_nat)]
 
+      ;; Re-validate packet bounds after map lookups (verifier loses tracking)
+      ;; Reload data/data_end from xdp context
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+
+      ;; Re-check bounds for IP + TCP header access (14 + 20 + 20 = 54 bytes)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 54)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
       ;; Get IP header pointer back
       [(dsl/mov-reg :r9 :r7)
        (dsl/add :r9 net/ETH-HLEN)]       ; r9 = IP header
@@ -398,6 +407,12 @@
 
       ;; Save diff for L4 checksum
       [(dsl/stx :w :r10 :r0 -64)]        ; stack[-64] = ip_diff
+
+      ;; Re-validate bounds after csum_diff call
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 54)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       ;; Load old IP checksum and apply diff
       [(dsl/mov-reg :r9 :r7)
@@ -456,6 +471,14 @@
       ;; =====================================================================
       [(asm/label :udp_nat)]
 
+      ;; Re-validate packet bounds after map lookups (verifier loses tracking)
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+
+      ;; Re-check bounds for IP + UDP header (14 + 20 + 8 = 42 bytes)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
       ;; Get IP header pointer
       [(dsl/mov-reg :r9 :r7)
        (dsl/add :r9 net/ETH-HLEN)]
@@ -472,6 +495,12 @@
 
       ;; Save diff for L4 checksum
       [(dsl/stx :w :r10 :r0 -64)]
+
+      ;; Re-validate bounds after csum_diff call
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       ;; Apply diff to IP checksum
       [(dsl/mov-reg :r9 :r7)
