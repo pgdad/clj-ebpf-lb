@@ -81,6 +81,44 @@
        (dsl/exit-insn)])))
 
 ;;; =============================================================================
+;;; TC Context Access Helpers
+;;; =============================================================================
+
+;; The __sk_buff struct fields are accessed as 32-bit values.
+;; For TC programs, data and data_end are at different offsets than XDP.
+;;
+;; struct __sk_buff (relevant fields):
+;;     ...
+;;     __u32 data;         // offset 76
+;;     __u32 data_end;     // offset 80
+;;     ...
+
+(defn tc-load-data-ptrs-32
+  "Load data and data_end pointers from SKB context using 32-bit loads.
+
+   data-reg: Register to store data pointer
+   data-end-reg: Register to store data_end pointer
+   ctx-reg: SKB context register (typically :r1)"
+  [data-reg data-end-reg ctx-reg]
+  [(dsl/ldx :w data-reg ctx-reg 76)     ; data at offset 76
+   (dsl/ldx :w data-end-reg ctx-reg 80)]) ; data_end at offset 80
+
+;;; =============================================================================
+;;; Jump Offset Calculation Helpers
+;;; =============================================================================
+
+(defn calculate-jump-offset
+  "Calculate BPF jump offset from source instruction to target instruction.
+   BPF jump offsets are relative to the NEXT instruction after the jump.
+
+   source-idx: Index of the jump instruction
+   target-idx: Index of the target instruction
+
+   Returns: Number of instructions to skip"
+  [source-idx target-idx]
+  (- target-idx source-idx 1))
+
+;;; =============================================================================
 ;;; Full TC Egress Program with SNAT
 ;;; =============================================================================
 
@@ -89,9 +127,8 @@
 
    This program:
    1. Parses IPv4/TCP or IPv4/UDP packets
-   2. Looks up reverse connection in conntrack map
-   3. If found, rewrites source IP/port to original destination
-   4. Updates checksums using kernel helpers
+   2. Validates packet structure
+   3. Passes all valid packets (SNAT logic to be added)
 
    Register allocation:
    r6 = saved SKB context (callee-saved)
@@ -99,61 +136,95 @@
    r8 = data_end pointer (callee-saved)
    r9 = IP header pointer / scratch (callee-saved)
 
-   Stack layout:
-   -16 : conntrack key (16 bytes)
-   -24 : scratch space"
-  [conntrack-map-fd]
-  ;; Calculate jump offsets for the program flow
-  ;; pass-label: jump to TC_ACT_OK and exit
-  ;; The offsets depend on the number of instructions
-  (let [;; Offsets calculated based on instruction count
-        ;; These are approximate and may need adjustment
-        pass-offset 2]  ; Jump to pass label (2 instructions forward)
+   Jump offset calculation:
+   We need to calculate the exact number of instructions between each
+   conditional jump and the PASS label at the end."
+  [_conntrack-map-fd]
+  ;; Build instruction blocks and count them to calculate proper offsets
+  ;;
+  ;; Program structure:
+  ;; Block 0: Save context (1 insn)
+  ;; Block 1: Load data ptrs (2 insns)
+  ;; Block 2: Check ETH bounds (3 insns, last is jump)
+  ;; Block 3: Load ethertype (1 insn)
+  ;; Block 4: Check IPv4 (1 insn, jump)
+  ;; Block 5: Get IP header ptr (2 insns)
+  ;; Block 6: Check IP bounds (3 insns, last is jump)
+  ;; Block 7: PASS - return action (2 insns)
+
+  (let [;; Count instructions in each block
+        block-0-count 1   ; mov-reg :r6 :r1
+        block-1-count 2   ; tc-load-data-ptrs-32
+        block-2-count 3   ; check-bounds (mov-reg, add, jmp-reg)
+        block-3-count 1   ; load-ethertype
+        block-4-count 1   ; is-not-ipv4 (jmp-imm)
+        block-5-count 2   ; get-ip-header-ptr
+        block-6-count 3   ; check-bounds (mov-reg, add, jmp-reg)
+        block-7-count 2   ; return-action (mov, exit)
+
+        ;; Calculate instruction indices (0-based)
+        block-0-start 0
+        block-1-start (+ block-0-start block-0-count)  ; 1
+        block-2-start (+ block-1-start block-1-count)  ; 3
+        block-3-start (+ block-2-start block-2-count)  ; 6
+        block-4-start (+ block-3-start block-3-count)  ; 7
+        block-5-start (+ block-4-start block-4-count)  ; 8
+        block-6-start (+ block-5-start block-5-count)  ; 10
+        block-7-start (+ block-6-start block-6-count)  ; 13 (PASS label)
+
+        ;; Jump sources (index of the jump instruction)
+        jump-2-idx (+ block-2-start 2)  ; 5
+        jump-4-idx block-4-start        ; 7
+        jump-6-idx (+ block-6-start 2)  ; 12
+
+        ;; Calculate offsets to PASS label (block-7-start = 13)
+        pass-label block-7-start
+        offset-from-jump-2 (calculate-jump-offset jump-2-idx pass-label)  ; 13-5-1 = 7
+        offset-from-jump-4 (calculate-jump-offset jump-4-idx pass-label)  ; 13-7-1 = 5
+        offset-from-jump-6 (calculate-jump-offset jump-6-idx pass-label)] ; 13-12-1 = 0
+
     (bpf/assemble
       (concat
-        ;; === Program Entry ===
-        ;; Save SKB context to callee-saved register
+        ;; Block 0: Save SKB context to callee-saved register
         [(dsl/mov-reg :r6 :r1)]
 
-        ;; Load data and data_end pointers
-        ;; SKB: data at offset 76, data_end at offset 80
-        (net/tc-load-data-ptrs :r7 :r8 :r1)
+        ;; Block 1: Load data and data_end pointers from SKB context
+        ;; Using 32-bit loads as required by the kernel
+        (tc-load-data-ptrs-32 :r7 :r8 :r1)
 
-        ;; === Parse Ethernet Header ===
-        ;; Check we have at least ETH_HLEN bytes
-        (net/check-bounds :r7 :r8 net/ETH-HLEN pass-offset :r9)
+        ;; Block 2: Check Ethernet header bounds
+        (net/check-bounds :r7 :r8 net/ETH-HLEN offset-from-jump-2 :r9)
 
-        ;; Load ethertype and check for IPv4
+        ;; Block 3: Load ethertype
         (eth/load-ethertype :r9 :r7)
-        (eth/is-not-ipv4 :r9 pass-offset)
 
-        ;; === Parse IPv4 Header ===
-        ;; Calculate IP header pointer: data + ETH_HLEN
+        ;; Block 4: Check for IPv4
+        (eth/is-not-ipv4 :r9 offset-from-jump-4)
+
+        ;; Block 5: Calculate IP header pointer: data + ETH_HLEN
         (eth/get-ip-header-ptr :r9 :r7)
 
-        ;; Check IP header bounds
-        (net/check-bounds :r9 :r8 net/IPV4-MIN-HLEN pass-offset :r0)
+        ;; Block 6: Check IP header bounds
+        (net/check-bounds :r9 :r8 net/IPV4-MIN-HLEN offset-from-jump-6 :r0)
 
-        ;; For now, just pass all packets
-        ;; Full SNAT with conntrack lookup requires more complex
-        ;; instruction sequence with proper jump offset calculations
-
-        ;; === Pass Label ===
+        ;; Block 7: PASS - return TC_ACT_OK
         (net/return-action net/TC-ACT-OK)))))
 
 (defn build-tc-egress-program
   "Build the TC egress program.
 
-   Currently uses pass-through mode while SNAT implementation
-   with proper jump offset calculation is in development.
+   Uses the SNAT program with proper jump offset calculation.
+   The program parses Ethernet and IPv4 headers and validates bounds.
 
-   The SNAT program structure is ready but needs careful
-   instruction counting to calculate correct jump offsets."
-  [_map-fds]
-  ;; Use pass-through for now - SNAT requires proper jump offset calculation
-  ;; The build-tc-snat-program has the right structure but jump offsets
-  ;; need to be calculated based on actual instruction counts
-  (build-tc-pass-program))
+   Map FDs are accepted for future SNAT implementation but currently
+   the program only does packet validation and passes all valid packets."
+  [map-fds]
+  (if (and (map? map-fds)
+           (:conntrack-map map-fds))
+    (build-tc-snat-program
+      (common/map-fd (:conntrack-map map-fds)))
+    ;; Use SNAT program even without maps (it just passes packets)
+    (build-tc-snat-program nil)))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment
