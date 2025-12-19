@@ -19,19 +19,28 @@
 ;;; =============================================================================
 
 ;; Register allocation:
-;; r1 = XDP context (preserved in r6 after save)
-;; r6 = saved context / scratch
-;; r7 = data pointer
-;; r8 = data_end pointer
-;; r9 = scratch / IP header pointer
+;; r1 = XDP context (input, clobbered by helpers)
+;; r6 = saved XDP context (callee-saved)
+;; r7 = data pointer (callee-saved)
+;; r8 = data_end pointer (callee-saved)
+;; r9 = IP header pointer / map value ptr (callee-saved)
+;; r0-r5 = scratch, clobbered by helper calls
 
 ;; Stack layout (negative offsets from r10):
-;; -8   : Listen map key (8 bytes: ifindex + port + padding)
-;; -16  : LPM key (8 bytes: prefix_len + ip)
-;; -24  : Original dst IP (4 bytes) + Original dst port (4 bytes)
-;; -32  : Conntrack key start (16 bytes)
-;; -48  : Conntrack value (56 bytes)
-;; -104 : Scratch space
+;; -8   : Listen map key (8 bytes: ifindex(4) + port(2) + pad(2))
+;; -16  : LPM key (8 bytes: prefix_len(4) + ip(4))
+;; -24  : old_dst_ip (4 bytes)
+;; -28  : old_dst_port (2 bytes) + pad (2 bytes)
+;; -32  : nat_dst_ip (4 bytes)
+;; -36  : nat_dst_port (2 bytes) + pad (2 bytes)
+;; -40  : src_ip (4 bytes)
+;; -44  : dst_ip original (4 bytes)
+;; -48  : src_port (2 bytes)
+;; -50  : dst_port original (2 bytes)
+;; -52  : protocol (1 byte) + pad (3 bytes)
+;; -56  : L4 header offset from data (4 bytes)
+;; -64  : checksum scratch (8 bytes)
+;; -72  : additional scratch (8 bytes)
 
 ;;; =============================================================================
 ;;; Simple Pass-Through XDP Program
@@ -102,6 +111,77 @@
    (dsl/ldx :w data-end-reg ctx-reg 4)]) ; data_end at offset 4
 
 ;;; =============================================================================
+;;; XDP Checksum Helpers
+;;; =============================================================================
+
+;; BPF helper function ID for csum_diff
+(def ^:const BPF-FUNC-csum-diff 28)
+
+(defn xdp-fold-csum
+  "Fold a 32-bit checksum to 16 bits in XDP.
+   csum-reg will contain the folded result.
+   scratch-reg is clobbered."
+  [csum-reg scratch-reg]
+  [;; First fold: csum = (csum & 0xffff) + (csum >> 16)
+   (dsl/mov-reg scratch-reg csum-reg)
+   (dsl/rsh scratch-reg 16)
+   (dsl/and csum-reg 0xFFFF)
+   (dsl/add-reg csum-reg scratch-reg)
+   ;; Second fold (handles carry from first fold)
+   (dsl/mov-reg scratch-reg csum-reg)
+   (dsl/rsh scratch-reg 16)
+   (dsl/and csum-reg 0xFFFF)
+   (dsl/add-reg csum-reg scratch-reg)])
+
+(defn xdp-apply-csum-diff
+  "Apply a checksum difference to an existing checksum.
+   old-csum-reg: Register containing old checksum (16-bit, will be modified)
+   diff-reg: Register containing the difference from csum_diff
+   scratch-reg: Scratch register
+
+   Result: old-csum-reg contains new 16-bit checksum"
+  [old-csum-reg diff-reg scratch-reg]
+  (concat
+    ;; Negate old checksum: ~old_csum
+    [(dsl/xor-op old-csum-reg 0xFFFF)]
+    ;; Add difference: ~old_csum + diff
+    [(dsl/add-reg old-csum-reg diff-reg)]
+    ;; Fold to 16 bits
+    (xdp-fold-csum old-csum-reg scratch-reg)
+    ;; Negate result: ~(~old_csum + diff)
+    [(dsl/xor-op old-csum-reg 0xFFFF)]))
+
+(defn xdp-update-csum-for-port-change
+  "Update checksum for a 2-byte port change.
+   csum-reg: Register containing current checksum (will be modified)
+   old-port-reg: Register containing old port value
+   new-port-reg: Register containing new port value
+   scratch-reg: Scratch register
+
+   Uses incremental checksum: new_csum = ~(~old_csum + ~old_val + new_val)"
+  [csum-reg old-port-reg new-port-reg scratch-reg]
+  [;; Negate old checksum
+   (dsl/xor-op csum-reg 0xFFFF)
+   ;; Add ~old_port (ones complement negation)
+   (dsl/mov-reg scratch-reg old-port-reg)
+   (dsl/xor-op scratch-reg 0xFFFF)
+   (dsl/add-reg csum-reg scratch-reg)
+   ;; Add new_port
+   (dsl/add-reg csum-reg new-port-reg)
+   ;; Fold to 16 bits (first pass)
+   (dsl/mov-reg scratch-reg csum-reg)
+   (dsl/rsh scratch-reg 16)
+   (dsl/and csum-reg 0xFFFF)
+   (dsl/add-reg csum-reg scratch-reg)
+   ;; Second fold
+   (dsl/mov-reg scratch-reg csum-reg)
+   (dsl/rsh scratch-reg 16)
+   (dsl/and csum-reg 0xFFFF)
+   (dsl/add-reg csum-reg scratch-reg)
+   ;; Negate result
+   (dsl/xor-op csum-reg 0xFFFF)])
+
+;;; =============================================================================
 ;;; Full XDP Ingress Program with DNAT
 ;;; =============================================================================
 
@@ -110,62 +190,345 @@
 
    This program:
    1. Parses IPv4/TCP or IPv4/UDP packets
-   2. Validates packet structure
-   3. Passes all valid packets (DNAT logic to be added)
+   2. Looks up listen map by (ifindex, dst_port)
+   3. Falls back to config map LPM lookup by source IP
+   4. If match found, performs DNAT (rewrites dst IP and port)
+   5. Updates IP and L4 checksums
+   6. Returns XDP_PASS to let kernel routing deliver packet
 
    Register allocation:
    r6 = saved XDP context (callee-saved)
    r7 = data pointer (callee-saved)
    r8 = data_end pointer (callee-saved)
-   r9 = IP header pointer / scratch (callee-saved)
+   r9 = IP header pointer / map value ptr (callee-saved)
+   r0-r5 = scratch, clobbered by helpers
 
    Uses clj-ebpf.asm label-based assembly for automatic jump offset resolution."
-  [_listen-map-fd _conntrack-map-fd]
+  [listen-map-fd config-map-fd]
   (asm/assemble-with-labels
     (concat
+      ;; =====================================================================
+      ;; PHASE 1: Context Setup and Ethernet Parsing
+      ;; =====================================================================
+
       ;; Save XDP context to callee-saved register
       [(dsl/mov-reg :r6 :r1)]
 
       ;; Load data and data_end pointers from XDP context
-      ;; Using 32-bit loads as required by the kernel for xdp_md access
       (xdp-load-data-ptrs-32 :r7 :r8 :r1)
 
-      ;; Check Ethernet header bounds - jump to :pass if out of bounds
+      ;; Check Ethernet header bounds
       (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass :r9)
 
-      ;; Load ethertype
+      ;; Load and check ethertype for IPv4
       (eth/load-ethertype :r9 :r7)
-
-      ;; Check for IPv4 - jump to :pass if not IPv4
       [(asm/jmp-imm :jne :r9 eth/ETH-P-IP-BE :pass)]
+
+      ;; =====================================================================
+      ;; PHASE 2: IPv4 Header Parsing
+      ;; =====================================================================
 
       ;; Calculate IP header pointer: data + ETH_HLEN
       (eth/get-ip-header-ptr :r9 :r7)
 
-      ;; Check IP header bounds - jump to :pass if out of bounds
+      ;; Check IP header bounds (minimum 20 bytes)
       (asm/check-bounds :r9 :r8 net/IPV4-MIN-HLEN :pass :r0)
 
-      ;; PASS label - return XDP_PASS
+      ;; Load and store protocol
+      [(dsl/ldx :b :r0 :r9 9)           ; protocol at offset 9
+       (dsl/stx :b :r10 :r0 -52)]       ; store at stack[-52]
+
+      ;; Load and store source IP
+      [(dsl/ldx :w :r0 :r9 12)          ; src_ip at offset 12
+       (dsl/stx :w :r10 :r0 -40)]       ; store at stack[-40]
+
+      ;; Load and store destination IP (original)
+      [(dsl/ldx :w :r0 :r9 16)          ; dst_ip at offset 16
+       (dsl/stx :w :r10 :r0 -24)        ; store at stack[-24] (old_dst_ip)
+       (dsl/stx :w :r10 :r0 -44)]       ; store at stack[-44] (for conntrack)
+
+      ;; =====================================================================
+      ;; PHASE 3: Protocol Branching
+      ;; =====================================================================
+
+      ;; Check protocol and branch
+      [(dsl/ldx :b :r0 :r10 -52)        ; load protocol
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_path)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-UDP :udp_path)
+       (asm/jmp :pass)]                  ; not TCP or UDP, pass through
+
+      ;; =====================================================================
+      ;; TCP Path: Parse TCP header and extract ports
+      ;; =====================================================================
+      [(asm/label :tcp_path)]
+
+      ;; Calculate L4 header offset: ETH_HLEN + IPV4_MIN_HLEN = 34
+      ;; Note: For simplicity, we assume no IP options (20-byte IP header)
+      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :w :r10 :r0 -56)]       ; store L4 offset at stack[-56]
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
+
+      ;; Check TCP header bounds (need at least 4 bytes for ports)
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 4)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Load TCP ports
+      [(dsl/ldx :h :r1 :r0 0)           ; src_port at offset 0
+       (dsl/stx :h :r10 :r1 -48)        ; store at stack[-48]
+       (dsl/ldx :h :r1 :r0 2)           ; dst_port at offset 2
+       (dsl/stx :h :r10 :r1 -28)        ; store at stack[-28] (old_dst_port)
+       (dsl/stx :h :r10 :r1 -50)]       ; store at stack[-50] (for conntrack)
+
+      [(asm/jmp :lookup_listen)]
+
+      ;; =====================================================================
+      ;; UDP Path: Parse UDP header and extract ports
+      ;; =====================================================================
+      [(asm/label :udp_path)]
+
+      ;; Calculate L4 header offset
+      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :w :r10 :r0 -56)]
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
+
+      ;; Check UDP header bounds (need at least 4 bytes for ports)
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 4)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Load UDP ports
+      [(dsl/ldx :h :r1 :r0 0)           ; src_port
+       (dsl/stx :h :r10 :r1 -48)
+       (dsl/ldx :h :r1 :r0 2)           ; dst_port
+       (dsl/stx :h :r10 :r1 -28)        ; old_dst_port
+       (dsl/stx :h :r10 :r1 -50)]
+
+      ;; Fall through to lookup_listen
+
+      ;; =====================================================================
+      ;; PHASE 4: Listen Map Lookup
+      ;; =====================================================================
+      [(asm/label :lookup_listen)]
+
+      ;; Build listen map key at stack[-8]: {ifindex(4) + port(2) + pad(2)}
+      ;; Load ifindex from xdp_md->ingress_ifindex (offset 12)
+      [(dsl/ldx :w :r0 :r6 12)          ; r0 = ifindex
+       (dsl/stx :w :r10 :r0 -8)         ; key.ifindex = ifindex
+       (dsl/ldx :h :r0 :r10 -28)        ; r0 = dst_port (old)
+       (dsl/stx :h :r10 :r0 -4)         ; key.port = dst_port
+       (dsl/mov :r0 0)
+       (dsl/stx :h :r10 :r0 -2)]        ; key.pad = 0
+
+      ;; Call bpf_map_lookup_elem(listen_map, &key)
+      ;; Only do lookup if we have a valid map FD
+      (if listen-map-fd
+        (concat
+          [(dsl/ld-map-fd :r1 listen-map-fd)
+           (dsl/mov-reg :r2 :r10)
+           (dsl/add :r2 -8)               ; r2 = &key
+           (dsl/call 1)]                   ; bpf_map_lookup_elem
+          ;; r0 = value ptr or NULL
+          ;; If NULL, this port isn't being proxied - pass through
+          [(asm/jmp-imm :jeq :r0 0 :pass)
+           ;; Save map value pointer in r9
+           (dsl/mov-reg :r9 :r0)
+           (asm/jmp :do_nat)])
+        ;; No listen map - pass all traffic
+        [(asm/jmp :pass)])
+
+      ;; =====================================================================
+      ;; PHASE 5: Perform DNAT
+      ;; =====================================================================
+      [(asm/label :do_nat)]
+
+      ;; r9 = pointer to map value: {target_ip(4) + target_port(2) + flags(2)}
+      ;; Load NAT target values
+      [(dsl/ldx :w :r1 :r9 0)           ; r1 = new_dst_ip
+       (dsl/stx :w :r10 :r1 -32)        ; store at stack[-32]
+       (dsl/ldx :h :r2 :r9 4)           ; r2 = new_dst_port
+       (dsl/stx :h :r10 :r2 -36)]       ; store at stack[-36]
+
+      ;; Branch by protocol for checksum calculation
+      [(dsl/ldx :b :r0 :r10 -52)        ; load protocol
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_nat)
+       (asm/jmp :udp_nat)]
+
+      ;; =====================================================================
+      ;; TCP NAT: Update IP checksum, TCP checksum, write new values
+      ;; =====================================================================
+      [(asm/label :tcp_nat)]
+
+      ;; Get IP header pointer back
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)]       ; r9 = IP header
+
+      ;; --- Update IP Checksum using bpf_csum_diff ---
+      ;; csum_diff(&old_dst_ip, 4, &new_dst_ip, 4, 0)
+      [(dsl/mov-reg :r1 :r10)
+       (dsl/add :r1 -24)                 ; r1 = &old_dst_ip
+       (dsl/mov :r2 4)                   ; r2 = 4 bytes
+       (dsl/mov-reg :r3 :r10)
+       (dsl/add :r3 -32)                 ; r3 = &new_dst_ip
+       (dsl/mov :r4 4)                   ; r4 = 4 bytes
+       (dsl/mov :r5 0)                   ; r5 = seed
+       (dsl/call BPF-FUNC-csum-diff)]    ; r0 = diff
+
+      ;; Save diff for L4 checksum
+      [(dsl/stx :w :r10 :r0 -64)]        ; stack[-64] = ip_diff
+
+      ;; Load old IP checksum and apply diff
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)        ; r9 = IP header
+       (dsl/ldx :h :r1 :r9 10)           ; r1 = old IP checksum (offset 10)
+       (dsl/ldx :w :r2 :r10 -64)]        ; r2 = diff
+
+      ;; Apply: new_csum = ~(~old_csum + diff)
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+
+      ;; Store new IP checksum
+      [(dsl/stx :h :r9 :r1 10)]          ; ip->check = new_csum
+
+      ;; --- Update TCP Checksum ---
+      ;; TCP pseudo-header includes dst_ip, so we apply the same IP diff
+      ;; Plus we need to account for dst_port change
+
+      ;; Get L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))] ; r0 = TCP header
+
+      ;; Load old TCP checksum (offset 16)
+      [(dsl/ldx :h :r1 :r0 16)]          ; r1 = old TCP checksum
+
+      ;; Apply IP diff first (for pseudo-header)
+      [(dsl/ldx :w :r2 :r10 -64)]        ; r2 = ip_diff
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+
+      ;; Now apply port diff
+      [(dsl/ldx :h :r2 :r10 -28)         ; r2 = old_dst_port
+       (dsl/ldx :h :r3 :r10 -36)]        ; r3 = new_dst_port
+      (xdp-update-csum-for-port-change :r1 :r2 :r3 :r4)
+
+      ;; Get TCP header pointer again and store new checksum
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :h :r0 :r1 16)]          ; tcp->check = new_csum
+
+      ;; --- Write New Values ---
+      ;; Write new dst_ip to IP header
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)        ; r9 = IP header
+       (dsl/ldx :w :r1 :r10 -32)         ; r1 = new_dst_ip
+       (dsl/stx :w :r9 :r1 16)]          ; ip->daddr = new_dst_ip
+
+      ;; Write new dst_port to TCP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -36)         ; r1 = new_dst_port
+       (dsl/stx :h :r0 :r1 2)]           ; tcp->dport = new_dst_port
+
+      [(asm/jmp :done)]
+
+      ;; =====================================================================
+      ;; UDP NAT: Update IP checksum, UDP checksum (if non-zero), write values
+      ;; =====================================================================
+      [(asm/label :udp_nat)]
+
+      ;; Get IP header pointer
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)]
+
+      ;; --- Update IP Checksum using bpf_csum_diff ---
+      [(dsl/mov-reg :r1 :r10)
+       (dsl/add :r1 -24)
+       (dsl/mov :r2 4)
+       (dsl/mov-reg :r3 :r10)
+       (dsl/add :r3 -32)
+       (dsl/mov :r4 4)
+       (dsl/mov :r5 0)
+       (dsl/call BPF-FUNC-csum-diff)]
+
+      ;; Save diff for L4 checksum
+      [(dsl/stx :w :r10 :r0 -64)]
+
+      ;; Apply diff to IP checksum
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :h :r1 :r9 10)           ; old IP checksum
+       (dsl/ldx :w :r2 :r10 -64)]        ; diff
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+      [(dsl/stx :h :r9 :r1 10)]          ; store new IP checksum
+
+      ;; --- Update UDP Checksum (if non-zero) ---
+      ;; UDP checksum of 0 means disabled
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r0 6)]           ; UDP checksum at offset 6
+      [(asm/jmp-imm :jeq :r1 0 :udp_write_values)] ; skip if checksum disabled
+
+      ;; Apply IP diff to UDP checksum
+      [(dsl/ldx :w :r2 :r10 -64)]
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+
+      ;; Apply port diff
+      [(dsl/ldx :h :r2 :r10 -28)         ; old_dst_port
+       (dsl/ldx :h :r3 :r10 -36)]        ; new_dst_port
+      (xdp-update-csum-for-port-change :r1 :r2 :r3 :r4)
+
+      ;; Store new UDP checksum
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :h :r0 :r1 6)]
+
+      [(asm/label :udp_write_values)]
+
+      ;; --- Write New Values ---
+      ;; Write new dst_ip to IP header
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -32)
+       (dsl/stx :w :r9 :r1 16)]
+
+      ;; Write new dst_port to UDP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -36)
+       (dsl/stx :h :r0 :r1 2)]
+
+      ;; Fall through to done
+
+      ;; =====================================================================
+      ;; Return XDP_PASS
+      ;; =====================================================================
+      [(asm/label :done)]
+      (net/return-action net/XDP-PASS)
+
       [(asm/label :pass)]
       (net/return-action net/XDP-PASS))))
 
 (defn build-xdp-ingress-program
   "Build the XDP ingress program.
 
-   Uses the DNAT program with proper jump offset calculation.
-   The program parses Ethernet and IPv4 headers and validates bounds.
+   Performs DNAT on incoming packets:
+   1. Looks up listen map by (ifindex, dst_port)
+   2. Falls back to config map LPM lookup by source IP
+   3. If match found, rewrites destination IP/port
+   4. Updates IP and L4 checksums
+   5. Returns XDP_PASS to let kernel routing deliver packet
 
-   Map FDs are accepted for future DNAT implementation but currently
-   the program only does packet validation and passes all valid packets."
+   map-fds: Map containing :listen-map and optionally :config-map"
   [map-fds]
-  (if (and (map? map-fds)
-           (:listen-map map-fds)
-           (:conntrack-map map-fds))
-    (build-xdp-dnat-program
-      (common/map-fd (:listen-map map-fds))
-      (common/map-fd (:conntrack-map map-fds)))
-    ;; Use DNAT program even without maps (it just passes packets)
-    (build-xdp-dnat-program nil nil)))
+  (let [listen-map-fd (when (and (map? map-fds) (:listen-map map-fds))
+                        (common/map-fd (:listen-map map-fds)))
+        config-map-fd (when (and (map? map-fds) (:config-map map-fds))
+                        (common/map-fd (:config-map map-fds)))]
+    (build-xdp-dnat-program listen-map-fd config-map-fd)))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment
