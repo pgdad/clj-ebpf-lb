@@ -151,12 +151,17 @@
 
 (defn encode-listen-key
   "Encode listen map key: {ifindex (4 bytes) + port (2 bytes) + padding (2 bytes)}.
-   Total: 8 bytes (aligned)."
+   Total: 8 bytes (aligned).
+   Uses native byte order for ifindex, but BIG_ENDIAN for port to match
+   raw packet bytes that XDP loads with ldx :h."
   [ifindex port]
   (let [buf (ByteBuffer/allocate 8)]
-    (.order buf ByteOrder/BIG_ENDIAN)
+    (.order buf (ByteOrder/nativeOrder))
     (.putInt buf (unchecked-int ifindex))
+    ;; Port must be in network byte order (big-endian) to match packet bytes
+    (.order buf ByteOrder/BIG_ENDIAN)
     (.putShort buf (unchecked-short port))
+    (.order buf (ByteOrder/nativeOrder))
     (.putShort buf (short 0))  ; padding
     (.array buf)))
 
@@ -164,18 +169,27 @@
   "Decode listen map key from byte array."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
-    (.order buf ByteOrder/BIG_ENDIAN)
-    {:ifindex (.getInt buf)
-     :port (bit-and (.getShort buf) 0xFFFF)}))
+    (.order buf (ByteOrder/nativeOrder))
+    (let [ifindex (.getInt buf)]
+      ;; Port is stored in network byte order (big-endian)
+      (.order buf ByteOrder/BIG_ENDIAN)
+      {:ifindex ifindex
+       :port (bit-and (.getShort buf) 0xFFFF)})))
 
 (defn encode-route-value
   "Encode route value: {target_ip (4 bytes) + target_port (2 bytes) + flags (2 bytes)}.
-   Total: 8 bytes."
+   Total: 8 bytes.
+   IP and port are stored in NETWORK byte order (big-endian) because XDP writes
+   them directly to packet headers which are in network byte order.
+   Flags remain in native order since they're only used internally."
   [target-ip target-port flags]
   (let [buf (ByteBuffer/allocate 8)]
+    ;; IP and port in network byte order for direct packet writes
     (.order buf ByteOrder/BIG_ENDIAN)
     (.putInt buf (unchecked-int target-ip))
     (.putShort buf (unchecked-short target-port))
+    ;; Flags in native order
+    (.order buf (ByteOrder/nativeOrder))
     (.putShort buf (unchecked-short flags))
     (.array buf)))
 
@@ -183,18 +197,24 @@
   "Decode route value from byte array."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
+    ;; IP and port in network byte order
     (.order buf ByteOrder/BIG_ENDIAN)
-    {:target-ip (Integer/toUnsignedLong (.getInt buf))
-     :target-port (bit-and (.getShort buf) 0xFFFF)
-     :flags (bit-and (.getShort buf) 0xFFFF)}))
+    (let [ip (Integer/toUnsignedLong (.getInt buf))
+          port (bit-and (.getShort buf) 0xFFFF)]
+      ;; Flags in native order
+      (.order buf (ByteOrder/nativeOrder))
+      {:target-ip ip
+       :target-port port
+       :flags (bit-and (.getShort buf) 0xFFFF)})))
 
 (defn encode-conntrack-key
   "Encode connection tracking 5-tuple key.
    {src_ip (4) + dst_ip (4) + src_port (2) + dst_port (2) + protocol (1) + padding (3)}
-   Total: 16 bytes (aligned)."
+   Total: 16 bytes (aligned).
+   Uses native byte order to match BPF program memory layout."
   [{:keys [src-ip dst-ip src-port dst-port protocol]}]
   (let [buf (ByteBuffer/allocate 16)]
-    (.order buf ByteOrder/BIG_ENDIAN)
+    (.order buf (ByteOrder/nativeOrder))
     (.putInt buf (unchecked-int src-ip))
     (.putInt buf (unchecked-int dst-ip))
     (.putShort buf (unchecked-short src-port))
@@ -208,7 +228,7 @@
   "Decode connection tracking key from byte array."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
-    (.order buf ByteOrder/BIG_ENDIAN)
+    (.order buf (ByteOrder/nativeOrder))
     {:src-ip (Integer/toUnsignedLong (.getInt buf))
      :dst-ip (Integer/toUnsignedLong (.getInt buf))
      :src-port (bit-and (.getShort buf) 0xFFFF)
@@ -219,11 +239,12 @@
   "Encode connection tracking value.
    {orig_dst_ip (4) + orig_dst_port (2) + padding (2) + nat_dst_ip (4) + nat_dst_port (2) + padding (2) +
     created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
-   Total: 64 bytes."
+   Total: 64 bytes.
+   Uses native byte order to match BPF program memory layout."
   [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
            created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev]}]
   (let [buf (ByteBuffer/allocate 64)]
-    (.order buf ByteOrder/BIG_ENDIAN)
+    (.order buf (ByteOrder/nativeOrder))
     (.putInt buf (unchecked-int (or orig-dst-ip 0)))
     (.putShort buf (unchecked-short (or orig-dst-port 0)))
     (.putShort buf (short 0))  ; padding
@@ -242,7 +263,7 @@
   "Decode connection tracking value from byte array (64 bytes)."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
-    (.order buf ByteOrder/BIG_ENDIAN)
+    (.order buf (ByteOrder/nativeOrder))
     (let [orig-dst-ip (Integer/toUnsignedLong (.getInt buf))
           orig-dst-port (bit-and (.getShort buf) 0xFFFF)
           _ (.getShort buf)  ; padding

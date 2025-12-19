@@ -76,24 +76,26 @@
   "Build XDP program that passes IPv4 packets and drops others.
    Uses clj-ebpf.net primitives for packet parsing."
   []
-  (bpf/assemble
+  (asm/assemble-with-labels
     (concat
-      ;; Save context and load data pointers
-      [(dsl/mov-reg :r6 :r1)]
-      (net/xdp-load-data-ptrs :r7 :r8 :r1)
+      ;; Save context and load data pointers using 32-bit loads
+      [(dsl/mov-reg :r6 :r1)
+       (dsl/ldx :w :r7 :r1 0)     ; data
+       (dsl/ldx :w :r8 :r1 4)]    ; data_end
 
       ;; Check Ethernet header bounds
-      (net/check-bounds :r7 :r8 net/ETH-HLEN 5 :r9)
+      (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass :r9)
 
-      ;; Load and check ethertype
+      ;; Load and check ethertype for IPv4
       (eth/load-ethertype :r9 :r7)
-      (eth/is-ipv4 :r9 1)
+      [(asm/jmp-imm :jne :r9 eth/ETH-P-IP-BE :pass)]
 
-      ;; Not IPv4 - pass (let other protocols through)
+      ;; IPv4 - pass
       [(dsl/mov :r0 net/XDP-PASS)
        (dsl/exit-insn)]
 
-      ;; IPv4 - pass
+      ;; Not IPv4 or bounds check failed - pass
+      [(asm/label :pass)]
       [(dsl/mov :r0 net/XDP-PASS)
        (dsl/exit-insn)])))
 
