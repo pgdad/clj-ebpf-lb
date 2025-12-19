@@ -3,8 +3,7 @@
    Handles reply packets from backends: performs SNAT to restore original destination."
   (:require [clj-ebpf.core :as bpf]
             [reverse-proxy.programs.common :as common]
-            [clojure.tools.logging :as log]
-            [clojure.java.shell :as shell]))
+            [clojure.tools.logging :as log]))
 
 ;;; =============================================================================
 ;;; TC Program Structure
@@ -115,31 +114,16 @@
 
 (defn attach-to-interface
   "Attach TC egress program to a network interface.
-   Uses shell commands as workaround for clj-ebpf TC netlink bug.
 
    prog: BpfProgram record or program FD
    iface: Interface name (e.g., \"eth0\")
    priority: Filter priority (lower = higher priority)"
   [prog iface & {:keys [priority] :or {priority 1}}]
   (log/info "Attaching TC egress program to" iface "with priority" priority)
-  (let [prog-fd (if (number? prog) prog (:fd prog))
-        pin-path (str "/sys/fs/bpf/tc_egress_" iface)]
-    ;; Pin the program to BPF filesystem
-    (require '[clj-ebpf.programs :as programs])
-    (try
-      ((resolve 'clj-ebpf.programs/pin-program)
-        {:fd prog-fd :name "tc_egress"} pin-path)
-      (catch Exception e
-        ;; Ignore if already pinned
-        (when-not (re-find #"File exists|already exists" (str e))
-          (throw e))))
-    ;; Attach using tc filter add command with pinned object
-    (let [result (shell/sh "tc" "filter" "add" "dev" iface
-                           "egress" "prio" (str priority)
-                           "bpf" "da" "pinned" pin-path)]
-      (when (not= 0 (:exit result))
-        (throw (ex-info "Failed to attach TC egress program"
-                        {:interface iface :error (:err result)}))))))
+  (let [prog-fd (if (number? prog) prog (:fd prog))]
+    (bpf/attach-tc-filter iface prog-fd :egress
+                          :priority priority
+                          :prog-name "tc_egress")))
 
 (defn attach-to-interfaces
   "Attach TC egress program to multiple interfaces."
@@ -148,16 +132,11 @@
     (apply attach-to-interface prog iface opts)))
 
 (defn detach-from-interface
-  "Detach TC egress program from an interface.
-   Uses shell commands as workaround for clj-ebpf TC netlink bug."
+  "Detach TC egress program from an interface."
   [iface & {:keys [priority] :or {priority 1}}]
   (log/info "Detaching TC egress program from" iface)
   (try
-    ;; Remove TC filter
-    (shell/sh "tc" "filter" "del" "dev" iface "egress" "prio" (str priority))
-    ;; Remove pinned program
-    (let [pin-path (str "/sys/fs/bpf/tc_egress_" iface)]
-      (shell/sh "rm" "-f" pin-path))
+    (bpf/detach-tc-filter iface :egress priority)
     (catch Exception e
       (log/warn "Failed to detach TC from" iface ":" (.getMessage e)))))
 
@@ -172,23 +151,22 @@
 ;;; =============================================================================
 
 (defn setup-tc-qdisc
-  "Set up clsact qdisc on an interface (required for TC attachment).
-   Uses shell command as workaround for clj-ebpf TC netlink bug."
+  "Set up clsact qdisc on an interface (required for TC attachment)."
   [iface]
   (log/info "Setting up clsact qdisc on" iface)
-  (let [result (shell/sh "tc" "qdisc" "add" "dev" iface "clsact")]
-    ;; Ignore errors if qdisc already exists
-    (when (and (not= 0 (:exit result))
-               (not (re-find #"File exists|Exclusivity flag|already exists" (:err result))))
-      (log/warn "Failed to add clsact qdisc:" (:err result)))))
+  (try
+    (bpf/add-clsact-qdisc iface)
+    (catch Exception e
+      ;; Ignore errors if qdisc already exists
+      (when-not (re-find #"File exists|Exclusivity flag|already exists" (str e))
+        (log/warn "Failed to add clsact qdisc:" (.getMessage e))))))
 
 (defn teardown-tc-qdisc
-  "Remove clsact qdisc from an interface.
-   Uses shell command as workaround for clj-ebpf TC netlink bug."
+  "Remove clsact qdisc from an interface."
   [iface]
   (log/info "Tearing down clsact qdisc on" iface)
   (try
-    (shell/sh "tc" "qdisc" "del" "dev" iface "clsact")
+    (bpf/remove-clsact-qdisc iface)
     (catch Exception e
       (log/warn "Failed to remove qdisc from" iface ":" (.getMessage e)))))
 
