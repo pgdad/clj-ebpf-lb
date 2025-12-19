@@ -41,6 +41,8 @@
 ;; -56  : L4 header offset from data (4 bytes)
 ;; -64  : checksum scratch (8 bytes)
 ;; -72  : additional scratch (8 bytes)
+;; -88  : Conntrack key (16 bytes: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3))
+;; -104 : Conntrack value (16 bytes: orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2))
 
 ;;; =============================================================================
 ;;; Simple Pass-Through XDP Program
@@ -194,7 +196,8 @@
    3. Falls back to config map LPM lookup by source IP
    4. If match found, performs DNAT (rewrites dst IP and port)
    5. Updates IP and L4 checksums
-   6. Returns XDP_PASS to let kernel routing deliver packet
+   6. Creates conntrack entry for TC SNAT to use on reply path
+   7. Returns XDP_PASS to let kernel routing deliver packet
 
    Register allocation:
    r6 = saved XDP context (callee-saved)
@@ -204,7 +207,7 @@
    r0-r5 = scratch, clobbered by helpers
 
    Uses clj-ebpf.asm label-based assembly for automatic jump offset resolution."
-  [listen-map-fd config-map-fd]
+  [listen-map-fd config-map-fd conntrack-map-fd]
   (asm/assemble-with-labels
     (concat
       ;; =====================================================================
@@ -433,7 +436,7 @@
        (dsl/ldx :h :r1 :r10 -36)         ; r1 = new_dst_port
        (dsl/stx :h :r0 :r1 2)]           ; tcp->dport = new_dst_port
 
-      [(asm/jmp :done)]
+      [(asm/jmp :create_conntrack)]
 
       ;; =====================================================================
       ;; UDP NAT: Update IP checksum, UDP checksum (if non-zero), write values
@@ -501,6 +504,59 @@
        (dsl/ldx :h :r1 :r10 -36)
        (dsl/stx :h :r0 :r1 2)]
 
+      ;; Fall through to create_conntrack
+
+      ;; =====================================================================
+      ;; PHASE 6: Create Conntrack Entry
+      ;; =====================================================================
+      ;; Create a conntrack entry so TC SNAT can find the mapping for reply packets.
+      ;; Key: {src_ip, old_dst_ip, src_port, old_dst_port, protocol}
+      ;; Value: {orig_dst_ip, orig_dst_port, nat_dst_ip, nat_dst_port}
+      [(asm/label :create_conntrack)]
+
+      ;; Build conntrack key at stack[-88] (16 bytes)
+      ;; Key layout: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3)
+      [(dsl/ldx :w :r0 :r10 -40)          ; r0 = src_ip
+       (dsl/stx :w :r10 :r0 -88)          ; key.src_ip
+       (dsl/ldx :w :r0 :r10 -24)          ; r0 = old_dst_ip (original destination)
+       (dsl/stx :w :r10 :r0 -84)          ; key.dst_ip
+       (dsl/ldx :h :r0 :r10 -48)          ; r0 = src_port
+       (dsl/stx :h :r10 :r0 -80)          ; key.src_port
+       (dsl/ldx :h :r0 :r10 -28)          ; r0 = old_dst_port
+       (dsl/stx :h :r10 :r0 -78)          ; key.dst_port
+       (dsl/ldx :b :r0 :r10 -52)          ; r0 = protocol
+       (dsl/stx :b :r10 :r0 -76)          ; key.protocol
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -75)          ; key.pad[0]
+       (dsl/stx :h :r10 :r0 -74)]         ; key.pad[1-2]
+
+      ;; Build conntrack value at stack[-104] (16 bytes)
+      ;; Value layout: orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2)
+      [(dsl/ldx :w :r0 :r10 -24)          ; r0 = old_dst_ip (for SNAT to restore)
+       (dsl/stx :w :r10 :r0 -104)         ; value.orig_dst_ip
+       (dsl/ldx :h :r0 :r10 -28)          ; r0 = old_dst_port
+       (dsl/stx :h :r10 :r0 -100)         ; value.orig_dst_port
+       (dsl/mov :r0 0)
+       (dsl/stx :h :r10 :r0 -98)          ; value.pad
+       (dsl/ldx :w :r0 :r10 -32)          ; r0 = nat_dst_ip (backend IP)
+       (dsl/stx :w :r10 :r0 -96)          ; value.nat_dst_ip
+       (dsl/ldx :h :r0 :r10 -36)          ; r0 = nat_dst_port
+       (dsl/stx :h :r10 :r0 -92)          ; value.nat_dst_port
+       (dsl/mov :r0 0)
+       (dsl/stx :h :r10 :r0 -90)]         ; value.pad
+
+      ;; Call bpf_map_update_elem(conntrack_map, &key, &value, BPF_ANY)
+      (if conntrack-map-fd
+        [(dsl/ld-map-fd :r1 conntrack-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 -88)                 ; r2 = &key
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -104)                ; r3 = &value
+         (dsl/mov :r4 0)                   ; r4 = BPF_ANY (0)
+         (dsl/call 2)]                     ; bpf_map_update_elem
+        ;; No conntrack map - skip update
+        [])
+
       ;; Fall through to done
 
       ;; =====================================================================
@@ -520,15 +576,18 @@
    2. Falls back to config map LPM lookup by source IP
    3. If match found, rewrites destination IP/port
    4. Updates IP and L4 checksums
-   5. Returns XDP_PASS to let kernel routing deliver packet
+   5. Creates conntrack entry for TC SNAT
+   6. Returns XDP_PASS to let kernel routing deliver packet
 
-   map-fds: Map containing :listen-map and optionally :config-map"
+   map-fds: Map containing :listen-map, optionally :config-map and :conntrack-map"
   [map-fds]
   (let [listen-map-fd (when (and (map? map-fds) (:listen-map map-fds))
                         (common/map-fd (:listen-map map-fds)))
         config-map-fd (when (and (map? map-fds) (:config-map map-fds))
-                        (common/map-fd (:config-map map-fds)))]
-    (build-xdp-dnat-program listen-map-fd config-map-fd)))
+                        (common/map-fd (:config-map map-fds)))
+        conntrack-map-fd (when (and (map? map-fds) (:conntrack-map map-fds))
+                           (common/map-fd (:conntrack-map map-fds)))]
+    (build-xdp-dnat-program listen-map-fd config-map-fd conntrack-map-fd)))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment
