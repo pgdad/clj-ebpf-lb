@@ -331,7 +331,7 @@
 
 (deftest ^:integration test-full-nat-path-with-maps
   ;; This test requires root privileges to create BPF maps
-  ;; Run with: sudo clojure -M:test -i reverse-proxy.nat-e2e-test/test-full-nat-path-with-maps
+  ;; Run with: sudo clojure -M:test
 
   (when (= 0 (-> (Runtime/getRuntime)
                   (.exec "id -u")
@@ -344,13 +344,19 @@
             conntrack-map (maps/create-conntrack-map test-config)]
         (try
           ;; Add a listen port entry
-          (maps/add-listen-port listen-map
-            {:ifindex 1 :port 80}
-            {:target-ip "10.1.1.5" :target-port 8080})
+          ;; add-listen-port signature: [listen-map ifindex port {:keys [ip port]} & opts]
+          (maps/add-listen-port listen-map 1 80
+            {:ip (util/ip-string->u32 "10.1.1.5") :port 8080})
 
           ;; Verify it was added
           (let [entries (maps/list-listen-ports listen-map)]
-            (is (= 1 (count entries))))
+            (is (= 1 (count entries)))
+            (when (seq entries)
+              (let [entry (first entries)]
+                (is (= 1 (:ifindex (:listen entry))))
+                (is (= 80 (:port (:listen entry))))
+                (is (= (util/ip-string->u32 "10.1.1.5") (:target-ip (:target entry))))
+                (is (= 8080 (:target-port (:target entry)))))))
 
           ;; Build programs with real map FDs
           (let [xdp-bytecode (xdp/build-xdp-ingress-program
@@ -361,7 +367,10 @@
             (is (bytes? xdp-bytecode))
             (is (bytes? tc-bytecode))
             (is (> (count xdp-bytecode) 0))
-            (is (> (count tc-bytecode) 0)))
+            (is (> (count tc-bytecode) 0))
+            ;; Verify instruction counts
+            (is (>= (/ (count xdp-bytecode) 8) 250) "XDP should have 250+ instructions")
+            (is (>= (/ (count tc-bytecode) 8) 140) "TC should have 140+ instructions"))
 
           (finally
             (bpf/close-map listen-map)

@@ -157,14 +157,14 @@
 (defn add-listen-port
   "Configure a listen interface/port with its default target.
    ifindex: network interface index
-   port: listen port number
+   listen-port: listen port number
    target: {:ip <u32> :port <int>}
    flags: bit flags (bit 0 = stats enabled)"
-  [listen-map ifindex port {:keys [ip port] :as target} & {:keys [flags] :or {flags 0}}]
-  (let [key-bytes (util/encode-listen-key ifindex port)
-        value-bytes (util/encode-route-value (:ip target) (:port target) flags)]
-    (log/debug "Adding listen port: ifindex=" ifindex "port=" port
-               "-> " (util/u32->ip-string (:ip target)) ":" (:port target))
+  [listen-map ifindex listen-port {:keys [ip port] :as target} & {:keys [flags] :or {flags 0}}]
+  (let [key-bytes (util/encode-listen-key ifindex listen-port)
+        value-bytes (util/encode-route-value ip port flags)]
+    (log/debug "Adding listen port: ifindex=" ifindex "port=" listen-port
+               "-> " (util/u32->ip-string ip) ":" port)
     (bpf/map-update listen-map key-bytes value-bytes)))
 
 (defn remove-listen-port
