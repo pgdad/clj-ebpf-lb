@@ -115,7 +115,7 @@
 
 (defn attach-to-interface
   "Attach TC egress program to a network interface.
-   Uses shell commands as workaround for clj-ebpf integer overflow bug.
+   Uses shell commands as workaround for clj-ebpf TC netlink bug.
 
    prog: BpfProgram record or program FD
    iface: Interface name (e.g., \"eth0\")
@@ -149,7 +149,7 @@
 
 (defn detach-from-interface
   "Detach TC egress program from an interface.
-   Uses shell commands as workaround for clj-ebpf integer overflow bug."
+   Uses shell commands as workaround for clj-ebpf TC netlink bug."
   [iface & {:keys [priority] :or {priority 1}}]
   (log/info "Detaching TC egress program from" iface)
   (try
@@ -173,10 +173,9 @@
 
 (defn setup-tc-qdisc
   "Set up clsact qdisc on an interface (required for TC attachment).
-   Uses shell command as workaround for clj-ebpf bug."
+   Uses shell command as workaround for clj-ebpf TC netlink bug."
   [iface]
   (log/info "Setting up clsact qdisc on" iface)
-  ;; Use tc command directly as workaround for clj-ebpf integer overflow bug
   (let [result (shell/sh "tc" "qdisc" "add" "dev" iface "clsact")]
     ;; Ignore errors if qdisc already exists
     (when (and (not= 0 (:exit result))
@@ -185,7 +184,7 @@
 
 (defn teardown-tc-qdisc
   "Remove clsact qdisc from an interface.
-   Uses shell command as workaround for clj-ebpf bug."
+   Uses shell command as workaround for clj-ebpf TC netlink bug."
   [iface]
   (log/info "Tearing down clsact qdisc on" iface)
   (try

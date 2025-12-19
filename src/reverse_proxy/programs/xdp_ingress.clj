@@ -3,8 +3,7 @@
    Handles incoming packets: parses headers, looks up routing, performs DNAT."
   (:require [clj-ebpf.core :as bpf]
             [reverse-proxy.programs.common :as common]
-            [clojure.tools.logging :as log]
-            [clojure.java.shell :as shell]))
+            [clojure.tools.logging :as log]))
 
 ;;; =============================================================================
 ;;; XDP Program Structure
@@ -167,7 +166,6 @@
 
 (defn attach-to-interface
   "Attach XDP program to a network interface.
-   Uses ip command as workaround for clj-ebpf netlink bug.
 
    prog: BpfProgram record or program FD
    iface: Interface name (e.g., \"eth0\")
@@ -175,26 +173,12 @@
   [prog iface & {:keys [mode] :or {mode :skb}}]
   (log/info "Attaching XDP program to" iface "in" mode "mode")
   (let [prog-fd (if (number? prog) prog (:fd prog))
-        pin-path (str "/sys/fs/bpf/xdp_" iface)
         mode-flag (case mode
-                    :skb "xdpgeneric"
-                    :drv "xdpdrv"
-                    :hw "xdpoffload"
-                    "xdpgeneric")]
-    ;; Pin the program to BPF filesystem using clj-ebpf
-    (require '[clj-ebpf.programs :as programs])
-    (try
-      ((resolve 'clj-ebpf.programs/pin-program)
-        {:fd prog-fd :name "xdp_ingress"} pin-path)
-      (catch Exception e
-        ;; Ignore if already pinned
-        (when-not (re-find #"File exists|already exists" (str e))
-          (throw e))))
-    ;; Attach using ip link
-    (let [result (shell/sh "ip" "link" "set" "dev" iface mode-flag "pinned" pin-path)]
-      (when (not= 0 (:exit result))
-        (throw (ex-info "Failed to attach XDP program"
-                        {:interface iface :error (:err result)}))))))
+                    :skb :skb-mode
+                    :drv :drv-mode
+                    :hw :hw-mode
+                    :skb-mode)]
+    (bpf/attach-xdp iface prog-fd mode-flag)))
 
 (defn attach-to-interfaces
   "Attach XDP program to multiple interfaces."
