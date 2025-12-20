@@ -352,11 +352,14 @@
           (let [entries (maps/list-listen-ports listen-map)]
             (is (= 1 (count entries)))
             (when (seq entries)
-              (let [entry (first entries)]
+              (let [entry (first entries)
+                    route (:route entry)
+                    first-target (first (:targets route))]
                 (is (= 1 (:ifindex (:listen entry))))
                 (is (= 80 (:port (:listen entry))))
-                (is (= (util/ip-string->u32 "10.1.1.5") (:target-ip (:target entry))))
-                (is (= 8080 (:target-port (:target entry)))))))
+                (is (= 1 (:target-count route)))
+                (is (= (util/ip-string->u32 "10.1.1.5") (:ip first-target)))
+                (is (= 8080 (:port first-target))))))
 
           ;; Build programs with real map FDs
           (let [xdp-bytecode (xdp/build-xdp-ingress-program

@@ -401,7 +401,11 @@
 
       [(asm/label :weight_loop)]
 
-      ;; Check loop bound (max 8 targets)
+      ;; Check loop bound with CONSTANT to satisfy verifier
+      ;; This ensures the verifier knows counter < 8, so max offset is 70 < 72
+      [(asm/jmp-imm :jge :r0 8 :single_target)] ; if counter >= 8, use first (safety)
+
+      ;; Also check against actual target_count
       [(dsl/ldx :w :r3 :r10 -60)        ; r3 = target_count
        (asm/jmp-reg :jge :r0 :r3 :single_target)] ; if counter >= count, use first
 
