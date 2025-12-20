@@ -554,19 +554,21 @@
       ;; PHASE 6: Create Conntrack Entry
       ;; =====================================================================
       ;; Create a conntrack entry so TC SNAT can find the mapping for reply packets.
-      ;; Key: {src_ip, old_dst_ip, src_port, old_dst_port, protocol}
+      ;; Key uses POST-NAT 5-tuple so TC can look up by reversing reply packet:
+      ;; Key: {src_ip, nat_dst_ip, src_port, nat_dst_port, protocol}
       ;; Value: {orig_dst_ip, orig_dst_port, nat_dst_ip, nat_dst_port}
       [(asm/label :create_conntrack)]
 
       ;; Build conntrack key at stack[-88] (16 bytes)
       ;; Key layout: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3)
-      [(dsl/ldx :w :r0 :r10 -40)          ; r0 = src_ip
+      ;; Use NAT'd destination (backend) so TC can find entry from reply packet
+      [(dsl/ldx :w :r0 :r10 -40)          ; r0 = src_ip (client)
        (dsl/stx :w :r10 :r0 -88)          ; key.src_ip
-       (dsl/ldx :w :r0 :r10 -24)          ; r0 = old_dst_ip (original destination)
+       (dsl/ldx :w :r0 :r10 -32)          ; r0 = nat_dst_ip (backend IP after NAT)
        (dsl/stx :w :r10 :r0 -84)          ; key.dst_ip
-       (dsl/ldx :h :r0 :r10 -48)          ; r0 = src_port
+       (dsl/ldx :h :r0 :r10 -48)          ; r0 = src_port (client)
        (dsl/stx :h :r10 :r0 -80)          ; key.src_port
-       (dsl/ldx :h :r0 :r10 -28)          ; r0 = old_dst_port
+       (dsl/ldx :h :r0 :r10 -36)          ; r0 = nat_dst_port (backend port after NAT)
        (dsl/stx :h :r10 :r0 -78)          ; key.dst_port
        (dsl/ldx :b :r0 :r10 -52)          ; r0 = protocol
        (dsl/stx :b :r10 :r0 -76)          ; key.protocol

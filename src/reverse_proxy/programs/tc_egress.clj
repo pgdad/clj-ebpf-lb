@@ -382,8 +382,11 @@
        (dsl/call BPF-FUNC-l4-csum-replace)]
 
       ;; --- Write new src_ip to IP header ---
-      ;; Need to reload data pointer as it may have changed
+      ;; Need to reload data pointer and re-check bounds
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 54)                 ; 14 + 20 + 20 = 54 for TCP header access
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       ;; Get IP header pointer
       [(dsl/mov-reg :r9 :r7)
@@ -413,8 +416,11 @@
        (dsl/call BPF-FUNC-l3-csum-replace)]
 
       ;; --- Check if UDP checksum is enabled (non-zero) ---
-      ;; Reload data pointer
+      ;; Reload data pointer and re-check bounds
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)                 ; 14 + 20 + 8 = 42 for UDP header access
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       [(dsl/mov-reg :r0 :r7)
        (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
@@ -440,8 +446,11 @@
       [(asm/label :udp_write_values)]
 
       ;; --- Write new values ---
-      ;; Reload data pointer
+      ;; Reload data pointer and re-check bounds
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)                 ; 14 + 20 + 8 = 42 for UDP write access
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
 
       ;; Write new src_ip to IP header
       [(dsl/mov-reg :r9 :r7)

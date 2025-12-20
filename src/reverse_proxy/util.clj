@@ -211,10 +211,12 @@
   "Encode connection tracking 5-tuple key.
    {src_ip (4) + dst_ip (4) + src_port (2) + dst_port (2) + protocol (1) + padding (3)}
    Total: 16 bytes (aligned).
-   Uses native byte order to match BPF program memory layout."
+   XDP stores packet values (network byte order) directly, so we use big-endian
+   to match packet byte layout."
   [{:keys [src-ip dst-ip src-port dst-port protocol]}]
   (let [buf (ByteBuffer/allocate 16)]
-    (.order buf (ByteOrder/nativeOrder))
+    ;; IPs and ports in network byte order to match packet bytes
+    (.order buf ByteOrder/BIG_ENDIAN)
     (.putInt buf (unchecked-int src-ip))
     (.putInt buf (unchecked-int dst-ip))
     (.putShort buf (unchecked-short src-port))
@@ -228,7 +230,8 @@
   "Decode connection tracking key from byte array."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
-    (.order buf (ByteOrder/nativeOrder))
+    ;; IPs and ports stored in network byte order
+    (.order buf ByteOrder/BIG_ENDIAN)
     {:src-ip (Integer/toUnsignedLong (.getInt buf))
      :dst-ip (Integer/toUnsignedLong (.getInt buf))
      :src-port (bit-and (.getShort buf) 0xFFFF)
@@ -240,17 +243,20 @@
    {orig_dst_ip (4) + orig_dst_port (2) + padding (2) + nat_dst_ip (4) + nat_dst_port (2) + padding (2) +
     created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
    Total: 64 bytes.
-   Uses native byte order to match BPF program memory layout."
+   IPs and ports in network byte order (from packet), counters in native order."
   [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
            created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev]}]
   (let [buf (ByteBuffer/allocate 64)]
-    (.order buf (ByteOrder/nativeOrder))
+    ;; IPs and ports in network byte order
+    (.order buf ByteOrder/BIG_ENDIAN)
     (.putInt buf (unchecked-int (or orig-dst-ip 0)))
     (.putShort buf (unchecked-short (or orig-dst-port 0)))
     (.putShort buf (short 0))  ; padding
     (.putInt buf (unchecked-int (or nat-dst-ip 0)))
     (.putShort buf (unchecked-short (or nat-dst-port 0)))
     (.putShort buf (short 0))  ; padding
+    ;; Counters in native order (written by XDP/TC directly)
+    (.order buf (ByteOrder/nativeOrder))
     (.putLong buf (or created-ns 0))
     (.putLong buf (or last-seen 0))
     (.putLong buf (or packets-fwd 0))
@@ -263,29 +269,32 @@
   "Decode connection tracking value from byte array (64 bytes)."
   [^bytes b]
   (let [buf (ByteBuffer/wrap b)]
-    (.order buf (ByteOrder/nativeOrder))
+    ;; IPs and ports in network byte order
+    (.order buf ByteOrder/BIG_ENDIAN)
     (let [orig-dst-ip (Integer/toUnsignedLong (.getInt buf))
           orig-dst-port (bit-and (.getShort buf) 0xFFFF)
           _ (.getShort buf)  ; padding
           nat-dst-ip (Integer/toUnsignedLong (.getInt buf))
           nat-dst-port (bit-and (.getShort buf) 0xFFFF)
-          _ (.getShort buf)  ; padding
-          created-ns (.getLong buf)
-          last-seen (.getLong buf)
-          packets-fwd (.getLong buf)
-          packets-rev (.getLong buf)
-          bytes-fwd (.getLong buf)
-          bytes-rev (.getLong buf)]
-      {:orig-dst-ip orig-dst-ip
-       :orig-dst-port orig-dst-port
-       :nat-dst-ip nat-dst-ip
-       :nat-dst-port nat-dst-port
-       :created-ns created-ns
-       :last-seen last-seen
-       :packets-fwd packets-fwd
-       :packets-rev packets-rev
-       :bytes-fwd bytes-fwd
-       :bytes-rev bytes-rev})))
+          _ (.getShort buf)]  ; padding
+      ;; Counters in native order
+      (.order buf (ByteOrder/nativeOrder))
+      (let [created-ns (.getLong buf)
+            last-seen (.getLong buf)
+            packets-fwd (.getLong buf)
+            packets-rev (.getLong buf)
+            bytes-fwd (.getLong buf)
+            bytes-rev (.getLong buf)]
+        {:orig-dst-ip orig-dst-ip
+         :orig-dst-port orig-dst-port
+         :nat-dst-ip nat-dst-ip
+         :nat-dst-port nat-dst-port
+         :created-ns created-ns
+         :last-seen last-seen
+         :packets-fwd packets-fwd
+         :packets-rev packets-rev
+         :bytes-fwd bytes-fwd
+         :bytes-rev bytes-rev}))))
 
 (defn encode-stats-event
   "Encode a stats event for ring buffer.
