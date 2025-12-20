@@ -48,7 +48,7 @@ A high-performance eBPF-based reverse proxy written in Clojure. Uses XDP (eXpres
 
 3. **Clone the repository**:
    ```bash
-   git clone https://github.com/your-org/clj-ebpf-reverse-proxy.git
+   git clone https://github.com/pgdad/clj-ebpf-reverse-proxy.git
    cd clj-ebpf-reverse-proxy
    ```
 
