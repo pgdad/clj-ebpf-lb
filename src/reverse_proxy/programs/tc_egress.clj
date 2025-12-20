@@ -338,11 +338,12 @@
       ;; --- Load the new source values from conntrack ---
       ;; new_src_ip = orig_dst_ip (offset 0)
       ;; new_src_port = orig_dst_port (offset 4)
+      ;; Stack layout: -40 to -37 = new_src_ip (4 bytes), -36 to -35 = new_src_port (2 bytes)
       [(dsl/ldx :w :r1 :r9 0)           ; r1 = new_src_ip (orig_dst_ip)
-       (dsl/stx :w :r10 :r1 -40)]       ; save at stack[-40]
+       (dsl/stx :w :r10 :r1 -40)]       ; save at stack[-40] (bytes -40 to -37)
 
       [(dsl/ldx :h :r2 :r9 4)           ; r2 = new_src_port (orig_dst_port)
-       (dsl/stx :h :r10 :r2 -38)]       ; save at stack[-38]
+       (dsl/stx :h :r10 :r2 -36)]       ; save at stack[-36] (bytes -36 to -35, no overlap)
 
       ;; Branch by protocol for checksum calculation
       [(dsl/ldx :b :r0 :r10 -28)        ; load protocol
@@ -377,7 +378,7 @@
       [(dsl/mov-reg :r1 :r6)
        (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 16)) ; TCP checksum offset
        (dsl/ldx :h :r3 :r10 -24)        ; old_src_port
-       (dsl/ldx :h :r4 :r10 -38)        ; new_src_port
+       (dsl/ldx :h :r4 :r10 -36)        ; new_src_port
        (dsl/mov :r5 2)                  ; sizeof(u16), no pseudo-header for port
        (dsl/call BPF-FUNC-l4-csum-replace)]
 
@@ -397,7 +398,7 @@
       ;; --- Write new src_port to TCP header ---
       [(dsl/mov-reg :r0 :r7)
        (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
-       (dsl/ldx :h :r1 :r10 -38)        ; r1 = new_src_port
+       (dsl/ldx :h :r1 :r10 -36)        ; r1 = new_src_port
        (dsl/stx :h :r0 :r1 0)]          ; tcp->sport = new_src_port
 
       [(asm/jmp :done)]
@@ -439,7 +440,7 @@
       [(dsl/mov-reg :r1 :r6)
        (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 6))
        (dsl/ldx :h :r3 :r10 -24)
-       (dsl/ldx :h :r4 :r10 -38)
+       (dsl/ldx :h :r4 :r10 -36)        ; new_src_port at -36
        (dsl/mov :r5 2)
        (dsl/call BPF-FUNC-l4-csum-replace)]
 
@@ -461,7 +462,7 @@
       ;; Write new src_port to UDP header
       [(dsl/mov-reg :r0 :r7)
        (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
-       (dsl/ldx :h :r1 :r10 -38)
+       (dsl/ldx :h :r1 :r10 -36)        ; new_src_port at -36
        (dsl/stx :h :r0 :r1 0)]
 
       ;; Fall through to done
