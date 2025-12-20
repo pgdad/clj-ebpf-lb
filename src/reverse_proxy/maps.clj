@@ -22,29 +22,33 @@
 ;;; =============================================================================
 
 (defn create-config-map
-  "Create LPM trie map for source IP -> target routing.
+  "Create LPM trie map for source IP -> target routing with weighted load balancing.
    Key: {prefix_len (4 bytes) + ip (4 bytes)} = 8 bytes
-   Value: {target_ip (4 bytes) + target_port (2 bytes) + flags (2 bytes)} = 8 bytes"
+   Value: Weighted route format (72 bytes):
+     Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+     Per target (8 bytes each, max 8): ip(4) + port(2) + cumulative_weight(2)"
   [{:keys [max-routes] :or {max-routes (:max-routes default-config)}}]
   (log/info "Creating config LPM trie map with max-entries:" max-routes)
   ;; Use create-map directly to get identity serializers for byte arrays
   (bpf/create-map {:map-type :lpm-trie
                    :key-size 8
-                   :value-size 8
+                   :value-size util/WEIGHTED-ROUTE-MAX-SIZE  ; 72 bytes
                    :max-entries max-routes
                    :map-flags 1  ; BPF_F_NO_PREALLOC required for LPM
                    :map-name "proxy_config"}))
 
 (defn create-listen-map
-  "Create hash map for listen interface/port -> default target.
+  "Create hash map for listen interface/port -> default target with weighted load balancing.
    Key: {ifindex (4 bytes) + port (2 bytes) + padding (2 bytes)} = 8 bytes
-   Value: {target_ip (4 bytes) + target_port (2 bytes) + flags (2 bytes)} = 8 bytes"
+   Value: Weighted route format (72 bytes):
+     Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+     Per target (8 bytes each, max 8): ip(4) + port(2) + cumulative_weight(2)"
   [{:keys [max-listen-ports] :or {max-listen-ports (:max-listen-ports default-config)}}]
   (log/info "Creating listen hash map with max-entries:" max-listen-ports)
   ;; Use create-map directly to get identity serializers for byte arrays
   (bpf/create-map {:map-type :hash
                    :key-size 8
-                   :value-size 8
+                   :value-size util/WEIGHTED-ROUTE-MAX-SIZE  ; 72 bytes
                    :max-entries max-listen-ports
                    :map-name "proxy_listen"}))
 
@@ -118,14 +122,31 @@
 
 (defn add-source-route
   "Add a source IP/CIDR route to the config map.
+   DEPRECATED: Use add-source-route-weighted for weighted load balancing.
    source: {:ip <u32> :prefix-len <int>}
    target: {:ip <u32> :port <int>}
    flags: optional flags (default 1 = enabled)"
   [config-map {:keys [ip prefix-len]} {:keys [ip port] :as target} & {:keys [flags] :or {flags 1}}]
-  (let [key-bytes (util/encode-lpm-key prefix-len ip)
-        value-bytes (util/encode-route-value (:ip target) port flags)]
+  ;; Convert single target to weighted format for compatibility
+  (let [target-group {:targets [{:ip (:ip target) :port port :weight 100}]
+                      :cumulative-weights [100]}
+        key-bytes (util/encode-lpm-key prefix-len ip)
+        value-bytes (util/encode-weighted-route-value target-group flags)]
     (log/debug "Adding source route:" (util/u32->ip-string ip) "/" prefix-len
                "-> " (util/u32->ip-string (:ip target)) ":" port)
+    (bpf/map-update config-map key-bytes value-bytes)))
+
+(defn add-source-route-weighted
+  "Add a source IP/CIDR route with weighted targets to the config map.
+   source: {:ip <u32> :prefix-len <int>}
+   target-group: TargetGroup record with :targets and :cumulative-weights
+   flags: optional flags (default 1 = enabled)"
+  [config-map {:keys [ip prefix-len]} target-group & {:keys [flags] :or {flags 1}}]
+  (let [key-bytes (util/encode-lpm-key prefix-len ip)
+        value-bytes (util/encode-weighted-route-value target-group flags)
+        targets (:targets target-group)]
+    (log/debug "Adding weighted source route:" (util/u32->ip-string ip) "/" prefix-len
+               "->" (count targets) "targets")
     (bpf/map-update config-map key-bytes value-bytes)))
 
 (defn remove-source-route
@@ -136,19 +157,21 @@
     (bpf/map-delete config-map key-bytes)))
 
 (defn lookup-source-route
-  "Look up a source IP in the config map (exact match on prefix-len + IP)."
+  "Look up a source IP in the config map (exact match on prefix-len + IP).
+   Returns weighted route data with :target-count, :flags, and :targets."
   [config-map {:keys [ip prefix-len]}]
   (let [key-bytes (util/encode-lpm-key prefix-len ip)]
     (when-let [value-bytes (bpf/map-lookup config-map key-bytes)]
-      (util/decode-route-value value-bytes))))
+      (util/decode-weighted-route-value value-bytes))))
 
 (defn list-source-routes
-  "List all source routes in the config map."
+  "List all source routes in the config map.
+   Returns a sequence of {:source {...} :route {...}} maps with weighted target data."
   [config-map]
   (->> (bpf/map-entries config-map)
        (map (fn [[k v]]
               {:source (util/decode-lpm-key k)
-               :target (util/decode-route-value v)}))))
+               :route (util/decode-weighted-route-value v)}))))
 
 ;;; =============================================================================
 ;;; Listen Map Operations (Hash - Listen Port Config)
@@ -156,15 +179,33 @@
 
 (defn add-listen-port
   "Configure a listen interface/port with its default target.
+   DEPRECATED: Use add-listen-port-weighted for weighted load balancing.
    ifindex: network interface index
    listen-port: listen port number
    target: {:ip <u32> :port <int>}
    flags: bit flags (bit 0 = stats enabled)"
   [listen-map ifindex listen-port {:keys [ip port] :as target} & {:keys [flags] :or {flags 0}}]
-  (let [key-bytes (util/encode-listen-key ifindex listen-port)
-        value-bytes (util/encode-route-value ip port flags)]
+  ;; Convert single target to weighted format for compatibility
+  (let [target-group {:targets [{:ip ip :port port :weight 100}]
+                      :cumulative-weights [100]}
+        key-bytes (util/encode-listen-key ifindex listen-port)
+        value-bytes (util/encode-weighted-route-value target-group flags)]
     (log/debug "Adding listen port: ifindex=" ifindex "port=" listen-port
                "-> " (util/u32->ip-string ip) ":" port)
+    (bpf/map-update listen-map key-bytes value-bytes)))
+
+(defn add-listen-port-weighted
+  "Configure a listen interface/port with weighted targets.
+   ifindex: network interface index
+   listen-port: listen port number
+   target-group: TargetGroup record with :targets and :cumulative-weights
+   flags: bit flags (bit 0 = stats enabled)"
+  [listen-map ifindex listen-port target-group & {:keys [flags] :or {flags 0}}]
+  (let [key-bytes (util/encode-listen-key ifindex listen-port)
+        value-bytes (util/encode-weighted-route-value target-group flags)
+        targets (:targets target-group)]
+    (log/debug "Adding weighted listen port: ifindex=" ifindex "port=" listen-port
+               "->" (count targets) "targets")
     (bpf/map-update listen-map key-bytes value-bytes)))
 
 (defn remove-listen-port
@@ -175,19 +216,21 @@
     (bpf/map-delete listen-map key-bytes)))
 
 (defn lookup-listen-port
-  "Look up configuration for a listen interface/port."
+  "Look up configuration for a listen interface/port.
+   Returns weighted route data with :target-count, :flags, and :targets."
   [listen-map ifindex port]
   (let [key-bytes (util/encode-listen-key ifindex port)]
     (when-let [value-bytes (bpf/map-lookup listen-map key-bytes)]
-      (util/decode-route-value value-bytes))))
+      (util/decode-weighted-route-value value-bytes))))
 
 (defn list-listen-ports
-  "List all configured listen ports."
+  "List all configured listen ports.
+   Returns a sequence of {:listen {...} :route {...}} maps with weighted target data."
   [listen-map]
   (->> (bpf/map-entries listen-map)
        (map (fn [[k v]]
               {:listen (util/decode-listen-key k)
-               :target (util/decode-route-value v)}))))
+               :route (util/decode-weighted-route-value v)}))))
 
 ;;; =============================================================================
 ;;; Connection Tracking Map Operations

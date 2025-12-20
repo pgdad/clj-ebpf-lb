@@ -31,18 +31,20 @@
 ;; -16  : LPM key (8 bytes: prefix_len(4) + ip(4))
 ;; -24  : old_dst_ip (4 bytes)
 ;; -28  : old_dst_port (2 bytes) + pad (2 bytes)
-;; -32  : nat_dst_ip (4 bytes)
-;; -36  : nat_dst_port (2 bytes) + pad (2 bytes)
+;; -32  : nat_dst_ip (4 bytes) - SELECTED target IP
+;; -36  : nat_dst_port (2 bytes) + pad (2 bytes) - SELECTED target port
 ;; -40  : src_ip (4 bytes)
 ;; -44  : dst_ip original (4 bytes)
 ;; -48  : src_port (2 bytes)
 ;; -50  : dst_port original (2 bytes)
 ;; -52  : protocol (1 byte) + pad (3 bytes)
 ;; -56  : L4 header offset from data (4 bytes)
-;; -64  : checksum scratch (8 bytes)
-;; -72  : additional scratch (8 bytes)
-;; -88  : Conntrack key (16 bytes: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3))
-;; -152 : Conntrack value (64 bytes):
+;; -60  : target_count (4 bytes) - for weighted selection
+;; -64  : random_value (4 bytes) - for weighted selection
+;; -72  : checksum scratch (8 bytes)
+;; -80  : additional scratch (8 bytes)
+;; -96  : Conntrack key (16 bytes: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3))
+;; -160 : Conntrack value (64 bytes):
 ;;        offset 0:  orig_dst_ip (4) - proxy's IP for SNAT to restore
 ;;        offset 4:  orig_dst_port (2) - proxy's port
 ;;        offset 6:  pad (2)
@@ -362,16 +364,92 @@
         [(asm/jmp :pass)])
 
       ;; =====================================================================
-      ;; PHASE 5: Perform DNAT
+      ;; PHASE 5: Weighted Target Selection and DNAT
       ;; =====================================================================
       [(asm/label :do_nat)]
 
-      ;; r9 = pointer to map value: {target_ip(4) + target_port(2) + flags(2)}
-      ;; Load NAT target values
-      [(dsl/ldx :w :r1 :r9 0)           ; r1 = new_dst_ip
+      ;; r9 = pointer to map value (weighted route format, 72 bytes):
+      ;; Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+      ;; Per target (8 bytes each): ip(4) + port(2) + cumulative_weight(2)
+
+      ;; Load target_count from header byte 0
+      [(dsl/ldx :b :r0 :r9 0)           ; r0 = target_count (1-8)
+       (dsl/stx :w :r10 :r0 -60)]       ; store at stack[-60]
+
+      ;; If target_count == 1, skip weighted selection (use first target directly)
+      [(asm/jmp-imm :jeq :r0 1 :single_target)]
+
+      ;; Multiple targets: need weighted random selection
+      ;; Call bpf_get_prandom_u32() -> r0
+      [(dsl/call common/BPF-FUNC-get-prandom-u32)]
+
+      ;; r0 = r0 % 100 (value 0-99)
+      [(dsl/mod :r0 100)
+       (dsl/stx :w :r10 :r0 -64)]       ; store random at stack[-64]
+
+      ;; Loop through targets comparing random with cumulative weights
+      ;; Target entries start at offset 8 in the map value
+      ;; Each target is 8 bytes: ip(4) + port(2) + cumulative_weight(2)
+
+      ;; r0 = loop counter (0-7)
+      ;; r1 = current target offset
+      ;; r2 = random value
+      ;; r3 = cumulative weight
+
+      [(dsl/mov :r0 0)                  ; loop counter
+       (dsl/mov :r1 8)]                 ; first target at offset 8
+
+      [(asm/label :weight_loop)]
+
+      ;; Check loop bound (max 8 targets)
+      [(dsl/ldx :w :r3 :r10 -60)        ; r3 = target_count
+       (asm/jmp-reg :jge :r0 :r3 :single_target)] ; if counter >= count, use first
+
+      ;; Calculate target offset: 8 + (counter * 8)
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/lsh :r1 3)                  ; r1 = counter * 8
+       (dsl/add :r1 8)]                 ; r1 = 8 + counter * 8
+
+      ;; Load cumulative_weight for this target (at offset 6 within target entry)
+      [(dsl/mov-reg :r2 :r9)            ; r2 = map value base
+       (dsl/add-reg :r2 :r1)            ; r2 = &target[i]
+       (dsl/ldx :h :r3 :r2 6)           ; r3 = cumulative_weight (at offset 6)
+       (dsl/ldx :w :r4 :r10 -64)]       ; r4 = random value
+
+      ;; If random < cumulative_weight, select this target
+      [(asm/jmp-reg :jlt :r4 :r3 :select_target)]
+
+      ;; Otherwise, continue loop
+      [(dsl/add :r0 1)                  ; counter++
+       (asm/jmp :weight_loop)]
+
+      ;; =====================================================================
+      ;; Select current target (r1 = offset within map value)
+      ;; =====================================================================
+      [(asm/label :select_target)]
+
+      ;; Load selected target IP (at offset r1+0 from map value)
+      [(dsl/mov-reg :r2 :r9)
+       (dsl/add-reg :r2 :r1)            ; r2 = &target[selected]
+       (dsl/ldx :w :r3 :r2 0)           ; r3 = target_ip
+       (dsl/stx :w :r10 :r3 -32)        ; store at stack[-32]
+       (dsl/ldx :h :r3 :r2 4)           ; r3 = target_port
+       (dsl/stx :h :r10 :r3 -36)]       ; store at stack[-36]
+      [(asm/jmp :do_checksum)]
+
+      ;; =====================================================================
+      ;; Single target: use first target at offset 8
+      ;; =====================================================================
+      [(asm/label :single_target)]
+
+      ;; Load first target (at offset 8): ip(4) + port(2) + cumulative(2)
+      [(dsl/ldx :w :r1 :r9 8)           ; r1 = new_dst_ip
        (dsl/stx :w :r10 :r1 -32)        ; store at stack[-32]
-       (dsl/ldx :h :r2 :r9 4)           ; r2 = new_dst_port
+       (dsl/ldx :h :r2 :r9 12)          ; r2 = new_dst_port
        (dsl/stx :h :r10 :r2 -36)]       ; store at stack[-36]
+
+      ;; Fall through to do_checksum
+      [(asm/label :do_checksum)]
 
       ;; Branch by protocol for checksum calculation
       [(dsl/ldx :b :r0 :r10 -52)        ; load protocol
@@ -408,7 +486,7 @@
        (dsl/call BPF-FUNC-csum-diff)]    ; r0 = diff
 
       ;; Save diff for L4 checksum
-      [(dsl/stx :w :r10 :r0 -64)]        ; stack[-64] = ip_diff
+      [(dsl/stx :w :r10 :r0 -72)]        ; stack[-72] = ip_diff
 
       ;; Re-validate bounds after csum_diff call
       (xdp-load-data-ptrs-32 :r7 :r8 :r6)
@@ -420,7 +498,7 @@
       [(dsl/mov-reg :r9 :r7)
        (dsl/add :r9 net/ETH-HLEN)        ; r9 = IP header
        (dsl/ldx :h :r1 :r9 10)           ; r1 = old IP checksum (offset 10)
-       (dsl/ldx :w :r2 :r10 -64)]        ; r2 = diff
+       (dsl/ldx :w :r2 :r10 -72)]        ; r2 = diff
 
       ;; Apply: new_csum = ~(~old_csum + diff)
       (xdp-apply-csum-diff :r1 :r2 :r3)
@@ -440,7 +518,7 @@
       [(dsl/ldx :h :r1 :r0 16)]          ; r1 = old TCP checksum
 
       ;; Apply IP diff first (for pseudo-header)
-      [(dsl/ldx :w :r2 :r10 -64)]        ; r2 = ip_diff
+      [(dsl/ldx :w :r2 :r10 -72)]        ; r2 = ip_diff
       (xdp-apply-csum-diff :r1 :r2 :r3)
 
       ;; Now apply port diff
@@ -496,7 +574,7 @@
        (dsl/call BPF-FUNC-csum-diff)]
 
       ;; Save diff for L4 checksum
-      [(dsl/stx :w :r10 :r0 -64)]
+      [(dsl/stx :w :r10 :r0 -72)]
 
       ;; Re-validate bounds after csum_diff call
       (xdp-load-data-ptrs-32 :r7 :r8 :r6)
@@ -508,7 +586,7 @@
       [(dsl/mov-reg :r9 :r7)
        (dsl/add :r9 net/ETH-HLEN)
        (dsl/ldx :h :r1 :r9 10)           ; old IP checksum
-       (dsl/ldx :w :r2 :r10 -64)]        ; diff
+       (dsl/ldx :w :r2 :r10 -72)]        ; diff
       (xdp-apply-csum-diff :r1 :r2 :r3)
       [(dsl/stx :h :r9 :r1 10)]          ; store new IP checksum
 
@@ -520,7 +598,7 @@
       [(asm/jmp-imm :jeq :r1 0 :udp_write_values)] ; skip if checksum disabled
 
       ;; Apply IP diff to UDP checksum
-      [(dsl/ldx :w :r2 :r10 -64)]
+      [(dsl/ldx :w :r2 :r10 -72)]
       (xdp-apply-csum-diff :r1 :r2 :r3)
 
       ;; Apply port diff
@@ -559,65 +637,65 @@
       ;; Value: {orig_dst_ip, orig_dst_port, nat_dst_ip, nat_dst_port}
       [(asm/label :create_conntrack)]
 
-      ;; Build conntrack key at stack[-88] (16 bytes)
+      ;; Build conntrack key at stack[-96] (16 bytes)
       ;; Key layout: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3)
       ;; Use NAT'd destination (backend) so TC can find entry from reply packet
       [(dsl/ldx :w :r0 :r10 -40)          ; r0 = src_ip (client)
-       (dsl/stx :w :r10 :r0 -88)          ; key.src_ip
+       (dsl/stx :w :r10 :r0 -96)          ; key.src_ip
        (dsl/ldx :w :r0 :r10 -32)          ; r0 = nat_dst_ip (backend IP after NAT)
-       (dsl/stx :w :r10 :r0 -84)          ; key.dst_ip
+       (dsl/stx :w :r10 :r0 -92)          ; key.dst_ip
        (dsl/ldx :h :r0 :r10 -48)          ; r0 = src_port (client)
-       (dsl/stx :h :r10 :r0 -80)          ; key.src_port
+       (dsl/stx :h :r10 :r0 -88)          ; key.src_port
        (dsl/ldx :h :r0 :r10 -36)          ; r0 = nat_dst_port (backend port after NAT)
-       (dsl/stx :h :r10 :r0 -78)          ; key.dst_port
+       (dsl/stx :h :r10 :r0 -86)          ; key.dst_port
        (dsl/ldx :b :r0 :r10 -52)          ; r0 = protocol
-       (dsl/stx :b :r10 :r0 -76)          ; key.protocol
+       (dsl/stx :b :r10 :r0 -84)          ; key.protocol
        (dsl/mov :r0 0)
-       (dsl/stx :b :r10 :r0 -75)          ; key.pad[0]
-       (dsl/stx :h :r10 :r0 -74)]         ; key.pad[1-2]
+       (dsl/stx :b :r10 :r0 -83)          ; key.pad[0]
+       (dsl/stx :h :r10 :r0 -82)]         ; key.pad[1-2]
 
-      ;; Build conntrack value at stack[-152] (64 bytes)
+      ;; Build conntrack value at stack[-160] (64 bytes)
       ;; Value layout: see stack layout comment at top of file
 
       ;; NAT mapping info (offsets 0-15)
       [(dsl/ldx :w :r0 :r10 -24)          ; r0 = old_dst_ip (for SNAT to restore)
-       (dsl/stx :w :r10 :r0 -152)         ; value.orig_dst_ip (offset 0)
+       (dsl/stx :w :r10 :r0 -160)         ; value.orig_dst_ip (offset 0)
        (dsl/ldx :h :r0 :r10 -28)          ; r0 = old_dst_port
-       (dsl/stx :h :r10 :r0 -148)         ; value.orig_dst_port (offset 4)
+       (dsl/stx :h :r10 :r0 -156)         ; value.orig_dst_port (offset 4)
        (dsl/mov :r0 0)
-       (dsl/stx :h :r10 :r0 -146)         ; value.pad (offset 6)
+       (dsl/stx :h :r10 :r0 -154)         ; value.pad (offset 6)
        (dsl/ldx :w :r0 :r10 -32)          ; r0 = nat_dst_ip (backend IP)
-       (dsl/stx :w :r10 :r0 -144)         ; value.nat_dst_ip (offset 8)
+       (dsl/stx :w :r10 :r0 -152)         ; value.nat_dst_ip (offset 8)
        (dsl/ldx :h :r0 :r10 -36)          ; r0 = nat_dst_port
-       (dsl/stx :h :r10 :r0 -140)         ; value.nat_dst_port (offset 12)
+       (dsl/stx :h :r10 :r0 -148)         ; value.nat_dst_port (offset 12)
        (dsl/mov :r0 0)
-       (dsl/stx :h :r10 :r0 -138)]        ; value.pad (offset 14)
+       (dsl/stx :h :r10 :r0 -146)]        ; value.pad (offset 14)
 
       ;; Get current timestamp for created_ns and last_seen_ns
       [(dsl/call BPF-FUNC-ktime-get-ns)   ; r0 = current time in ns
-       (dsl/stx :dw :r10 :r0 -136)        ; value.created_ns (offset 16)
-       (dsl/stx :dw :r10 :r0 -128)]       ; value.last_seen_ns (offset 24)
+       (dsl/stx :dw :r10 :r0 -144)        ; value.created_ns (offset 16)
+       (dsl/stx :dw :r10 :r0 -136)]       ; value.last_seen_ns (offset 24)
 
       ;; Initialize packet counters: packets_fwd = 1, packets_rev = 0
       [(dsl/mov :r0 1)
-       (dsl/stx :dw :r10 :r0 -120)        ; value.packets_fwd = 1 (offset 32)
+       (dsl/stx :dw :r10 :r0 -128)        ; value.packets_fwd = 1 (offset 32)
        (dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -112)]       ; value.packets_rev = 0 (offset 40)
+       (dsl/stx :dw :r10 :r0 -120)]       ; value.packets_rev = 0 (offset 40)
 
       ;; Calculate packet length: bytes_fwd = data_end - data
       [(dsl/mov-reg :r0 :r8)              ; r0 = data_end
        (dsl/sub-reg :r0 :r7)              ; r0 = data_end - data = packet length
-       (dsl/stx :dw :r10 :r0 -104)        ; value.bytes_fwd (offset 48)
+       (dsl/stx :dw :r10 :r0 -112)        ; value.bytes_fwd (offset 48)
        (dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -96)]        ; value.bytes_rev = 0 (offset 56)
+       (dsl/stx :dw :r10 :r0 -104)]       ; value.bytes_rev = 0 (offset 56)
 
       ;; Call bpf_map_update_elem(conntrack_map, &key, &value, BPF_ANY)
       (if conntrack-map-fd
         [(dsl/ld-map-fd :r1 conntrack-map-fd)
          (dsl/mov-reg :r2 :r10)
-         (dsl/add :r2 -88)                 ; r2 = &key
+         (dsl/add :r2 -96)                 ; r2 = &key
          (dsl/mov-reg :r3 :r10)
-         (dsl/add :r3 -152)                ; r3 = &value
+         (dsl/add :r3 -160)                ; r3 = &value
          (dsl/mov :r4 0)                   ; r4 = BPF_ANY (0)
          (dsl/call 2)]                     ; bpf_map_update_elem
         ;; No conntrack map - skip update

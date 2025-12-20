@@ -24,15 +24,18 @@
   (testing "Parse source route with CIDR"
     (let [route (config/parse-source-route
                   {:source "192.168.1.0/24"
-                   :target {:ip "10.0.0.1" :port 8080}})]
+                   :target {:ip "10.0.0.1" :port 8080}}
+                  "test-proxy")]
       (is (= 0xC0A80100 (:source route)))
       (is (= 24 (:prefix-len route)))
-      (is (= 0x0A000001 (get-in route [:target :ip])))))
+      ;; target is now a TargetGroup
+      (is (= 0x0A000001 (get-in route [:target-group :targets 0 :ip])))))
 
   (testing "Parse source route with single IP"
     (let [route (config/parse-source-route
                   {:source "192.168.1.100"
-                   :target {:ip "10.0.0.2" :port 9000}})]
+                   :target {:ip "10.0.0.2" :port 9000}}
+                  "test-proxy")]
       (is (= 32 (:prefix-len route))))))
 
 (deftest parse-proxy-config-test
@@ -238,3 +241,162 @@
       (is (string? formatted))
       (is (pos? (count formatted)))
       (is (clojure.string/includes? formatted "test")))))
+
+;;; =============================================================================
+;;; Weighted Load Balancing Tests
+;;; =============================================================================
+
+(deftest validate-weights-single-target-test
+  (testing "Single target with no weight is valid"
+    (is (nil? (config/validate-weights [{:ip "10.0.0.1" :port 8080}]))))
+
+  (testing "Single target with weight=100 is valid"
+    (is (nil? (config/validate-weights [{:ip "10.0.0.1" :port 8080 :weight 100}]))))
+
+  (testing "Single target with any weight is valid (ignored)"
+    (is (nil? (config/validate-weights [{:ip "10.0.0.1" :port 8080 :weight 50}])))))
+
+(deftest validate-weights-multiple-targets-test
+  (testing "Two targets with weights summing to 100 is valid"
+    (is (nil? (config/validate-weights
+                [{:ip "10.0.0.1" :port 8080 :weight 50}
+                 {:ip "10.0.0.2" :port 8080 :weight 50}]))))
+
+  (testing "Three targets with weights summing to 100 is valid"
+    (is (nil? (config/validate-weights
+                [{:ip "10.0.0.1" :port 8080 :weight 50}
+                 {:ip "10.0.0.2" :port 8080 :weight 30}
+                 {:ip "10.0.0.3" :port 8080 :weight 20}]))))
+
+  (testing "Eight targets (max) with weights summing to 100 is valid"
+    (is (nil? (config/validate-weights
+                (mapv #(hash-map :ip (str "10.0.0." %) :port 8080 :weight (if (= % 8) 37 9))
+                      (range 1 9)))))))
+
+(deftest validate-weights-invalid-test
+  (testing "Two targets with weights summing to 120 is invalid"
+    (is (= "Weights must sum to 100, got 120"
+           (config/validate-weights
+             [{:ip "10.0.0.1" :port 8080 :weight 60}
+              {:ip "10.0.0.2" :port 8080 :weight 60}]))))
+
+  (testing "Two targets with weights summing to 80 is invalid"
+    (is (= "Weights must sum to 100, got 80"
+           (config/validate-weights
+             [{:ip "10.0.0.1" :port 8080 :weight 40}
+              {:ip "10.0.0.2" :port 8080 :weight 40}]))))
+
+  (testing "Two targets with missing weight is invalid"
+    (is (= "All targets must have explicit weights when multiple targets are specified"
+           (config/validate-weights
+             [{:ip "10.0.0.1" :port 8080 :weight 50}
+              {:ip "10.0.0.2" :port 8080}])))))
+
+(deftest compute-cumulative-weights-test
+  (testing "Compute cumulative weights for single target"
+    (let [targets [(config/->WeightedTarget 0 8080 100)]]
+      (is (= [100] (config/compute-cumulative-weights targets)))))
+
+  (testing "Compute cumulative weights for multiple targets"
+    (let [targets [(config/->WeightedTarget 0 8080 50)
+                   (config/->WeightedTarget 1 8080 30)
+                   (config/->WeightedTarget 2 8080 20)]]
+      (is (= [50 80 100] (config/compute-cumulative-weights targets))))))
+
+(deftest parse-weighted-target-test
+  (testing "Parse weighted target with explicit weight"
+    (let [target (config/parse-weighted-target {:ip "10.0.0.1" :port 8080 :weight 75})]
+      (is (= 0x0A000001 (:ip target)))
+      (is (= 8080 (:port target)))
+      (is (= 75 (:weight target)))))
+
+  (testing "Parse weighted target without weight defaults to 100"
+    (let [target (config/parse-weighted-target {:ip "10.0.0.1" :port 8080})]
+      (is (= 100 (:weight target))))))
+
+(deftest parse-target-group-test
+  (testing "Parse single target to target group"
+    (let [tg (config/parse-target-group {:ip "10.0.0.1" :port 8080} "test")]
+      (is (= 1 (count (:targets tg))))
+      (is (= [100] (:cumulative-weights tg)))))
+
+  (testing "Parse multiple weighted targets to target group"
+    (let [tg (config/parse-target-group
+               [{:ip "10.0.0.1" :port 8080 :weight 50}
+                {:ip "10.0.0.2" :port 8080 :weight 30}
+                {:ip "10.0.0.3" :port 8080 :weight 20}]
+               "test")]
+      (is (= 3 (count (:targets tg))))
+      (is (= [50 80 100] (:cumulative-weights tg))))))
+
+(deftest parse-target-group-validation-test
+  (testing "Parsing multiple targets with invalid weights throws"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"Weight validation failed"
+          (config/parse-target-group
+            [{:ip "10.0.0.1" :port 8080 :weight 60}
+             {:ip "10.0.0.2" :port 8080 :weight 60}]
+            "test")))))
+
+(deftest parse-weighted-proxy-config-test
+  (testing "Parse proxy with weighted default-target"
+    (let [proxy-cfg (config/parse-proxy-config
+                      {:name "weighted-proxy"
+                       :listen {:interfaces ["eth0"] :port 80}
+                       :default-target
+                       [{:ip "10.0.0.1" :port 8080 :weight 70}
+                        {:ip "10.0.0.2" :port 8080 :weight 30}]})]
+      (is (= "weighted-proxy" (:name proxy-cfg)))
+      (is (= 2 (count (get-in proxy-cfg [:default-target :targets]))))
+      (is (= [70 100] (get-in proxy-cfg [:default-target :cumulative-weights])))))
+
+  (testing "Parse proxy with backward-compatible single default-target"
+    (let [proxy-cfg (config/parse-proxy-config
+                      {:name "single-proxy"
+                       :listen {:interfaces ["eth0"] :port 80}
+                       :default-target {:ip "10.0.0.1" :port 8080}})]
+      (is (= 1 (count (get-in proxy-cfg [:default-target :targets]))))
+      (is (= [100] (get-in proxy-cfg [:default-target :cumulative-weights]))))))
+
+(deftest parse-weighted-source-routes-test
+  (testing "Parse source route with weighted targets"
+    (let [proxy-cfg (config/parse-proxy-config
+                      {:name "test"
+                       :listen {:interfaces ["eth0"] :port 80}
+                       :default-target {:ip "10.0.0.1" :port 8080}
+                       :source-routes
+                       [{:source "192.168.1.0/24"
+                         :targets [{:ip "10.0.1.1" :port 8080 :weight 70}
+                                   {:ip "10.0.1.2" :port 8080 :weight 30}]}]})]
+      (let [route (first (:source-routes proxy-cfg))
+            tg (:target-group route)]
+        (is (= 2 (count (:targets tg))))
+        (is (= [70 100] (:cumulative-weights tg))))))
+
+  (testing "Parse source route with single target (backward compatible)"
+    (let [proxy-cfg (config/parse-proxy-config
+                      {:name "test"
+                       :listen {:interfaces ["eth0"] :port 80}
+                       :default-target {:ip "10.0.0.1" :port 8080}
+                       :source-routes
+                       [{:source "192.168.1.0/24"
+                         :target {:ip "10.0.1.1" :port 8080}}]})]
+      (let [route (first (:source-routes proxy-cfg))
+            tg (:target-group route)]
+        (is (= 1 (count (:targets tg))))))))
+
+(deftest make-weighted-target-group-test
+  (testing "Create weighted target group from specs"
+    (let [tg (config/make-weighted-target-group
+               [{:ip "10.0.0.1" :port 8080 :weight 60}
+                {:ip "10.0.0.2" :port 8080 :weight 40}])]
+      (is (= 2 (count (:targets tg))))
+      (is (= [60 100] (:cumulative-weights tg)))))
+
+  (testing "Creating invalid weighted target group throws"
+    (is (thrown?
+          clojure.lang.ExceptionInfo
+          (config/make-weighted-target-group
+            [{:ip "10.0.0.1" :port 8080 :weight 50}
+             {:ip "10.0.0.2" :port 8080}])))))

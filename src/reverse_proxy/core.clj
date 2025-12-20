@@ -11,6 +11,7 @@
             [reverse-proxy.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
+  (:import [reverse_proxy.config TargetGroup])
   (:gen-class))
 
 ;;; =============================================================================
@@ -156,7 +157,8 @@
 ;;; =============================================================================
 
 (defn- apply-config!
-  "Apply configuration to eBPF maps."
+  "Apply configuration to eBPF maps.
+   Now supports weighted load balancing with TargetGroup records."
   [ebpf-maps config]
   (let [{:keys [listen-map config-map settings-map]} ebpf-maps]
 
@@ -174,20 +176,20 @@
             {:keys [interfaces port]} listen]
 
         ;; Add listen port for each interface
+        ;; default-target is now a TargetGroup with :targets and :cumulative-weights
         (doseq [iface interfaces]
           (when-let [ifindex (util/get-interface-index iface)]
-            (maps/add-listen-port listen-map ifindex port
-              {:ip (:ip default-target)
-               :port (:port default-target)}
+            (maps/add-listen-port-weighted listen-map ifindex port
+              default-target
               :flags (if (:stats-enabled (:settings config)) 1 0))))
 
         ;; Add source routes
+        ;; Each route now has :target-group instead of :target
         (doseq [route source-routes]
-          (maps/add-source-route config-map
+          (maps/add-source-route-weighted config-map
             {:ip (:source route)
              :prefix-len (:prefix-len route)}
-            {:ip (get-in route [:target :ip])
-             :port (get-in route [:target :port])}))))))
+            (:target-group route)))))))
 
 ;;; =============================================================================
 ;;; Interface Attachment
@@ -246,7 +248,8 @@
 ;;; =============================================================================
 
 (defn add-proxy!
-  "Add a new proxy configuration at runtime."
+  "Add a new proxy configuration at runtime.
+   Now supports weighted load balancing with TargetGroup records."
   [proxy-config]
   (when-let [state @proxy-state]
     (let [parsed (config/parse-proxy-config proxy-config)
@@ -257,20 +260,18 @@
             {:keys [listen default-target source-routes]} parsed
             {:keys [interfaces port]} listen]
 
-        ;; Add listen port entries
+        ;; Add listen port entries with weighted targets
         (doseq [iface interfaces]
           (when-let [ifindex (util/get-interface-index iface)]
-            (maps/add-listen-port listen-map ifindex port
-              {:ip (:ip default-target)
-               :port (:port default-target)})))
+            (maps/add-listen-port-weighted listen-map ifindex port
+              default-target)))
 
-        ;; Add source routes
+        ;; Add source routes with weighted targets
         (doseq [route source-routes]
-          (maps/add-source-route config-map
+          (maps/add-source-route-weighted config-map
             {:ip (:source route)
              :prefix-len (:prefix-len route)}
-            {:ip (get-in route [:target :ip])
-             :port (get-in route [:target :port])}))
+            (:target-group route)))
 
         ;; Attach to new interfaces
         (attach-interfaces! interfaces))
@@ -304,22 +305,44 @@
         (log/info "Removed proxy:" proxy-name)))))
 
 (defn add-source-route!
-  "Add a source route to a proxy."
+  "Add a source route to a proxy.
+   target can be:
+   - Single target: {:ip \"10.0.0.1\" :port 8080}
+   - Weighted targets: [{:ip \"10.0.0.1\" :port 8080 :weight 50}
+                        {:ip \"10.0.0.2\" :port 8080 :weight 50}]"
   [proxy-name source target]
   (when-let [state @proxy-state]
     (let [{:keys [config-map]} (:maps state)
           {:keys [ip prefix-len]} (util/resolve-to-ip source)
-          target-ip (if (string? (:ip target))
-                      (util/ip-string->u32 (:ip target))
-                      (:ip target))]
+          ;; Normalize target to TargetGroup
+          target-group (cond
+                         ;; Already a TargetGroup record
+                         (instance? TargetGroup target)
+                         target
 
-      (maps/add-source-route config-map
+                         ;; Vector of targets - create weighted target group
+                         (vector? target)
+                         (config/make-weighted-target-group target)
+
+                         ;; Single target map - create single target group
+                         :else
+                         (config/make-single-target-group
+                           (if (string? (:ip target))
+                             (util/ip-string->u32 (:ip target))
+                             (:ip target))
+                           (:port target)))
+          ;; For config update, convert back to map format
+          target-spec (if (vector? target) target {:ip (:ip target) :port (:port target)})]
+
+      (maps/add-source-route-weighted config-map
         {:ip ip :prefix-len prefix-len}
-        {:ip target-ip :port (:port target)})
+        target-group)
 
       (swap! proxy-state update :config
              config/add-source-route-to-proxy proxy-name
-             {:source source :target target})
+             (if (vector? target)
+               {:source source :targets target}
+               {:source source :target target}))
 
       (log/info "Added source route:" source "->" target))))
 

@@ -39,6 +39,7 @@
 (def BPF-FUNC-map-update-elem 2)
 (def BPF-FUNC-map-delete-elem 3)
 (def BPF-FUNC-ktime-get-ns 5)
+(def BPF-FUNC-get-prandom-u32 7)  ;; For weighted load balancing
 (def BPF-FUNC-redirect 23)
 (def BPF-FUNC-csum-diff 28)
 (def BPF-FUNC-l3-csum-replace 55)
@@ -362,6 +363,27 @@
    Result in r0."
   []
   [(dsl/call BPF-FUNC-ktime-get-ns)])
+
+;;; =============================================================================
+;;; Random Number Helper (for Weighted Load Balancing)
+;;; =============================================================================
+
+(defn build-get-prandom-u32
+  "Get a pseudo-random 32-bit number.
+   Result in r0."
+  []
+  [(dsl/call BPF-FUNC-get-prandom-u32)])
+
+(defn build-random-mod-100
+  "Generate random number in range [0, 99].
+   Result in r0.
+   Uses: r0, r1 as scratch"
+  []
+  [(dsl/call BPF-FUNC-get-prandom-u32)
+   ;; r0 = r0 % 100
+   ;; BPF doesn't have modulo, so we use: r0 = r0 - (r0 / 100) * 100
+   ;; But there's a simpler approach: BPF has ALU mod operation
+   (dsl/mod :r0 100)])
 
 ;;; =============================================================================
 ;;; Map Utilities

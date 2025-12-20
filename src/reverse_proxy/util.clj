@@ -207,6 +207,114 @@
        :target-port port
        :flags (bit-and (.getShort buf) 0xFFFF)})))
 
+;;; =============================================================================
+;;; Weighted Route Encoding (for load balancing)
+;;; =============================================================================
+
+;; Weighted route value format (max 72 bytes):
+;;
+;; Header (8 bytes):
+;;   target_count: u8 (1-8)
+;;   reserved: u8[3]
+;;   flags: u16
+;;   reserved: u16
+;;
+;; Per target (8 bytes each, max 8):
+;;   ip: u32 (network byte order)
+;;   port: u16 (network byte order)
+;;   cumulative_weight: u16 (0-100)
+;;
+;; Total: 8 + (8 × N) bytes, max 72 bytes
+
+(def ^:const WEIGHTED-ROUTE-HEADER-SIZE 8)
+(def ^:const WEIGHTED-ROUTE-TARGET-SIZE 8)
+(def ^:const WEIGHTED-ROUTE-MAX-TARGETS 8)
+(def ^:const WEIGHTED-ROUTE-MAX-SIZE
+  (+ WEIGHTED-ROUTE-HEADER-SIZE (* WEIGHTED-ROUTE-MAX-TARGETS WEIGHTED-ROUTE-TARGET-SIZE)))
+
+(defn encode-weighted-route-value
+  "Encode weighted route value for BPF map.
+   target-group is a TargetGroup record with :targets and :cumulative-weights.
+   flags is optional (default 0).
+
+   Format (max 72 bytes):
+   - Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+   - Per target (8 bytes each): ip(4) + port(2) + cumulative_weight(2)
+
+   IP and port are stored in network byte order for direct packet writes."
+  ([target-group] (encode-weighted-route-value target-group 0))
+  ([target-group flags]
+   (let [targets (:targets target-group)
+         cumulative-weights (:cumulative-weights target-group)
+         target-count (count targets)
+         _ (when (> target-count WEIGHTED-ROUTE-MAX-TARGETS)
+             (throw (ex-info "Too many targets" {:count target-count :max WEIGHTED-ROUTE-MAX-TARGETS})))
+         ;; Always allocate max size for consistent map value size
+         buf (ByteBuffer/allocate WEIGHTED-ROUTE-MAX-SIZE)]
+
+     ;; Header: target_count (1 byte)
+     (.order buf ByteOrder/BIG_ENDIAN)
+     (.put buf (unchecked-byte target-count))
+     ;; Reserved (3 bytes)
+     (.put buf (byte 0))
+     (.put buf (byte 0))
+     (.put buf (byte 0))
+     ;; Flags (2 bytes) in native order
+     (.order buf (ByteOrder/nativeOrder))
+     (.putShort buf (unchecked-short flags))
+     ;; Reserved (2 bytes)
+     (.putShort buf (short 0))
+
+     ;; Per-target entries
+     (.order buf ByteOrder/BIG_ENDIAN)
+     (doseq [[target cumulative-weight] (map vector targets cumulative-weights)]
+       (.putInt buf (unchecked-int (:ip target)))
+       (.putShort buf (unchecked-short (:port target)))
+       (.putShort buf (unchecked-short cumulative-weight)))
+
+     ;; Zero-fill remaining target slots
+     (dotimes [_ (- WEIGHTED-ROUTE-MAX-TARGETS target-count)]
+       (.putLong buf 0))
+
+     (.array buf))))
+
+(defn decode-weighted-route-value
+  "Decode weighted route value from byte array (72 bytes).
+   Returns {:target-count :flags :targets} where targets is a vector of
+   {:ip :port :cumulative-weight} maps."
+  [^bytes b]
+  (when (< (alength b) WEIGHTED-ROUTE-MAX-SIZE)
+    (throw (ex-info "Buffer too small for weighted route" {:size (alength b) :expected WEIGHTED-ROUTE-MAX-SIZE})))
+  (let [buf (ByteBuffer/wrap b)]
+    ;; Header
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (let [target-count (bit-and (.get buf) 0xFF)
+          _ (.get buf)  ; reserved
+          _ (.get buf)  ; reserved
+          _ (.get buf)  ; reserved
+          ;; Flags in native order
+          _ (.order buf (ByteOrder/nativeOrder))
+          flags (bit-and (.getShort buf) 0xFFFF)
+          _ (.getShort buf)  ; reserved
+          ;; Targets in network byte order
+          _ (.order buf ByteOrder/BIG_ENDIAN)
+          targets (vec (for [_ (range target-count)]
+                         (let [ip (Integer/toUnsignedLong (.getInt buf))
+                               port (bit-and (.getShort buf) 0xFFFF)
+                               cumulative-weight (bit-and (.getShort buf) 0xFFFF)]
+                           {:ip ip
+                            :port port
+                            :cumulative-weight cumulative-weight})))]
+      {:target-count target-count
+       :flags flags
+       :targets targets})))
+
+(defn weighted-route-value-size
+  "Return the fixed size of weighted route values (72 bytes).
+   All weighted routes use the same size for BPF map compatibility."
+  []
+  WEIGHTED-ROUTE-MAX-SIZE)
+
 (defn encode-conntrack-key
   "Encode connection tracking 5-tuple key.
    {src_ip (4) + dst_ip (4) + src_port (2) + dst_port (2) + protocol (1) + padding (3)}
