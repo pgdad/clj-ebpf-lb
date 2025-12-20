@@ -1,0 +1,7 @@
+# VM disk images (created by setup-vm.sh)
+*.img
+*.qcow2
+
+# Runtime files
+*.pid
+*.log
