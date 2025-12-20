@@ -1,0 +1,53 @@
+;; Multi-Backend with Source-Based Routing
+;;
+;; Routes traffic to different backends based on the client's source IP.
+;; Useful for:
+;;   - Internal vs external traffic separation
+;;   - Geographic routing
+;;   - Tenant isolation
+;;   - A/B testing
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/multi-backend.edn
+;;
+;; Routing Logic:
+;;   1. Traffic from 192.168.0.0/16 -> Internal backend (10.0.0.10:8080)
+;;   2. Traffic from 10.10.0.0/16   -> Premium backend (10.0.0.20:8080)
+;;   3. Traffic from 172.16.5.0/24  -> Dev/test backend (10.0.0.30:8080)
+;;   4. All other traffic           -> Default backend (10.0.0.1:8080)
+;;
+;; Note: Routes are matched by longest prefix first.
+
+{:proxies
+ [{:name "web-proxy"
+   :listen
+   {:interfaces ["eth0"]
+    :port 80}
+
+   ;; Default backend - used when no source route matches
+   :default-target
+   {:ip "10.0.0.1"
+    :port 8080}
+
+   ;; Source-based routing rules
+   :source-routes
+   [;; Route internal network (192.168.x.x) to internal backend
+    {:source "192.168.0.0/16"
+     :target {:ip "10.0.0.10" :port 8080}}
+
+    ;; Route premium/VIP clients to dedicated backend
+    {:source "10.10.0.0/16"
+     :target {:ip "10.0.0.20" :port 8080}}
+
+    ;; Route dev/test network to test backend
+    {:source "172.16.5.0/24"
+     :target {:ip "10.0.0.30" :port 8080}}
+
+    ;; You can also route a single IP
+    {:source "203.0.113.50"
+     :target {:ip "10.0.0.40" :port 8080}}]}]
+
+ :settings
+ {:stats-enabled true        ; Enable to monitor which backends receive traffic
+  :connection-timeout-sec 300
+  :max-connections 50000}}

@@ -1,0 +1,32 @@
+;; Simple Single-Backend Proxy Configuration
+;;
+;; This is the simplest possible configuration - forward all traffic
+;; from port 80 to a single backend server.
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/simple-proxy.edn
+;;
+;; Test:
+;;   1. Start a backend server:
+;;      python3 -m http.server 8080
+;;
+;;   2. Run the proxy:
+;;      sudo clojure -M:run -c examples/simple-proxy.edn
+;;
+;;   3. Test:
+;;      curl http://localhost:80
+
+{:proxies
+ [{:name "simple"
+   :listen
+   {:interfaces ["eth0"]    ; Change to your interface name (use: ip link show)
+    :port 80}               ; Port to listen on
+
+   :default-target
+   {:ip "127.0.0.1"         ; Backend server IP
+    :port 8080}}]           ; Backend server port
+
+ :settings
+ {:stats-enabled false      ; Set to true to enable statistics
+  :connection-timeout-sec 300
+  :max-connections 10000}}

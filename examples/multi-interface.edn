@@ -1,0 +1,50 @@
+;; Multi-Interface Proxy Configuration
+;;
+;; Listen on multiple network interfaces. Useful for:
+;;   - Servers with public and private NICs
+;;   - Multiple VLANs
+;;   - High availability with multiple network paths
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/multi-interface.edn
+;;
+;; Check your interfaces:
+;;   ip link show
+;;   ip addr show
+;;
+;; Common interface naming:
+;;   - eth0, eth1            : Traditional naming
+;;   - ens3, ens4            : Predictable naming (cloud)
+;;   - enp0s3, enp0s8        : Predictable naming (physical)
+;;   - bond0                 : Bonded interfaces
+;;   - veth0, veth1          : Virtual ethernet pairs
+
+{:proxies
+ [;; Public-facing web proxy
+  {:name "public-web"
+   :listen
+   {:interfaces ["eth0" "eth1"]  ; Listen on multiple interfaces
+    :port 80}
+   :default-target
+   {:ip "10.0.0.1"
+    :port 8080}}
+
+  ;; Internal API proxy (different port, different interfaces)
+  {:name "internal-api"
+   :listen
+   {:interfaces ["eth2"]         ; Private network interface
+    :port 8080}
+   :default-target
+   {:ip "10.0.1.1"
+    :port 3000}
+   :source-routes
+   [;; Only allow internal subnets
+    {:source "10.0.0.0/8"
+     :target {:ip "10.0.1.1" :port 3000}}
+    {:source "172.16.0.0/12"
+     :target {:ip "10.0.1.2" :port 3000}}]}]
+
+ :settings
+ {:stats-enabled false
+  :connection-timeout-sec 300
+  :max-connections 100000}}

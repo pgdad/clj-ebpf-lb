@@ -1,0 +1,68 @@
+;; High Availability Configuration
+;;
+;; Configuration for a production-ready high-availability setup.
+;; This example shows patterns for:
+;;   - Multiple backend targets with source-based failover
+;;   - Higher connection limits
+;;   - Statistics enabled for monitoring
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/high-availability.edn
+;;
+;; Recommended deployment:
+;;   - Run on multiple frontend servers
+;;   - Use DNS round-robin or external load balancer
+;;   - Monitor with the stats streaming API
+
+{:proxies
+ [;; Primary web traffic handler
+  {:name "web-ha"
+   :listen
+   {:interfaces ["eth0" "eth1"]    ; Multi-homed for redundancy
+    :port 80}
+
+   ;; Primary backend cluster
+   :default-target
+   {:ip "10.0.0.1"
+    :port 8080}
+
+   :source-routes
+   [;; Datacenter 1 clients -> DC1 backends
+    {:source "10.10.0.0/16"
+     :target {:ip "10.0.0.10" :port 8080}}
+
+    ;; Datacenter 2 clients -> DC2 backends
+    {:source "10.20.0.0/16"
+     :target {:ip "10.0.0.20" :port 8080}}
+
+    ;; Cloud region A -> Cloud backends A
+    {:source "172.16.0.0/16"
+     :target {:ip "10.0.0.30" :port 8080}}
+
+    ;; Cloud region B -> Cloud backends B
+    {:source "172.17.0.0/16"
+     :target {:ip "10.0.0.40" :port 8080}}
+
+    ;; VPN users -> Dedicated backend
+    {:source "192.168.100.0/24"
+     :target {:ip "10.0.0.50" :port 8080}}]}
+
+  ;; HTTPS traffic (L4 passthrough - TLS terminated at backend)
+  {:name "https-ha"
+   :listen
+   {:interfaces ["eth0" "eth1"]
+    :port 443}
+   :default-target
+   {:ip "10.0.1.1"
+    :port 8443}
+   :source-routes
+   [;; Same source-based routing for HTTPS
+    {:source "10.10.0.0/16"
+     :target {:ip "10.0.1.10" :port 8443}}
+    {:source "10.20.0.0/16"
+     :target {:ip "10.0.1.20" :port 8443}}]}]
+
+ :settings
+ {:stats-enabled true              ; Always enable for production monitoring
+  :connection-timeout-sec 600      ; 10 minutes for long-lived connections
+  :max-connections 500000}}        ; High limit for production workloads

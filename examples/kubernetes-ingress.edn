@@ -1,0 +1,61 @@
+;; Kubernetes Ingress-Style Configuration
+;;
+;; Multiple proxies for different services, similar to a K8s Ingress controller.
+;; This pattern is useful for microservices architectures where each service
+;; is exposed on a different port.
+;;
+;; Note: This is Layer 4 (TCP/UDP) proxying, not Layer 7 (HTTP).
+;; For hostname-based routing, you need an L7 proxy like nginx/envoy.
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/kubernetes-ingress.edn
+;;
+;; Service Layout:
+;;   Port 80   -> Frontend service (web-svc)
+;;   Port 443  -> API service (api-svc) - Note: No TLS termination, passthrough only
+;;   Port 8443 -> Admin service (admin-svc)
+
+{:proxies
+ [;; Frontend/Web Service
+  {:name "web-svc"
+   :listen
+   {:interfaces ["eth0"]
+    :port 80}
+   :default-target
+   {:ip "10.0.10.1"         ; web-svc ClusterIP or Pod IP
+    :port 8080}
+   :source-routes
+   [;; Route internal traffic to canary deployment
+    {:source "10.0.0.0/8"
+     :target {:ip "10.0.10.2" :port 8080}}]}
+
+  ;; API Service
+  {:name "api-svc"
+   :listen
+   {:interfaces ["eth0"]
+    :port 443}
+   :default-target
+   {:ip "10.0.20.1"         ; api-svc ClusterIP or Pod IP
+    :port 3000}
+   :source-routes
+   [;; Premium tier gets dedicated API backend
+    {:source "172.16.0.0/12"
+     :target {:ip "10.0.20.10" :port 3000}}]}
+
+  ;; Admin Service (internal only)
+  {:name "admin-svc"
+   :listen
+   {:interfaces ["eth0"]
+    :port 8443}
+   :default-target
+   {:ip "10.0.30.1"         ; admin-svc ClusterIP or Pod IP
+    :port 9000}
+   :source-routes
+   [;; Only allow from management network
+    {:source "192.168.100.0/24"
+     :target {:ip "10.0.30.1" :port 9000}}]}]
+
+ :settings
+ {:stats-enabled true         ; Enable for monitoring dashboards
+  :connection-timeout-sec 300
+  :max-connections 200000}}   ; Higher limit for microservices
