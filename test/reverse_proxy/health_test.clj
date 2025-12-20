@@ -7,7 +7,8 @@
             [reverse-proxy.health.manager :as manager]
             [reverse-proxy.config :as config]
             [reverse-proxy.util :as util])
-  (:import [java.net ServerSocket]))
+  (:import [java.net ServerSocket InetSocketAddress]
+           [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]))
 
 ;;; =============================================================================
 ;;; Test Fixtures
@@ -70,6 +71,143 @@
   (testing "Target ID parsing"
     (is (= {:ip "10.0.0.1" :port 8080} (checker/parse-target-id "10.0.0.1:8080")))
     (is (= {:ip "192.168.1.100" :port 443} (checker/parse-target-id "192.168.1.100:443")))))
+
+;;; =============================================================================
+;;; HTTP Health Check Integration Tests
+;;; =============================================================================
+
+(defn- create-http-handler
+  "Create an HTTP handler that responds with the given status code and body."
+  [status-code body]
+  (reify HttpHandler
+    (handle [_ exchange]
+      (let [response-bytes (.getBytes ^String body "UTF-8")]
+        (.sendResponseHeaders ^HttpExchange exchange status-code (count response-bytes))
+        (with-open [os (.getResponseBody ^HttpExchange exchange)]
+          (.write os response-bytes))))))
+
+(defn- start-test-http-server
+  "Start a test HTTP server on a random port with the given handlers.
+   handlers is a map of path -> [status-code body]
+   Returns [server port]."
+  [handlers]
+  (let [server (HttpServer/create (InetSocketAddress. 0) 0)
+        port (.getPort (.getAddress server))]
+    (doseq [[path [status body]] handlers]
+      (.createContext server path (create-http-handler status body)))
+    (.setExecutor server nil)
+    (.start server)
+    [server port]))
+
+(defn- stop-test-http-server
+  "Stop the test HTTP server."
+  [^HttpServer server]
+  (.stop server 0))
+
+(deftest check-http-success-test
+  (testing "HTTP check succeeds with 200 OK"
+    (let [[server port] (start-test-http-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (checker/check-http "127.0.0.1" port "/health" 2000 [200])]
+          (is (:success? result))
+          (is (number? (:latency-ms result)))
+          (is (nil? (:error result))))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-custom-path-test
+  (testing "HTTP check works with custom health check path"
+    (let [[server port] (start-test-http-server {"/api/v1/healthz" [200 "{\"status\":\"healthy\"}"]})]
+      (try
+        (let [result (checker/check-http "127.0.0.1" port "/api/v1/healthz" 2000 [200])]
+          (is (:success? result)))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-multiple-expected-codes-test
+  (testing "HTTP check accepts multiple expected status codes"
+    (let [[server port] (start-test-http-server {"/health" [204 ""]})]
+      (try
+        ;; 204 No Content should be accepted when in expected codes
+        (let [result (checker/check-http "127.0.0.1" port "/health" 2000 [200 204])]
+          (is (:success? result)))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-unexpected-status-test
+  (testing "HTTP check fails with unexpected status code"
+    (let [[server port] (start-test-http-server {"/health" [503 "Service Unavailable"]})]
+      (try
+        (let [result (checker/check-http "127.0.0.1" port "/health" 2000 [200])]
+          (is (not (:success? result)))
+          (is (= :unexpected-status (:error result)))
+          (is (clojure.string/includes? (:message result) "503")))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-404-test
+  (testing "HTTP check fails when endpoint returns 404"
+    (let [[server port] (start-test-http-server {"/other" [200 "OK"]})]
+      (try
+        ;; Request /health but server only has /other
+        (let [result (checker/check-http "127.0.0.1" port "/health" 2000 [200])]
+          (is (not (:success? result)))
+          (is (= :unexpected-status (:error result))))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-connection-refused-test
+  (testing "HTTP check fails with connection refused on closed port"
+    (let [result (checker/check-http "127.0.0.1" 59998 "/health" 1000 [200])]
+      (is (not (:success? result)))
+      (is (= :connection-refused (:error result))))))
+
+(deftest check-http-various-status-codes-test
+  (testing "HTTP check handles various status codes correctly"
+    (let [[server port] (start-test-http-server {"/ok" [200 "OK"]
+                                                  "/created" [201 "Created"]
+                                                  "/accepted" [202 "Accepted"]
+                                                  "/bad-request" [400 "Bad Request"]
+                                                  "/internal-error" [500 "Internal Server Error"]})]
+      (try
+        ;; 200 OK - success
+        (is (:success? (checker/check-http "127.0.0.1" port "/ok" 2000 [200])))
+
+        ;; 201 Created - success when expected
+        (is (:success? (checker/check-http "127.0.0.1" port "/created" 2000 [200 201 202])))
+
+        ;; 400 Bad Request - failure
+        (let [result (checker/check-http "127.0.0.1" port "/bad-request" 2000 [200])]
+          (is (not (:success? result)))
+          (is (= :unexpected-status (:error result))))
+
+        ;; 500 Internal Error - failure
+        (let [result (checker/check-http "127.0.0.1" port "/internal-error" 2000 [200])]
+          (is (not (:success? result)))
+          (is (= :unexpected-status (:error result))))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-via-public-api-test
+  (testing "HTTP check via public health API"
+    (let [[server port] (start-test-http-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (health/check-http "127.0.0.1" port "/health" 2000 [200])]
+          (is (:success? result)))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-http-latency-measurement-test
+  (testing "HTTP check measures latency correctly"
+    (let [[server port] (start-test-http-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (checker/check-http "127.0.0.1" port "/health" 2000 [200])]
+          (is (:success? result))
+          (is (number? (:latency-ms result)))
+          (is (> (:latency-ms result) 0))
+          (is (< (:latency-ms result) 2000)))  ; Should be much faster than timeout
+        (finally
+          (stop-test-http-server server))))))
 
 ;;; =============================================================================
 ;;; Weights Tests
