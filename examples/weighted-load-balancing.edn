@@ -1,0 +1,91 @@
+;; Weighted Load Balancing Configuration
+;;
+;; Distribute traffic across multiple backend servers with configurable weights.
+;; Useful for:
+;;   - Gradual rollouts (canary deployments)
+;;   - A/B testing with traffic splits
+;;   - Load distribution based on server capacity
+;;   - Blue/green deployments
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/weighted-load-balancing.edn
+;;
+;; Weight Rules:
+;;   - For single targets, weight is optional
+;;   - For multiple targets, all weights are required and must sum to 100
+;;   - Traffic distribution is probabilistic per new connection
+;;   - Established connections always go to the same backend (connection affinity)
+;;
+;; Example Distribution:
+;;   With weights [50, 30, 20] over 10000 connections:
+;;     - Backend 1: ~5000 connections (50%)
+;;     - Backend 2: ~3000 connections (30%)
+;;     - Backend 3: ~2000 connections (20%)
+
+{:proxies
+ [;; Example 1: Simple weighted distribution across 3 backends
+  {:name "web-weighted"
+   :listen
+   {:interfaces ["eth0"]
+    :port 80}
+
+   ;; Distribute traffic across three backends with different capacities
+   :default-target
+   [{:ip "10.0.0.1" :port 8080 :weight 50}   ; Primary: 50% of traffic
+    {:ip "10.0.0.2" :port 8080 :weight 30}   ; Secondary: 30% of traffic
+    {:ip "10.0.0.3" :port 8080 :weight 20}]} ; Tertiary: 20% of traffic
+
+  ;; Example 2: Canary deployment - gradual rollout of new version
+  {:name "api-canary"
+   :listen
+   {:interfaces ["eth0"]
+    :port 8080}
+
+   ;; 90% stable, 10% canary
+   :default-target
+   [{:ip "10.1.0.1" :port 3000 :weight 90}   ; Stable version
+    {:ip "10.1.0.2" :port 3000 :weight 10}]} ; Canary version
+
+  ;; Example 3: Blue/green deployment with gradual traffic shift
+  {:name "app-blue-green"
+   :listen
+   {:interfaces ["eth0"]
+    :port 443}
+
+   ;; Transitioning from blue (old) to green (new)
+   :default-target
+   [{:ip "10.2.0.1" :port 8443 :weight 30}   ; Blue (old) - winding down
+    {:ip "10.2.0.2" :port 8443 :weight 70}]} ; Green (new) - ramping up
+
+  ;; Example 4: Weighted source-based routing
+  ;; Different clients can have different backend distributions
+  {:name "mixed-routing"
+   :listen
+   {:interfaces ["eth0" "eth1"]
+    :port 9000}
+
+   ;; Default: even split across two backends
+   :default-target
+   [{:ip "10.3.0.1" :port 8080 :weight 50}
+    {:ip "10.3.0.2" :port 8080 :weight 50}]
+
+   :source-routes
+   [;; Internal network: weighted distribution across internal backends
+    {:source "192.168.0.0/16"
+     :targets [{:ip "10.3.1.1" :port 8080 :weight 60}
+               {:ip "10.3.1.2" :port 8080 :weight 40}]}
+
+    ;; VIP customers: premium backends with more capacity
+    {:source "10.100.0.0/16"
+     :targets [{:ip "10.3.2.1" :port 8080 :weight 40}
+               {:ip "10.3.2.2" :port 8080 :weight 40}
+               {:ip "10.3.2.3" :port 8080 :weight 20}]}
+
+    ;; Single specific host: non-weighted (single target)
+    {:source "203.0.113.100"
+     :target {:ip "10.3.3.1" :port 8080}}]}]
+
+ :settings
+ {:stats-enabled true              ; Enable to monitor distribution
+  :connection-timeout-sec 300
+  :max-connections 100000}}

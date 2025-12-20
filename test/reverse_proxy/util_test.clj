@@ -195,3 +195,92 @@
     (is (= 2 util/XDP-PASS))
     (is (= 3 util/XDP-TX))
     (is (= 4 util/XDP-REDIRECT))))
+
+;;; =============================================================================
+;;; Weighted Route Encoding Tests
+;;; =============================================================================
+
+(deftest weighted-route-constants-test
+  (testing "Weighted route constants are correct"
+    (is (= 8 util/WEIGHTED-ROUTE-HEADER-SIZE))
+    (is (= 8 util/WEIGHTED-ROUTE-TARGET-SIZE))
+    (is (= 8 util/WEIGHTED-ROUTE-MAX-TARGETS))
+    (is (= 72 util/WEIGHTED-ROUTE-MAX-SIZE))))
+
+(deftest encode-weighted-route-single-target-test
+  (testing "Single target encoding"
+    (let [target-group {:targets [{:ip 0x0A000001 :port 8080 :weight 100}]
+                        :cumulative-weights [100]}
+          encoded (util/encode-weighted-route-value target-group 0)]
+      (is (= util/WEIGHTED-ROUTE-MAX-SIZE (count encoded)))
+      (let [decoded (util/decode-weighted-route-value encoded)]
+        (is (= 1 (:target-count decoded)))
+        (is (= 0 (:flags decoded)))
+        (is (= 1 (count (:targets decoded))))
+        (is (= 0x0A000001 (get-in decoded [:targets 0 :ip])))
+        (is (= 8080 (get-in decoded [:targets 0 :port])))
+        (is (= 100 (get-in decoded [:targets 0 :cumulative-weight])))))))
+
+(deftest encode-weighted-route-multiple-targets-test
+  (testing "Multiple targets encoding"
+    (let [target-group {:targets [{:ip 0x0A000001 :port 8080 :weight 50}
+                                  {:ip 0x0A000002 :port 8080 :weight 30}
+                                  {:ip 0x0A000003 :port 8080 :weight 20}]
+                        :cumulative-weights [50 80 100]}
+          encoded (util/encode-weighted-route-value target-group 1)]
+      (is (= util/WEIGHTED-ROUTE-MAX-SIZE (count encoded)))
+      (let [decoded (util/decode-weighted-route-value encoded)]
+        (is (= 3 (:target-count decoded)))
+        (is (= 1 (:flags decoded)))
+        (is (= 3 (count (:targets decoded))))
+        ;; Check all targets
+        (is (= 0x0A000001 (get-in decoded [:targets 0 :ip])))
+        (is (= 8080 (get-in decoded [:targets 0 :port])))
+        (is (= 50 (get-in decoded [:targets 0 :cumulative-weight])))
+        (is (= 0x0A000002 (get-in decoded [:targets 1 :ip])))
+        (is (= 80 (get-in decoded [:targets 1 :cumulative-weight])))
+        (is (= 0x0A000003 (get-in decoded [:targets 2 :ip])))
+        (is (= 100 (get-in decoded [:targets 2 :cumulative-weight])))))))
+
+(deftest encode-weighted-route-max-targets-test
+  (testing "Maximum 8 targets encoding"
+    (let [targets (for [i (range 8)]
+                    {:ip (+ 0x0A000001 i) :port (+ 8080 i) :weight (if (= i 7) 16 12)})
+          cumulative (reductions + (map :weight targets))
+          target-group {:targets (vec targets)
+                        :cumulative-weights (vec cumulative)}
+          encoded (util/encode-weighted-route-value target-group 0)]
+      (is (= util/WEIGHTED-ROUTE-MAX-SIZE (count encoded)))
+      (let [decoded (util/decode-weighted-route-value encoded)]
+        (is (= 8 (:target-count decoded)))
+        (is (= 8 (count (:targets decoded))))
+        ;; Verify first and last targets
+        (is (= 0x0A000001 (get-in decoded [:targets 0 :ip])))
+        (is (= 8080 (get-in decoded [:targets 0 :port])))
+        (is (= 0x0A000008 (get-in decoded [:targets 7 :ip])))
+        (is (= 8087 (get-in decoded [:targets 7 :port])))
+        (is (= 100 (get-in decoded [:targets 7 :cumulative-weight])))))))
+
+(deftest encode-weighted-route-roundtrip-test
+  (testing "Encoding roundtrip preserves all data"
+    (doseq [num-targets [1 2 3 4 5 6 7 8]]
+      (let [weights (if (= num-targets 1)
+                      [100]
+                      (let [base-weight (quot 100 num-targets)
+                            remainder (rem 100 num-targets)]
+                        (concat (repeat (dec num-targets) base-weight)
+                                [(+ base-weight remainder)])))
+            targets (vec (for [[i w] (map-indexed vector weights)]
+                           {:ip (+ 0xC0A80101 i) :port (+ 3000 i) :weight w}))
+            cumulative (vec (reductions + weights))
+            target-group {:targets targets :cumulative-weights cumulative}
+            encoded (util/encode-weighted-route-value target-group 42)
+            decoded (util/decode-weighted-route-value encoded)]
+        (is (= num-targets (:target-count decoded))
+            (str "Failed for " num-targets " targets"))
+        (is (= 42 (:flags decoded)))
+        (is (= num-targets (count (:targets decoded))))))))
+
+(deftest weighted-route-value-size-test
+  (testing "Value size calculation"
+    (is (= util/WEIGHTED-ROUTE-MAX-SIZE (util/weighted-route-value-size)))))

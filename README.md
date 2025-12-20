@@ -9,6 +9,7 @@ A high-performance eBPF-based reverse proxy written in Clojure. Uses XDP (eXpres
 - **TC Egress SNAT**: Return traffic has its source address rewritten to appear as the proxy
 - **Connection Tracking**: Full stateful NAT with per-CPU hash maps for scalability
 - **Source-Based Routing**: Route traffic to different backends based on client IP/subnet
+- **Weighted Load Balancing**: Distribute traffic across multiple backends with configurable weights
 - **Runtime Configuration**: Add/remove proxies and routes without restart
 - **Statistics Collection**: Real-time connection and traffic statistics via ring buffer
 - **ARM64 Support**: Full cross-platform support with QEMU-based ARM64 testing
@@ -145,6 +146,47 @@ The routing precedence is:
 1. Most specific source route (longest prefix match)
 2. Default target (if no route matches)
 
+### Weighted Load Balancing
+
+Distribute traffic across multiple backend servers with configurable weights. This is useful for canary deployments, A/B testing, capacity-based distribution, and blue/green deployments.
+
+```clojure
+;; Weighted default target - distribute across 3 backends
+:default-target
+[{:ip "10.0.0.1" :port 8080 :weight 50}   ; 50% of traffic
+ {:ip "10.0.0.2" :port 8080 :weight 30}   ; 30% of traffic
+ {:ip "10.0.0.3" :port 8080 :weight 20}]  ; 20% of traffic
+
+;; Weighted source routes
+:source-routes
+[{:source "192.168.0.0/16"
+  :targets [{:ip "10.0.1.1" :port 8080 :weight 70}
+            {:ip "10.0.1.2" :port 8080 :weight 30}]}]
+```
+
+**Weight Rules:**
+- Weights are percentages and must sum to exactly 100
+- For single targets, weight is optional (backward compatible)
+- For multiple targets, all must have explicit weights
+- Maximum 8 targets per group
+- Selection is per new connection (established connections maintain affinity)
+
+**Canary Deployment Example:**
+```clojure
+;; 95% stable, 5% canary
+:default-target
+[{:ip "10.0.0.1" :port 8080 :weight 95}   ; Stable version
+ {:ip "10.0.0.2" :port 8080 :weight 5}]   ; Canary version
+```
+
+**Blue/Green Deployment Example:**
+```clojure
+;; Gradual traffic shift from blue to green
+:default-target
+[{:ip "10.0.0.1" :port 8080 :weight 20}   ; Blue (old)
+ {:ip "10.0.0.2" :port 8080 :weight 80}]  ; Green (new)
+```
+
 ## Programmatic API
 
 Use the proxy as a library in your Clojure application:
@@ -168,9 +210,14 @@ Use the proxy as a library in your Clojure application:
 (proxy/get-status)
 ;; => {:running true, :attached-interfaces ["eth0"], ...}
 
-;; Add a source route at runtime
+;; Add a source route at runtime (single target)
 (proxy/add-source-route! "web" "192.168.1.0/24"
                          {:ip "10.0.0.2" :port 8080})
+
+;; Add a weighted source route at runtime
+(proxy/add-source-route! "web" "10.10.0.0/16"
+                         [{:ip "10.0.0.3" :port 8080 :weight 70}
+                          {:ip "10.0.0.4" :port 8080 :weight 30}])
 
 ;; Get active connections
 (proxy/get-connections)
