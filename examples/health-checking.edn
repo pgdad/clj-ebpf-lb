@@ -1,0 +1,175 @@
+;; Health Checking Configuration
+;;
+;; Automatically detect unhealthy backends and redistribute traffic to healthy ones.
+;; Supports TCP, HTTP, and HTTPS health checks with configurable thresholds.
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/health-checking.edn
+;;
+;; Health Check Types:
+;;   - :tcp   - Simple TCP connection test (fastest)
+;;   - :http  - HTTP GET request with status code validation
+;;   - :https - HTTPS GET request with status code validation
+;;   - :none  - Disable health checking for this target
+;;
+;; Weight Redistribution:
+;;   When a backend becomes unhealthy, its traffic is redistributed proportionally
+;;   to remaining healthy backends. Example:
+;;     Original weights: [50, 30, 20]
+;;     If middle server fails: [71, 0, 29] (proportional redistribution)
+;;
+;; Gradual Recovery:
+;;   When a backend recovers, it receives traffic gradually:
+;;     Step 1: 25% of original weight
+;;     Step 2: 50% of original weight
+;;     Step 3: 75% of original weight
+;;     Step 4: 100% of original weight
+;;   This prevents overwhelming a recovering backend.
+
+{:proxies
+ [;; Example 1: Basic TCP health checks
+  {:name "web-tcp-health"
+   :listen
+   {:interfaces ["eth0"]
+    :port 80}
+
+   :default-target
+   [{:ip "10.0.0.1" :port 8080 :weight 50
+     :health-check {:type :tcp
+                    :interval-ms 5000      ; Check every 5 seconds
+                    :timeout-ms 2000       ; 2 second timeout
+                    :healthy-threshold 2   ; 2 successes to mark healthy
+                    :unhealthy-threshold 3}} ; 3 failures to mark unhealthy
+    {:ip "10.0.0.2" :port 8080 :weight 30
+     :health-check {:type :tcp
+                    :interval-ms 5000
+                    :timeout-ms 2000
+                    :healthy-threshold 2
+                    :unhealthy-threshold 3}}
+    {:ip "10.0.0.3" :port 8080 :weight 20
+     :health-check {:type :tcp
+                    :interval-ms 5000
+                    :timeout-ms 2000
+                    :healthy-threshold 2
+                    :unhealthy-threshold 3}}]}
+
+  ;; Example 2: HTTP health checks with path
+  {:name "api-http-health"
+   :listen
+   {:interfaces ["eth0"]
+    :port 8080}
+
+   :default-target
+   [{:ip "10.1.0.1" :port 3000 :weight 60
+     :health-check {:type :http
+                    :path "/health"        ; Health endpoint path
+                    :interval-ms 10000     ; Check every 10 seconds
+                    :timeout-ms 3000       ; 3 second timeout
+                    :healthy-threshold 2
+                    :unhealthy-threshold 3
+                    :expected-codes [200 204]}} ; Accept 200 or 204
+    {:ip "10.1.0.2" :port 3000 :weight 40
+     :health-check {:type :http
+                    :path "/health"
+                    :interval-ms 10000
+                    :timeout-ms 3000
+                    :healthy-threshold 2
+                    :unhealthy-threshold 3
+                    :expected-codes [200 204]}}]}
+
+  ;; Example 3: HTTPS health checks
+  {:name "secure-api"
+   :listen
+   {:interfaces ["eth0"]
+    :port 443}
+
+   :default-target
+   [{:ip "10.2.0.1" :port 8443 :weight 50
+     :health-check {:type :https
+                    :path "/api/status"
+                    :interval-ms 15000
+                    :timeout-ms 5000
+                    :healthy-threshold 3
+                    :unhealthy-threshold 2}}
+    {:ip "10.2.0.2" :port 8443 :weight 50
+     :health-check {:type :https
+                    :path "/api/status"
+                    :interval-ms 15000
+                    :timeout-ms 5000
+                    :healthy-threshold 3
+                    :unhealthy-threshold 2}}]}
+
+  ;; Example 4: Mixed health check types
+  {:name "mixed-health"
+   :listen
+   {:interfaces ["eth0"]
+    :port 9000}
+
+   :default-target
+   [{:ip "10.3.0.1" :port 8080 :weight 40
+     :health-check {:type :tcp           ; Fast TCP check
+                    :interval-ms 3000
+                    :timeout-ms 1000}}
+    {:ip "10.3.0.2" :port 8080 :weight 40
+     :health-check {:type :http          ; Full HTTP check
+                    :path "/ready"
+                    :interval-ms 5000
+                    :timeout-ms 2000}}
+    {:ip "10.3.0.3" :port 8080 :weight 20
+     :health-check {:type :none}}]}      ; No health check (always considered healthy)
+
+  ;; Example 5: Source routes with health checks
+  {:name "routed-health"
+   :listen
+   {:interfaces ["eth0"]
+    :port 9090}
+
+   :default-target
+   [{:ip "10.4.0.1" :port 8080 :weight 100
+     :health-check {:type :tcp :interval-ms 5000}}]
+
+   :source-routes
+   [;; Internal network with health-checked backends
+    {:source "192.168.0.0/16"
+     :targets [{:ip "10.4.1.1" :port 8080 :weight 50
+                :health-check {:type :http
+                               :path "/health"
+                               :interval-ms 5000}}
+               {:ip "10.4.1.2" :port 8080 :weight 50
+                :health-check {:type :http
+                               :path "/health"
+                               :interval-ms 5000}}]}
+
+    ;; VIP with stricter health checks
+    {:source "10.100.0.0/16"
+     :targets [{:ip "10.4.2.1" :port 8080 :weight 50
+                :health-check {:type :http
+                               :path "/health"
+                               :interval-ms 3000
+                               :timeout-ms 1000
+                               :healthy-threshold 3
+                               :unhealthy-threshold 2}}
+               {:ip "10.4.2.2" :port 8080 :weight 50
+                :health-check {:type :http
+                               :path "/health"
+                               :interval-ms 3000
+                               :timeout-ms 1000
+                               :healthy-threshold 3
+                               :unhealthy-threshold 2}}]}]}]
+
+ :settings
+ {:stats-enabled true
+  :connection-timeout-sec 300
+  :max-connections 100000
+
+  ;; Enable health checking system
+  :health-check-enabled true
+
+  ;; Default health check config (used when target doesn't specify one)
+  :health-check-defaults
+  {:type :tcp
+   :interval-ms 10000         ; Default: check every 10 seconds
+   :timeout-ms 3000           ; Default: 3 second timeout
+   :healthy-threshold 2       ; Default: 2 successes to mark healthy
+   :unhealthy-threshold 3     ; Default: 3 failures to mark unhealthy
+   :expected-codes [200 201 202 204]}}} ; Default expected HTTP codes

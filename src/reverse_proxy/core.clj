@@ -8,6 +8,7 @@
             [reverse-proxy.programs.tc-egress :as tc]
             [reverse-proxy.conntrack :as conntrack]
             [reverse-proxy.stats :as stats]
+            [reverse-proxy.health :as health]
             [reverse-proxy.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -18,7 +19,8 @@
 ;;; Forward Declarations
 ;;; =============================================================================
 
-(declare apply-config! attach-interfaces! detach-interfaces!)
+(declare apply-config! attach-interfaces! detach-interfaces!
+         register-health-checks! unregister-health-checks!)
 
 ;;; =============================================================================
 ;;; Proxy State
@@ -112,6 +114,9 @@
                 (let [interfaces (get-in proxy-cfg [:listen :interfaces])]
                   (attach-interfaces! interfaces)))
 
+              ;; Register health checks if enabled
+              (register-health-checks! ebpf-maps config)
+
               (log/info "Reverse proxy initialized successfully")
               state))))
 
@@ -125,6 +130,9 @@
   []
   (when-let [state @proxy-state]
     (log/info "Shutting down reverse proxy")
+
+    ;; Stop health checking
+    (unregister-health-checks! (:config state))
 
     ;; Stop stats stream if running
     (when-let [stream @(:stats-stream state)]
@@ -451,6 +459,8 @@
      :attached-interfaces (vec @(:attached-interfaces state))
      :stats-enabled (stats-enabled?)
      :stats-streaming (some? @(:stats-stream state))
+     :health-check-enabled (get-in state [:config :settings :health-check-enabled])
+     :health-checking (health/running?)
      :connection-count (get-connection-count)
      :proxies (count (get-in state [:config :proxies]))}
     {:running false}))
@@ -460,11 +470,13 @@
   []
   (let [status (get-status)]
     (println "=== Reverse Proxy Status ===")
-    (println (format "Running:            %s" (:running status)))
+    (println (format "Running:             %s" (:running status)))
     (when (:running status)
       (println (format "Attached interfaces: %s" (clojure.string/join ", " (:attached-interfaces status))))
       (println (format "Stats enabled:       %s" (:stats-enabled status)))
       (println (format "Stats streaming:     %s" (:stats-streaming status)))
+      (println (format "Health check enabled:%s" (:health-check-enabled status)))
+      (println (format "Health checking:     %s" (:health-checking status)))
       (println (format "Active connections:  %d" (:connection-count status)))
       (println (format "Configured proxies:  %d" (:proxies status))))))
 
@@ -479,6 +491,74 @@
   []
   (when-let [state @proxy-state]
     (conntrack/print-connections (get-in state [:maps :conntrack-map]))))
+
+;;; =============================================================================
+;;; Health Checking Integration
+;;; =============================================================================
+
+(defn- create-weight-update-fn
+  "Create a callback function for weight updates.
+   Updates BPF maps when target weights change due to health status."
+  [listen-map proxy-cfg]
+  (let [{:keys [listen]} proxy-cfg
+        {:keys [interfaces port]} listen]
+    (fn [new-target-group]
+      (log/info "Updating weights for proxy" (:name proxy-cfg)
+                "new cumulative weights:" (:cumulative-weights new-target-group))
+      ;; Update listen map entries for all interfaces
+      (doseq [iface interfaces]
+        (when-let [ifindex (util/get-interface-index iface)]
+          (maps/add-listen-port-weighted listen-map ifindex port
+            new-target-group
+            :flags 0))))))
+
+(defn- register-health-checks!
+  "Register all proxies for health checking."
+  [ebpf-maps config]
+  (when (get-in config [:settings :health-check-enabled])
+    (log/info "Starting health checking system")
+    (health/start!)
+    (let [listen-map (:listen-map ebpf-maps)
+          settings (:settings config)]
+      (doseq [proxy-cfg (:proxies config)]
+        (let [target-group (:default-target proxy-cfg)
+              targets (:targets target-group)
+              ;; Only register if at least one target has health check config
+              has-health-checks? (some :health-check targets)]
+          (when has-health-checks?
+            (let [update-fn (create-weight-update-fn listen-map proxy-cfg)]
+              (health/register-proxy! (:name proxy-cfg) target-group settings update-fn)
+              (log/info "Registered proxy" (:name proxy-cfg) "for health checking"))))))))
+
+(defn- unregister-health-checks!
+  "Unregister all proxies from health checking and stop the system."
+  [config]
+  (when (get-in config [:settings :health-check-enabled])
+    (doseq [proxy-cfg (:proxies config)]
+      (health/unregister-proxy! (:name proxy-cfg)))
+    (health/stop!)
+    (log/info "Health checking system stopped")))
+
+(defn get-health-status
+  "Get health status for a specific proxy."
+  [proxy-name]
+  (health/get-status proxy-name))
+
+(defn get-all-health-status
+  "Get health status for all proxies."
+  []
+  (health/get-all-status))
+
+(defn print-health-status
+  "Print health status for all proxies."
+  []
+  (health/print-all-status))
+
+(defn health-check-enabled?
+  "Check if health checking is enabled."
+  []
+  (when-let [state @proxy-state]
+    (get-in state [:config :settings :health-check-enabled])))
 
 ;;; =============================================================================
 ;;; CLI

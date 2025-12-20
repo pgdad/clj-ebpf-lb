@@ -294,13 +294,13 @@
 
 (deftest compute-cumulative-weights-test
   (testing "Compute cumulative weights for single target"
-    (let [targets [(config/->WeightedTarget 0 8080 100)]]
+    (let [targets [(config/->WeightedTarget 0 8080 100 nil)]]
       (is (= [100] (config/compute-cumulative-weights targets)))))
 
   (testing "Compute cumulative weights for multiple targets"
-    (let [targets [(config/->WeightedTarget 0 8080 50)
-                   (config/->WeightedTarget 1 8080 30)
-                   (config/->WeightedTarget 2 8080 20)]]
+    (let [targets [(config/->WeightedTarget 0 8080 50 nil)
+                   (config/->WeightedTarget 1 8080 30 nil)
+                   (config/->WeightedTarget 2 8080 20 nil)]]
       (is (= [50 80 100] (config/compute-cumulative-weights targets))))))
 
 (deftest parse-weighted-target-test

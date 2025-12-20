@@ -29,9 +29,22 @@
 ;; Weight for load balancing (1-100, represents percentage)
 (s/def ::weight (s/and int? #(>= % 1) #(<= % 100)))
 
-;; Target specification (single target, with optional weight)
+;;; Health Check Specs
+(s/def ::health-check-type #{:tcp :http :https :none})
+(s/def ::path (s/and string? #(clojure.string/starts-with? % "/")))
+(s/def ::interval-ms (s/and int? #(>= % 1000) #(<= % 300000)))
+(s/def ::timeout-ms (s/and int? #(>= % 100) #(<= % 60000)))
+(s/def ::healthy-threshold (s/and int? #(>= % 1) #(<= % 10)))
+(s/def ::unhealthy-threshold (s/and int? #(>= % 1) #(<= % 10)))
+(s/def ::expected-codes (s/coll-of int? :min-count 1))
+
+(s/def ::health-check
+  (s/keys :opt-un [::health-check-type ::path ::interval-ms ::timeout-ms
+                   ::healthy-threshold ::unhealthy-threshold ::expected-codes]))
+
+;; Target specification (single target, with optional weight and health check)
 (s/def ::ip ::ip-string)
-(s/def ::target (s/keys :req-un [::ip ::port] :opt-un [::weight]))
+(s/def ::target (s/keys :req-un [::ip ::port] :opt-un [::weight ::health-check]))
 
 ;; Weighted targets array (for load balancing across multiple backends)
 (s/def ::targets (s/coll-of ::target :min-count 1 :max-count 8))
@@ -64,8 +77,11 @@
 (s/def ::stats-enabled boolean?)
 (s/def ::connection-timeout-sec (s/and int? pos?))
 (s/def ::max-connections (s/and int? pos?))
+(s/def ::health-check-enabled boolean?)
+(s/def ::health-check-defaults ::health-check)
 (s/def ::settings
-  (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections]))
+  (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
+                   ::health-check-enabled ::health-check-defaults]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -78,8 +94,30 @@
 ;; Single target (ip and port as u32 values)
 (defrecord Target [ip port])
 
-;; Weighted target extends Target with weight (1-100 percentage)
-(defrecord WeightedTarget [ip port weight])
+;; Health check configuration for a target
+;; type: :tcp, :http, :https, or :none
+;; path: HTTP path to check (for :http/:https)
+;; interval-ms: time between checks
+;; timeout-ms: max time to wait for check
+;; healthy-threshold: consecutive successes needed to mark healthy
+;; unhealthy-threshold: consecutive failures needed to mark unhealthy
+;; expected-codes: HTTP status codes considered healthy (default [200])
+(defrecord HealthCheckConfig [type path interval-ms timeout-ms
+                              healthy-threshold unhealthy-threshold
+                              expected-codes])
+
+;; Default health check configuration values
+(def default-health-check-config
+  {:type :tcp
+   :path "/health"
+   :interval-ms 10000
+   :timeout-ms 3000
+   :healthy-threshold 2
+   :unhealthy-threshold 3
+   :expected-codes [200 201 202 204]})
+
+;; Weighted target extends Target with weight (1-100 percentage) and optional health check
+(defrecord WeightedTarget [ip port weight health-check])
 
 ;; Group of weighted targets with cumulative weights for fast selection
 ;; targets: vector of WeightedTarget
@@ -94,7 +132,8 @@
 ;; ProxyConfig now holds TargetGroup for default-target
 (defrecord ProxyConfig [name listen default-target source-routes])
 
-(defrecord Settings [stats-enabled connection-timeout-sec max-connections])
+(defrecord Settings [stats-enabled connection-timeout-sec max-connections
+                     health-check-enabled health-check-defaults])
 (defrecord Config [proxies settings])
 
 ;;; =============================================================================
@@ -133,11 +172,32 @@
 ;;; Configuration Parsing
 ;;; =============================================================================
 
+(defn parse-health-check-config
+  "Parse health check configuration, merging with defaults."
+  [health-check-map global-defaults]
+  (when (and health-check-map (not= (:type health-check-map) :none))
+    (let [defaults (merge default-health-check-config global-defaults)
+          merged (merge defaults health-check-map)]
+      (->HealthCheckConfig
+        (:type merged)
+        (:path merged)
+        (:interval-ms merged)
+        (:timeout-ms merged)
+        (:healthy-threshold merged)
+        (:unhealthy-threshold merged)
+        (:expected-codes merged)))))
+
 (defn parse-weighted-target
   "Parse a target map to WeightedTarget record with resolved IP.
-   If weight is not specified, defaults to 100 (for single target scenarios)."
-  [{:keys [ip port weight]}]
-  (->WeightedTarget (util/ip-string->u32 ip) port (or weight 100)))
+   If weight is not specified, defaults to 100 (for single target scenarios).
+   global-health-defaults: optional global health check defaults from settings."
+  ([target-map] (parse-weighted-target target-map nil))
+  ([{:keys [ip port weight health-check]} global-health-defaults]
+   (->WeightedTarget
+     (util/ip-string->u32 ip)
+     port
+     (or weight 100)
+     (parse-health-check-config health-check global-health-defaults))))
 
 (defn compute-cumulative-weights
   "Compute cumulative weights from a sequence of WeightedTarget records.
@@ -198,7 +258,9 @@
   (->Settings
     (get settings :stats-enabled false)
     (get settings :connection-timeout-sec 300)
-    (get settings :max-connections 100000)))
+    (get settings :max-connections 100000)
+    (get settings :health-check-enabled false)
+    (get settings :health-check-defaults default-health-check-config)))
 
 (defn parse-config
   "Parse full configuration from EDN map."
@@ -247,6 +309,18 @@
     (catch java.io.FileNotFoundException _
       (throw (ex-info "Configuration file not found" {:path path})))))
 
+(defn health-check->map
+  "Convert a HealthCheckConfig back to EDN format."
+  [^HealthCheckConfig hc]
+  (when hc
+    {:type (:type hc)
+     :path (:path hc)
+     :interval-ms (:interval-ms hc)
+     :timeout-ms (:timeout-ms hc)
+     :healthy-threshold (:healthy-threshold hc)
+     :unhealthy-threshold (:unhealthy-threshold hc)
+     :expected-codes (:expected-codes hc)}))
+
 (defn target-group->map
   "Convert a TargetGroup back to EDN format.
    Returns a single target map if only one target, otherwise a vector."
@@ -254,14 +328,20 @@
   (let [targets (:targets tg)]
     (if (= 1 (count targets))
       ;; Single target - return simple map without weight
-      (let [t (first targets)]
-        {:ip (util/u32->ip-string (:ip t))
-         :port (:port t)})
+      (let [t (first targets)
+            base {:ip (util/u32->ip-string (:ip t))
+                  :port (:port t)}]
+        (if (:health-check t)
+          (assoc base :health-check (health-check->map (:health-check t)))
+          base))
       ;; Multiple targets - return array with weights
       (mapv (fn [t]
-              {:ip (util/u32->ip-string (:ip t))
-               :port (:port t)
-               :weight (:weight t)})
+              (let [base {:ip (util/u32->ip-string (:ip t))
+                          :port (:port t)
+                          :weight (:weight t)}]
+                (if (:health-check t)
+                  (assoc base :health-check (health-check->map (:health-check t)))
+                  base)))
             targets))))
 
 (defn config->map
@@ -289,7 +369,9 @@
    :settings
    {:stats-enabled (get-in config [:settings :stats-enabled])
     :connection-timeout-sec (get-in config [:settings :connection-timeout-sec])
-    :max-connections (get-in config [:settings :max-connections])}})
+    :max-connections (get-in config [:settings :max-connections])
+    :health-check-enabled (get-in config [:settings :health-check-enabled])
+    :health-check-defaults (get-in config [:settings :health-check-defaults])}})
 
 (defn save-config-file
   "Save configuration to an EDN file."
@@ -304,25 +386,28 @@
 
 (def default-settings
   "Default settings values."
-  (->Settings false 300 100000))
+  (->Settings false 300 100000 false default-health-check-config))
 
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
    Convenience function for simple configurations."
-  [ip port]
-  (let [ip-u32 (if (string? ip) (util/ip-string->u32 ip) ip)]
-    (->TargetGroup
-      [(->WeightedTarget ip-u32 port 100)]
-      [100])))
+  ([ip port] (make-single-target-group ip port nil))
+  ([ip port health-check]
+   (let [ip-u32 (if (string? ip) (util/ip-string->u32 ip) ip)]
+     (->TargetGroup
+       [(->WeightedTarget ip-u32 port 100 health-check)]
+       [100]))))
 
 (defn make-weighted-target-group
   "Create a TargetGroup with multiple weighted targets.
-   targets should be a sequence of {:ip :port :weight} maps.
+   targets should be a sequence of {:ip :port :weight :health-check} maps.
    Validates that weights sum to 100."
   [targets]
   (validate-target-weights! targets "make-weighted-target-group")
-  (let [parsed (mapv (fn [{:keys [ip port weight]}]
-                       (->WeightedTarget (util/ip-string->u32 ip) port weight))
+  (let [parsed (mapv (fn [{:keys [ip port weight health-check]}]
+                       (->WeightedTarget (util/ip-string->u32 ip) port weight
+                                         (when health-check
+                                           (parse-health-check-config health-check nil))))
                      targets)
         cumulative (compute-cumulative-weights parsed)]
     (->TargetGroup parsed cumulative)))
@@ -330,20 +415,21 @@
 (defn make-simple-config
   "Create a simple single-proxy configuration.
    Useful for quick testing or simple deployments."
-  [{:keys [name interface port target-ip target-port stats-enabled]
+  [{:keys [name interface port target-ip target-port stats-enabled health-check-enabled]
     :or {name "default"
          interface "eth0"
          port 80
          target-ip "127.0.0.1"
          target-port 8080
-         stats-enabled false}}]
+         stats-enabled false
+         health-check-enabled false}}]
   (->Config
     [(->ProxyConfig
        name
        (->Listen [interface] port)
        (make-single-target-group target-ip target-port)
        [])]
-    (->Settings stats-enabled 300 100000)))
+    (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config)))
 
 ;;; =============================================================================
 ;;; Configuration Modification

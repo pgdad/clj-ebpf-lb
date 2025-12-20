@@ -187,6 +187,75 @@ Distribute traffic across multiple backend servers with configurable weights. Th
  {:ip "10.0.0.2" :port 8080 :weight 80}]  ; Green (new)
 ```
 
+### Health Checking
+
+Automatically detect unhealthy backends and redistribute traffic to healthy ones. Health checking uses virtual threads for efficient concurrent monitoring.
+
+**Enable health checking in settings:**
+```clojure
+:settings
+{:health-check-enabled true
+ :health-check-defaults
+ {:type :tcp
+  :interval-ms 10000          ; Check every 10 seconds
+  :timeout-ms 3000            ; 3 second timeout
+  :healthy-threshold 2        ; 2 successes = healthy
+  :unhealthy-threshold 3}}    ; 3 failures = unhealthy
+```
+
+**Per-target health check configuration:**
+```clojure
+:default-target
+[{:ip "10.0.0.1" :port 8080 :weight 50
+  :health-check {:type :tcp
+                 :interval-ms 5000
+                 :timeout-ms 2000}}
+ {:ip "10.0.0.2" :port 8080 :weight 50
+  :health-check {:type :http
+                 :path "/health"
+                 :interval-ms 5000
+                 :expected-codes [200 204]}}]
+```
+
+**Health Check Types:**
+
+| Type | Description | Use Case |
+|------|-------------|----------|
+| `:tcp` | TCP connection test | Fast, low overhead |
+| `:http` | HTTP GET with status validation | Application-level health |
+| `:https` | HTTPS GET with status validation | Secure endpoints |
+| `:none` | Skip health checking | Always considered healthy |
+
+**Weight Redistribution:**
+
+When a backend becomes unhealthy, its traffic is redistributed proportionally to remaining healthy backends:
+
+```
+Original weights: [50, 30, 20]
+If middle server fails: [71, 0, 29]  (proportional redistribution)
+If all servers fail: [50, 30, 20]    (graceful degradation - keep original)
+```
+
+**Gradual Recovery:**
+
+When a backend recovers, traffic is gradually restored to prevent overwhelming it:
+- Step 1: 25% of original weight
+- Step 2: 50% of original weight
+- Step 3: 75% of original weight
+- Step 4: 100% of original weight
+
+**Health Check Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `type` | `:tcp` | Check type (`:tcp`, `:http`, `:https`, `:none`) |
+| `path` | `"/health"` | HTTP(S) endpoint path |
+| `interval-ms` | `10000` | Time between checks (1000-300000) |
+| `timeout-ms` | `3000` | Check timeout (100-60000) |
+| `healthy-threshold` | `2` | Consecutive successes to mark healthy |
+| `unhealthy-threshold` | `3` | Consecutive failures to mark unhealthy |
+| `expected-codes` | `[200 201 202 204]` | Valid HTTP response codes |
+
 ## Programmatic API
 
 Use the proxy as a library in your Clojure application:
@@ -272,6 +341,60 @@ Use the proxy as a library in your Clojure application:
   ;; Read events from channel
   (async/<! ch))
 (proxy/stop-stats-stream!)
+```
+
+### Health Checking API
+
+```clojure
+(require '[reverse-proxy.health :as health])
+
+;; Start/stop health checking system
+(health/start!)
+(health/stop!)
+(health/running?)  ; => true/false
+
+;; Get health status
+(health/get-status "web")
+;; => {:proxy-name "web"
+;;     :targets [{:target-id "10.0.0.1:8080"
+;;                :status :healthy
+;;                :last-latency-ms 2.5
+;;                :consecutive-successes 5}
+;;               {:target-id "10.0.0.2:8080"
+;;                :status :unhealthy
+;;                :last-error :connection-refused}]
+;;     :original-weights [50 50]
+;;     :effective-weights [100 0]}
+
+(health/get-all-status)       ; All proxies
+(health/healthy? "web" "10.0.0.1:8080")
+(health/all-healthy? "web")
+(health/unhealthy-targets "web")
+
+;; Subscribe to health events
+(def unsubscribe
+  (health/subscribe!
+    (fn [event]
+      (println "Health event:" (:type event) (:target-id event)))))
+;; Events: :target-healthy, :target-unhealthy, :weights-updated
+
+;; Unsubscribe
+(unsubscribe)
+
+;; Manual control (for maintenance)
+(health/set-target-status! "web" "10.0.0.1:8080" :unhealthy)
+(health/force-check! "web" "10.0.0.1:8080")
+
+;; Direct health checks (for testing)
+(health/check-tcp "10.0.0.1" 8080 2000)
+;; => {:success? true :latency-ms 1.5}
+
+(health/check-http "10.0.0.1" 8080 "/health" 3000 [200])
+;; => {:success? true :latency-ms 15.2 :message "HTTP 200"}
+
+;; Format status for display
+(health/print-status "web")
+(health/print-all-status)
 ```
 
 ## How It Works

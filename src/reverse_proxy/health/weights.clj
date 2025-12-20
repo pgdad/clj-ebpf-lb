@@ -1,0 +1,159 @@
+(ns reverse-proxy.health.weights
+  "Weight redistribution logic for health-aware load balancing.
+   Computes effective weights based on target health status."
+  (:require [clojure.tools.logging :as log]
+            [reverse-proxy.util :as util]
+            [reverse-proxy.config :as config]))
+
+;;; =============================================================================
+;;; Weight Calculation
+;;; =============================================================================
+
+(defn redistribute-weights
+  "Redistribute weights among healthy targets proportionally.
+
+   Original weights: [50, 30, 20] with targets A, B, C
+   If B is unhealthy: A gets 50/(50+20)*100 = 71%, C gets 20/(50+20)*100 = 29%
+   Effective weights: [71, 0, 29]
+
+   Returns a vector of effective weights (same length as original).
+   Unhealthy targets get weight 0."
+  [original-weights health-statuses]
+  (let [;; Build pairs of [weight, healthy?]
+        weight-health (map vector original-weights health-statuses)
+        ;; Sum of healthy weights
+        healthy-sum (reduce + 0 (map first (filter second weight-health)))]
+    (if (zero? healthy-sum)
+      ;; All targets unhealthy - keep original weights (graceful degradation)
+      (do
+        (log/warn "All targets unhealthy, keeping original weights for graceful degradation")
+        original-weights)
+      ;; Redistribute proportionally
+      (mapv (fn [[weight healthy?]]
+              (if healthy?
+                (int (Math/round (* 100.0 (/ weight healthy-sum))))
+                0))
+            weight-health))))
+
+(defn fix-weight-rounding
+  "Ensure weights sum to exactly 100 by adjusting the largest weight.
+   This handles rounding errors from redistribute-weights."
+  [weights]
+  (let [total (reduce + weights)]
+    (cond
+      (= total 100) weights
+      (empty? weights) weights
+      :else
+      (let [;; Find index of largest non-zero weight
+            indexed (map-indexed vector weights)
+            max-idx (first (reduce (fn [[max-i max-w :as best] [i w]]
+                                     (if (> w max-w) [i w] best))
+                                   (first indexed)
+                                   (rest indexed)))
+            diff (- 100 total)]
+        (update weights max-idx + diff)))))
+
+(defn compute-effective-weights
+  "Compute effective weights based on health statuses.
+   Returns vector of weights summing to 100, with unhealthy targets at 0."
+  [original-weights health-statuses]
+  (-> (redistribute-weights original-weights health-statuses)
+      (fix-weight-rounding)))
+
+;;; =============================================================================
+;;; Cumulative Weights
+;;; =============================================================================
+
+(defn weights->cumulative
+  "Convert individual weights to cumulative weights.
+   Example: [50, 30, 20] -> [50, 80, 100]"
+  [weights]
+  (vec (reductions + weights)))
+
+;;; =============================================================================
+;;; Target Group Updates
+;;; =============================================================================
+
+(defn update-target-group-weights
+  "Create a new TargetGroup with updated effective weights.
+   Preserves original targets but updates cumulative weights for routing.
+
+   target-group: Original TargetGroup record
+   health-statuses: Vector of booleans (true = healthy)
+
+   Returns a new TargetGroup with updated cumulative-weights."
+  [target-group health-statuses]
+  (let [targets (:targets target-group)
+        original-weights (mapv :weight targets)
+        effective-weights (compute-effective-weights original-weights health-statuses)
+        cumulative (weights->cumulative effective-weights)
+        ;; Create new targets with effective weights
+        updated-targets (mapv (fn [target eff-weight]
+                                (assoc target :effective-weight eff-weight))
+                              targets effective-weights)]
+    (-> target-group
+        (assoc :targets updated-targets)
+        (assoc :cumulative-weights cumulative)
+        (assoc :effective-weights effective-weights))))
+
+;;; =============================================================================
+;;; Gradual Recovery
+;;; =============================================================================
+
+(def recovery-steps
+  "Steps for gradual weight recovery: 25%, 50%, 75%, 100%"
+  [0.25 0.50 0.75 1.0])
+
+(defn compute-recovery-weight
+  "Compute the recovery weight for a target based on recovery step.
+   recovery-step: 0-3 indicating progress through recovery-steps"
+  [original-weight recovery-step]
+  (if (>= recovery-step (count recovery-steps))
+    original-weight
+    (int (Math/round (* original-weight (nth recovery-steps recovery-step))))))
+
+(defn apply-recovery-weights
+  "Apply gradual recovery weights for recently recovered targets.
+
+   original-weights: Vector of configured weights
+   health-statuses: Vector of booleans (true = healthy)
+   recovery-steps: Vector of integers (nil for healthy targets, 0-3 for recovering)
+
+   Returns vector of effective weights with recovery scaling applied."
+  [original-weights health-statuses recovery-progress]
+  (let [;; First compute base effective weights
+        base-weights (compute-effective-weights original-weights health-statuses)
+        ;; Apply recovery scaling to recovering targets
+        scaled-weights (mapv (fn [base-weight recovery-step healthy?]
+                               (cond
+                                 (not healthy?) 0
+                                 (nil? recovery-step) base-weight
+                                 :else (compute-recovery-weight base-weight recovery-step)))
+                             base-weights recovery-progress health-statuses)
+        ;; Redistribute what's left from reduced recovery weights
+        total (reduce + scaled-weights)
+        scale-factor (if (zero? total) 0.0 (/ 100.0 total))]
+    (fix-weight-rounding
+      (mapv #(int (Math/round (double (* % scale-factor)))) scaled-weights))))
+
+;;; =============================================================================
+;;; Weight Comparison
+;;; =============================================================================
+
+(defn weights-changed?
+  "Check if effective weights have changed from current cumulative weights.
+   Returns true if an update is needed."
+  [current-cumulative new-cumulative]
+  (not= current-cumulative new-cumulative))
+
+;;; =============================================================================
+;;; Debug/Display
+;;; =============================================================================
+
+(defn format-weight-distribution
+  "Format weight distribution for logging."
+  [targets effective-weights]
+  (clojure.string/join ", "
+    (map (fn [t w]
+           (str (util/u32->ip-string (:ip t)) ":" (:port t) " -> " w "%"))
+         targets effective-weights)))
