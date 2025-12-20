@@ -8,7 +8,10 @@
             [reverse-proxy.config :as config]
             [reverse-proxy.util :as util])
   (:import [java.net ServerSocket InetSocketAddress]
-           [com.sun.net.httpserver HttpServer HttpHandler HttpExchange]))
+           [java.io File FileInputStream]
+           [java.security KeyStore]
+           [javax.net.ssl SSLContext KeyManagerFactory]
+           [com.sun.net.httpserver HttpServer HttpsServer HttpHandler HttpExchange HttpsConfigurator]))
 
 ;;; =============================================================================
 ;;; Test Fixtures
@@ -208,6 +211,165 @@
           (is (< (:latency-ms result) 2000)))  ; Should be much faster than timeout
         (finally
           (stop-test-http-server server))))))
+
+;;; =============================================================================
+;;; HTTPS Health Check Integration Tests
+;;; =============================================================================
+
+(defn- generate-test-keystore-file
+  "Generate a temporary keystore file with a self-signed certificate using keytool.
+   Returns the keystore file path and password."
+  []
+  (let [keystore-file (File/createTempFile "test-keystore" ".jks")
+        keystore-path (.getAbsolutePath keystore-file)
+        password "testpass123"]
+    ;; Delete the file first since keytool won't overwrite
+    (.delete keystore-file)
+    ;; Generate keystore with self-signed cert using keytool
+    (let [process (-> (ProcessBuilder.
+                        ["keytool" "-genkeypair"
+                         "-alias" "test"
+                         "-keyalg" "RSA"
+                         "-keysize" "2048"
+                         "-validity" "1"
+                         "-keystore" keystore-path
+                         "-storepass" password
+                         "-keypass" password
+                         "-dname" "CN=localhost,O=Test,L=Test,ST=Test,C=US"
+                         "-storetype" "JKS"])
+                      (.redirectErrorStream true)
+                      (.start))
+          exit-code (.waitFor process)]
+      (when (not= 0 exit-code)
+        (throw (ex-info "Failed to generate test keystore"
+                        {:exit-code exit-code
+                         :output (slurp (.getInputStream process))}))))
+    ;; Mark for deletion on JVM exit
+    (.deleteOnExit keystore-file)
+    {:path keystore-path
+     :password password
+     :file keystore-file}))
+
+(defn- load-keystore
+  "Load a KeyStore from a file."
+  [{:keys [path password]}]
+  (let [keystore (KeyStore/getInstance "JKS")]
+    (with-open [fis (FileInputStream. path)]
+      (.load keystore fis (.toCharArray password)))
+    {:keystore keystore
+     :password (.toCharArray password)}))
+
+(defn- create-ssl-context-for-server
+  "Create an SSLContext for the test HTTPS server."
+  [{:keys [keystore password]}]
+  (let [kmf (doto (KeyManagerFactory/getInstance (KeyManagerFactory/getDefaultAlgorithm))
+              (.init keystore password))
+        ssl-context (doto (SSLContext/getInstance "TLS")
+                      (.init (.getKeyManagers kmf) nil nil))]
+    ssl-context))
+
+(defn- start-test-https-server
+  "Start a test HTTPS server on a random port with the given handlers.
+   handlers is a map of path -> [status-code body]
+   Returns [server port keystore-info]."
+  [handlers]
+  (let [ks-file-info (generate-test-keystore-file)
+        ks-info (load-keystore ks-file-info)
+        ssl-context (create-ssl-context-for-server ks-info)
+        server (HttpsServer/create (InetSocketAddress. 0) 0)
+        port (.getPort (.getAddress server))]
+    (.setHttpsConfigurator server (HttpsConfigurator. ssl-context))
+    (doseq [[path [status body]] handlers]
+      (.createContext server path (create-http-handler status body)))
+    (.setExecutor server nil)
+    (.start server)
+    [server port (assoc ks-file-info :keystore (:keystore ks-info))]))
+
+(defn- stop-test-https-server
+  "Stop the test HTTPS server."
+  [^HttpsServer server]
+  (.stop server 0))
+
+(deftest check-https-connection-refused-test
+  (testing "HTTPS check fails with connection refused on closed port"
+    (let [result (checker/check-https "127.0.0.1" 59997 "/health" 1000 [200])]
+      (is (not (:success? result)))
+      (is (= :connection-refused (:error result))))))
+
+(deftest check-https-ssl-error-self-signed-test
+  (testing "HTTPS check fails with SSL error for self-signed certificate"
+    ;; Start HTTPS server with self-signed cert
+    ;; Client should reject it because it's not in the trust store
+    (let [[server port _] (start-test-https-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (checker/check-https "127.0.0.1" port "/health" 2000 [200])]
+          ;; Should fail with SSL error because self-signed cert is not trusted
+          (is (not (:success? result)))
+          (is (= :ssl-error (:error result)))
+          (is (some? (:message result))))
+        (finally
+          (stop-test-https-server server))))))
+
+(deftest check-https-ssl-error-message-content-test
+  (testing "HTTPS SSL error message contains useful information"
+    (let [[server port _] (start-test-https-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (checker/check-https "127.0.0.1" port "/health" 2000 [200])]
+          (is (not (:success? result)))
+          (is (= :ssl-error (:error result)))
+          ;; Message should mention certificate or SSL/TLS issue
+          (is (or (clojure.string/includes? (str (:message result)) "certificate")
+                  (clojure.string/includes? (str (:message result)) "PKIX")
+                  (clojure.string/includes? (str (:message result)) "SSL")
+                  (clojure.string/includes? (str (:message result)) "trust"))))
+        (finally
+          (stop-test-https-server server))))))
+
+(deftest check-https-to-http-server-test
+  (testing "HTTPS check to HTTP-only server fails gracefully"
+    ;; Try HTTPS against a plain HTTP server
+    (let [[server port] (start-test-http-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (checker/check-https "127.0.0.1" port "/health" 2000 [200])]
+          ;; Should fail - could be SSL error, IO error, or timeout
+          ;; (HTTP server doesn't speak TLS, so SSL handshake fails or times out)
+          (is (not (:success? result)))
+          (is (contains? #{:ssl-error :io-error :timeout} (:error result))))
+        (finally
+          (stop-test-http-server server))))))
+
+(deftest check-https-via-public-api-test
+  (testing "HTTPS check via public health API"
+    (let [[server port _] (start-test-https-server {"/health" [200 "OK"]})]
+      (try
+        (let [result (health/check-https "127.0.0.1" port "/health" 2000 [200])]
+          ;; Should fail with SSL error (self-signed cert)
+          (is (not (:success? result)))
+          (is (= :ssl-error (:error result))))
+        (finally
+          (stop-test-https-server server))))))
+
+(deftest check-https-different-paths-test
+  (testing "HTTPS check handles different paths correctly"
+    (let [[server port _] (start-test-https-server {"/health" [200 "OK"]
+                                                     "/ready" [200 "Ready"]
+                                                     "/live" [204 ""]})]
+      (try
+        ;; All paths should fail with SSL error (self-signed cert)
+        ;; but the server is correctly configured for different paths
+        (doseq [path ["/health" "/ready" "/live"]]
+          (let [result (checker/check-https "127.0.0.1" port path 2000 [200 204])]
+            (is (not (:success? result)))
+            (is (= :ssl-error (:error result)))))
+        (finally
+          (stop-test-https-server server))))))
+
+(deftest check-https-timeout-test
+  (testing "HTTPS check fails with timeout on non-routable address"
+    (let [result (checker/check-https "10.255.255.1" 443 "/health" 100 [200])]
+      (is (not (:success? result)))
+      ;; Could be timeout, no-route, or connection-refused depending on network
+      (is (contains? #{:timeout :no-route :connection-refused :io-error} (:error result))))))
 
 ;;; =============================================================================
 ;;; Weights Tests
