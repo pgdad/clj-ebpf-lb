@@ -75,6 +75,45 @@
          (teardown-veth-pair ~binding)))))
 
 ;;; =============================================================================
+;;; Resource Management Macros
+;;; =============================================================================
+
+(defmacro with-xdp-attached
+  "Attach XDP program to interface and ensure detachment after use.
+
+   Example:
+     (with-xdp-attached [_ prog veth0 :mode :skb]
+       ;; XDP program is attached
+       (do-tests))"
+  [[binding prog iface & {:keys [mode] :or {mode :skb}}] & body]
+  `(do
+     (xdp/attach-to-interface ~prog ~iface :mode ~mode)
+     (try
+       (let [~binding ~iface]
+         ~@body)
+       (finally
+         (xdp/detach-from-interface ~iface :mode ~mode)))))
+
+(defmacro with-bpf-maps
+  "Create multiple BPF maps and ensure they are closed after use.
+
+   Example:
+     (with-bpf-maps [listen-map (maps/create-listen-map {:max-listen-ports 10})
+                     conntrack-map (maps/create-conntrack-map {:max-connections 100})]
+       ;; Use maps
+       (do-tests))"
+  [bindings & body]
+  (if (empty? bindings)
+    `(do ~@body)
+    (let [[binding expr & rest-bindings] bindings]
+      `(let [~binding ~expr]
+         (try
+           (with-bpf-maps [~@rest-bindings]
+             ~@body)
+           (finally
+             (bpf/close-map ~binding)))))))
+
+;;; =============================================================================
 ;;; Connectivity Test Helpers
 ;;; =============================================================================
 
@@ -105,31 +144,25 @@
           (is (ping-from-ns ns "10.200.1.1" :count 1)
               "Baseline connectivity should work")
 
-          ;; Load and attach simple pass program
-          (let [bytecode (xdp/build-xdp-pass-program)
-                prog (bpf/load-program {:insns bytecode
-                                        :prog-type :xdp
-                                        :prog-name "xdp_pass"
-                                        :license "GPL"
-                                        :log-level 1})]
-            (try
+          ;; Load and attach simple pass program using with-program
+          (let [bytecode (xdp/build-xdp-pass-program)]
+            (bpf/with-program [prog {:insns bytecode
+                                     :prog-type :xdp
+                                     :prog-name "xdp_pass"
+                                     :license "GPL"
+                                     :log-level 1}]
               (is prog "Program should load successfully")
               (is (:fd prog) "Program should have FD")
 
-              ;; Attach to interface
-              (xdp/attach-to-interface prog veth0 :mode :skb)
+              ;; Attach to interface using with-xdp-attached
+              (with-xdp-attached [_ prog veth0 :mode :skb]
+                ;; Verify XDP is attached
+                (let [link-info (exec "ip" "link" "show" veth0)]
+                  (is (re-find #"xdp" link-info) "XDP should be attached"))
 
-              ;; Verify XDP is attached
-              (let [link-info (exec "ip" "link" "show" veth0)]
-                (is (re-find #"xdp" link-info) "XDP should be attached"))
-
-              ;; Traffic should still work
-              (is (ping-from-ns ns "10.200.1.1" :count 3)
-                  "Traffic should pass with XDP attached")
-
-              (finally
-                (xdp/detach-from-interface veth0)
-                (when prog (bpf/close-program prog))))))))))
+                ;; Traffic should still work
+                (is (ping-from-ns ns "10.200.1.1" :count 3)
+                    "Traffic should pass with XDP attached")))))))))
 
 (deftest ^:integration test-xdp-ipv4-filter
   ;; Test IPv4 filter program
@@ -142,25 +175,19 @@
     (testing "IPv4 filter program loads and passes IPv4 traffic"
       (with-veth-pair veth "ipv4"
         (let [{:keys [veth0 ns]} veth]
-          ;; Build and load IPv4 filter
-          (let [bytecode (xdp/build-ipv4-filter-program)
-                prog (bpf/load-program {:insns bytecode
-                                        :prog-type :xdp
-                                        :prog-name "xdp_ipv4"
-                                        :license "GPL"
-                                        :log-level 1})]
-            (try
+          ;; Build and load IPv4 filter using with-program
+          (let [bytecode (xdp/build-ipv4-filter-program)]
+            (bpf/with-program [prog {:insns bytecode
+                                     :prog-type :xdp
+                                     :prog-name "xdp_ipv4"
+                                     :license "GPL"
+                                     :log-level 1}]
               (is prog "Program should load")
 
-              (xdp/attach-to-interface prog veth0 :mode :skb)
-
-              ;; IPv4 traffic should work
-              (is (ping-from-ns ns "10.200.1.1" :count 3)
-                  "IPv4 traffic should pass")
-
-              (finally
-                (xdp/detach-from-interface veth0)
-                (when prog (bpf/close-program prog))))))))))
+              (with-xdp-attached [_ prog veth0 :mode :skb]
+                ;; IPv4 traffic should work
+                (is (ping-from-ns ns "10.200.1.1" :count 3)
+                    "IPv4 traffic should pass")))))))))
 
 (deftest ^:integration test-xdp-dnat-program
   ;; Test the full DNAT program with maps
@@ -174,33 +201,31 @@
       (with-veth-pair veth "dnat"
         (let [{:keys [veth0 ns]} veth
               ifindex (util/get-interface-index veth0)]
-          ;; Create maps
-          (let [listen-map (maps/create-listen-map {:max-listen-ports 10})
-                conntrack-map (maps/create-conntrack-map {:max-connections 100})]
-            (try
-              ;; Add a listen port entry for our interface
-              (maps/add-listen-port listen-map ifindex 80
-                {:ip (util/ip-string->u32 "10.200.1.100")
-                 :port 8080})
+          ;; Create maps using with-bpf-maps
+          (with-bpf-maps [listen-map (maps/create-listen-map {:max-listen-ports 10})
+                          conntrack-map (maps/create-conntrack-map {:max-connections 100})]
+            ;; Add a listen port entry for our interface
+            (maps/add-listen-port listen-map ifindex 80
+              {:ip (util/ip-string->u32 "10.200.1.100")
+               :port 8080})
 
-              ;; Build and load DNAT program
-              (let [bytecode (xdp/build-xdp-ingress-program
-                              {:listen-map listen-map
-                               :conntrack-map conntrack-map})
-                    _ (log/info "XDP DNAT bytecode size:" (count bytecode) "bytes"
-                                "(" (/ (count bytecode) 8) "instructions)")
-                    prog (bpf/load-program {:insns bytecode
-                                            :prog-type :xdp
-                                            :prog-name "xdp_dnat"
-                                            :license "GPL"
-                                            :log-level 4})]  ; High log level for debugging
-                (try
-                  (is prog "DNAT program should load")
-                  (is (:fd prog) "Program should have FD")
-                  (log/info "XDP DNAT program loaded successfully, fd:" (:fd prog))
+            ;; Build and load DNAT program using with-program
+            (let [bytecode (xdp/build-xdp-ingress-program
+                            {:listen-map listen-map
+                             :conntrack-map conntrack-map})]
+              (log/info "XDP DNAT bytecode size:" (count bytecode) "bytes"
+                        "(" (/ (count bytecode) 8) "instructions)")
+              (bpf/with-program [prog {:insns bytecode
+                                       :prog-type :xdp
+                                       :prog-name "xdp_dnat"
+                                       :license "GPL"
+                                       :log-level 4}]
+                (is prog "DNAT program should load")
+                (is (:fd prog) "Program should have FD")
+                (log/info "XDP DNAT program loaded successfully, fd:" (:fd prog))
 
-                  ;; Attach to interface
-                  (xdp/attach-to-interface prog veth0 :mode :skb)
+                ;; Attach to interface using with-xdp-attached
+                (with-xdp-attached [_ prog veth0 :mode :skb]
                   (log/info "XDP DNAT program attached to" veth0)
 
                   ;; Verify XDP is attached
@@ -211,15 +236,7 @@
                   (is (ping-from-ns ns "10.200.1.1" :count 2)
                       "ICMP traffic should pass (not TCP/UDP)")
 
-                  (log/info "XDP DNAT test completed successfully")
-
-                  (finally
-                    (xdp/detach-from-interface veth0)
-                    (when prog (bpf/close-program prog)))))
-
-              (finally
-                (bpf/close-map listen-map)
-                (bpf/close-map conntrack-map)))))))))
+                  (log/info "XDP DNAT test completed successfully"))))))))))
 
 ;;; =============================================================================
 ;;; Manual Testing Entry Point

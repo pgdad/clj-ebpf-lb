@@ -20,6 +20,29 @@
    :max-connections 1000})
 
 ;;; =============================================================================
+;;; Resource Management Macros
+;;; =============================================================================
+
+(defmacro with-bpf-maps
+  "Create multiple BPF maps and ensure they are closed after use.
+
+   Example:
+     (with-bpf-maps [listen-map (maps/create-listen-map {:max-listen-ports 10})
+                     conntrack-map (maps/create-conntrack-map {:max-connections 100})]
+       ;; Use maps
+       (do-tests))"
+  [bindings & body]
+  (if (empty? bindings)
+    `(do ~@body)
+    (let [[binding expr & rest-bindings] bindings]
+      `(let [~binding ~expr]
+         (try
+           (with-bpf-maps [~@rest-bindings]
+             ~@body)
+           (finally
+             (bpf/close-map ~binding)))))))
+
+;;; =============================================================================
 ;;; Program Assembly Tests
 ;;; =============================================================================
 
@@ -340,44 +363,39 @@
                   (clojure.string/trim)
                   (Integer/parseInt)))
     (testing "Full NAT path with real BPF maps"
-      (let [listen-map (maps/create-listen-map test-config)
-            conntrack-map (maps/create-conntrack-map test-config)]
-        (try
-          ;; Add a listen port entry
-          ;; add-listen-port signature: [listen-map ifindex port {:keys [ip port]} & opts]
-          (maps/add-listen-port listen-map 1 80
-            {:ip (util/ip-string->u32 "10.1.1.5") :port 8080})
+      ;; Use with-bpf-maps for automatic cleanup
+      (with-bpf-maps [listen-map (maps/create-listen-map test-config)
+                      conntrack-map (maps/create-conntrack-map test-config)]
+        ;; Add a listen port entry
+        (maps/add-listen-port listen-map 1 80
+          {:ip (util/ip-string->u32 "10.1.1.5") :port 8080})
 
-          ;; Verify it was added
-          (let [entries (maps/list-listen-ports listen-map)]
-            (is (= 1 (count entries)))
-            (when (seq entries)
-              (let [entry (first entries)
-                    route (:route entry)
-                    first-target (first (:targets route))]
-                (is (= 1 (:ifindex (:listen entry))))
-                (is (= 80 (:port (:listen entry))))
-                (is (= 1 (:target-count route)))
-                (is (= (util/ip-string->u32 "10.1.1.5") (:ip first-target)))
-                (is (= 8080 (:port first-target))))))
+        ;; Verify it was added
+        (let [entries (maps/list-listen-ports listen-map)]
+          (is (= 1 (count entries)))
+          (when (seq entries)
+            (let [entry (first entries)
+                  route (:route entry)
+                  first-target (first (:targets route))]
+              (is (= 1 (:ifindex (:listen entry))))
+              (is (= 80 (:port (:listen entry))))
+              (is (= 1 (:target-count route)))
+              (is (= (util/ip-string->u32 "10.1.1.5") (:ip first-target)))
+              (is (= 8080 (:port first-target))))))
 
-          ;; Build programs with real map FDs
-          (let [xdp-bytecode (xdp/build-xdp-ingress-program
-                              {:listen-map listen-map
-                               :conntrack-map conntrack-map})
-                tc-bytecode (tc/build-tc-egress-program
-                              {:conntrack-map conntrack-map})]
-            (is (bytes? xdp-bytecode))
-            (is (bytes? tc-bytecode))
-            (is (> (count xdp-bytecode) 0))
-            (is (> (count tc-bytecode) 0))
-            ;; Verify instruction counts
-            (is (>= (/ (count xdp-bytecode) 8) 250) "XDP should have 250+ instructions")
-            (is (>= (/ (count tc-bytecode) 8) 140) "TC should have 140+ instructions"))
-
-          (finally
-            (bpf/close-map listen-map)
-            (bpf/close-map conntrack-map)))))))
+        ;; Build programs with real map FDs
+        (let [xdp-bytecode (xdp/build-xdp-ingress-program
+                            {:listen-map listen-map
+                             :conntrack-map conntrack-map})
+              tc-bytecode (tc/build-tc-egress-program
+                            {:conntrack-map conntrack-map})]
+          (is (bytes? xdp-bytecode))
+          (is (bytes? tc-bytecode))
+          (is (> (count xdp-bytecode) 0))
+          (is (> (count tc-bytecode) 0))
+          ;; Verify instruction counts
+          (is (>= (/ (count xdp-bytecode) 8) 250) "XDP should have 250+ instructions")
+          (is (>= (/ (count tc-bytecode) 8) 140) "TC should have 140+ instructions"))))))
 
 ;;; =============================================================================
 ;;; Run All Tests
