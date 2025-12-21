@@ -13,6 +13,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [kubernetes-ingress.edn](#kubernetes-ingress-style) | K8s-style ingress controller pattern | Advanced |
 | [repl_usage.clj](#repl-usage) | Interactive REPL session | Intermediate |
 | [monitoring.clj](#statistics-and-monitoring) | Real-time statistics monitoring | Advanced |
+| [connection-draining.clj](#connection-draining) | Graceful backend removal patterns | Advanced |
 
 ## Prerequisites
 
@@ -220,6 +221,51 @@ The example demonstrates:
 
 ---
 
+### Connection Draining
+
+Graceful backend removal patterns for zero-downtime deployments.
+
+**File: `connection-draining.clj`**
+
+**Instructions**:
+```bash
+# Start a REPL
+sudo clojure -M:dev
+
+# Load and run the example
+(load-file "examples/connection-draining.clj")
+```
+
+The example demonstrates:
+- Basic draining: Stop new connections while existing ones complete
+- Drain with callback: Get notified when drain completes
+- Synchronous draining: Block until drain finishes
+- Rolling updates: Drain backends one at a time for zero-downtime deployments
+- Maintenance windows: Safely take a backend offline for maintenance
+- Graceful shutdown: Drain all backends before system shutdown
+- Monitoring: Watch drain progress in real-time
+
+**Key API Functions**:
+```clojure
+;; Start draining (stops new connections)
+(lb/drain-backend! "proxy-name" "ip:port"
+  :timeout-ms 30000
+  :on-complete (fn [status] ...))
+
+;; Cancel drain and restore traffic
+(lb/undrain-backend! "proxy-name" "ip:port")
+
+;; Check drain status
+(lb/get-drain-status "ip:port")
+(lb/get-all-draining)
+(lb/draining? "ip:port")
+
+;; Block until drain completes
+(lb/wait-for-drain! "ip:port")  ; => :completed, :timeout, or :cancelled
+```
+
+---
+
 ## Testing Examples Locally
 
 ### Create a Test Environment with Network Namespaces
@@ -323,7 +369,17 @@ ip link show eth0
 ### Maintenance Mode
 
 ```clojure
-;; Redirect all traffic to maintenance page server
+;; Option 1: Use connection draining (recommended)
+;; Gracefully drain existing connections, then perform maintenance
+(let [restore (do
+                (lb/drain-backend! "web" "10.0.0.1:8080" :timeout-ms 60000)
+                (lb/wait-for-drain! "10.0.0.1:8080")
+                ;; Return a restore function
+                #(lb/undrain-backend! "web" "10.0.0.1:8080"))]
+  ;; Perform maintenance...
+  (restore))
+
+;; Option 2: Redirect all traffic to maintenance page server
 (lb/remove-proxy! "web")
 (lb/add-proxy!
   {:name "web"
@@ -366,6 +422,30 @@ ip link show eth0
 ;; Admin: 100% blue (not yet migrated)
 (lb/add-sni-route! "gateway" "admin.myapp.io"
                    {:ip "10.0.3.1" :port 8443})  ; Blue only
+```
+
+### Graceful Rolling Updates
+
+```clojure
+;; Zero-downtime rolling update across all backends
+(defn rolling-update [proxy-name targets deploy-fn]
+  (doseq [target targets]
+    ;; 1. Drain the backend (stop new connections)
+    (lb/drain-backend! proxy-name target :timeout-ms 30000)
+
+    ;; 2. Wait for existing connections to complete
+    (lb/wait-for-drain! target)
+
+    ;; 3. Deploy new version
+    (deploy-fn target)
+
+    ;; 4. Restore traffic
+    (lb/undrain-backend! proxy-name target)))
+
+;; Usage:
+(rolling-update "web"
+                ["10.0.0.1:8080" "10.0.0.2:8080"]
+                (fn [target] (println "Deploying to" target)))
 ```
 
 ## Next Steps
