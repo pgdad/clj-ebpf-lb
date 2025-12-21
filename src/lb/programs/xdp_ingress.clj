@@ -210,13 +210,15 @@
 
    This program:
    1. Parses IPv4/TCP or IPv4/UDP packets
-   2. For TCP port 443, attempts SNI-based routing (TLS ClientHello parsing)
-   3. Falls back to listen map lookup by (ifindex, dst_port)
-   4. Falls back to config map LPM lookup by source IP
-   5. If match found, performs DNAT (rewrites dst IP and port)
-   6. Updates IP and L4 checksums
-   7. Creates conntrack entry for TC SNAT to use on reply path
-   8. Returns XDP_PASS to let kernel routing deliver packet
+   2. Applies per-source rate limiting (if configured)
+   3. For TCP port 443, attempts SNI-based routing (TLS ClientHello parsing)
+   4. Falls back to listen map lookup by (ifindex, dst_port)
+   5. Falls back to config map LPM lookup by source IP
+   6. If match found, applies per-backend rate limiting (if configured)
+   7. Performs DNAT (rewrites dst IP and port)
+   8. Updates IP and L4 checksums
+   9. Creates conntrack entry for TC SNAT to use on reply path
+   10. Returns XDP_PASS to let kernel routing deliver packet
 
    Routing priority:
    1. Source IP exact/CIDR match (config map)
@@ -231,7 +233,8 @@
    r0-r5 = scratch, clobbered by helpers
 
    Uses clj-ebpf.asm label-based assembly for automatic jump offset resolution."
-  [listen-map-fd config-map-fd sni-map-fd conntrack-map-fd]
+  [listen-map-fd config-map-fd sni-map-fd conntrack-map-fd
+   rate-limit-config-fd rate-limit-src-fd rate-limit-backend-fd]
   (asm/assemble-with-labels
     (concat
       ;; =====================================================================
@@ -1015,7 +1018,11 @@
       (net/return-action net/XDP-PASS)
 
       [(asm/label :pass)]
-      (net/return-action net/XDP-PASS))))
+      (net/return-action net/XDP-PASS)
+
+      ;; Rate limited - drop packet
+      [(asm/label :rate_limited)]
+      (net/return-action net/XDP-DROP))))
 
 (defn build-xdp-ingress-program
   "Build the XDP ingress program.
@@ -1029,7 +1036,12 @@
    6. Creates conntrack entry for TC SNAT
    7. Returns XDP_PASS to let kernel routing deliver packet
 
-   map-fds: Map containing :listen-map, optionally :config-map, :sni-map and :conntrack-map"
+   Rate limiting (if configured):
+   - Per-source: Applied after parsing source IP
+   - Per-backend: Applied after target selection
+
+   map-fds: Map containing :listen-map, optionally :config-map, :sni-map, :conntrack-map,
+            and rate limit maps"
   [map-fds]
   (let [listen-map-fd (when (and (map? map-fds) (:listen-map map-fds))
                         (common/map-fd (:listen-map map-fds)))
@@ -1038,8 +1050,15 @@
         sni-map-fd (when (and (map? map-fds) (:sni-map map-fds))
                      (common/map-fd (:sni-map map-fds)))
         conntrack-map-fd (when (and (map? map-fds) (:conntrack-map map-fds))
-                           (common/map-fd (:conntrack-map map-fds)))]
-    (build-xdp-dnat-program listen-map-fd config-map-fd sni-map-fd conntrack-map-fd)))
+                           (common/map-fd (:conntrack-map map-fds)))
+        rate-limit-config-fd (when (and (map? map-fds) (:rate-limit-config-map map-fds))
+                               (common/map-fd (:rate-limit-config-map map-fds)))
+        rate-limit-src-fd (when (and (map? map-fds) (:rate-limit-src-map map-fds))
+                            (common/map-fd (:rate-limit-src-map map-fds)))
+        rate-limit-backend-fd (when (and (map? map-fds) (:rate-limit-backend-map map-fds))
+                                (common/map-fd (:rate-limit-backend-map map-fds)))]
+    (build-xdp-dnat-program listen-map-fd config-map-fd sni-map-fd conntrack-map-fd
+                            rate-limit-config-fd rate-limit-src-fd rate-limit-backend-fd)))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment

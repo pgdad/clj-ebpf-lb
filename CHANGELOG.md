@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Rate limiting with token bucket algorithm
+  - Per-source IP rate limiting to prevent client abuse
+  - Per-backend rate limiting to protect backend capacity
+  - BPF-based enforcement with sub-millisecond overhead
+  - LRU hash maps for automatic bucket expiration
+  - Token scaling (1000x) for precise sub-token accounting
+  - Runtime API: `set-source-rate-limit!`, `set-backend-rate-limit!`
+  - Disable functions: `disable-source-rate-limit!`, `disable-backend-rate-limit!`, `clear-rate-limits!`
+  - Status functions: `get-rate-limit-config`, `rate-limiting-enabled?`
+  - Configuration via settings: `{:rate-limits {:per-source {:requests-per-sec 100 :burst 200}}}`
+
 ## [0.3.0] - 2025-12-21
 
 ### Added

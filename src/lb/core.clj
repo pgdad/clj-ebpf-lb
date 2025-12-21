@@ -10,6 +10,7 @@
             [lb.stats :as stats]
             [lb.health :as health]
             [lb.drain :as drain]
+            [lb.rate-limit :as rate-limit]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -137,6 +138,15 @@
                 (drain/init! (:conntrack-map ebpf-maps) drain-update-fn
                              :check-interval-ms (or (:drain-check-interval-ms drain-settings) 1000)))
 
+              ;; Initialize rate limiting
+              (rate-limit/init! (:rate-limit-config-map ebpf-maps)
+                                (:rate-limit-src-map ebpf-maps)
+                                (:rate-limit-backend-map ebpf-maps))
+
+              ;; Apply rate limit settings from config if present
+              (when-let [settings (:settings config)]
+                (rate-limit/configure-from-settings! settings))
+
               (log/info "Load balancer initialized successfully")
               state))))
 
@@ -150,6 +160,9 @@
   []
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
+
+    ;; Shutdown rate limiting
+    (rate-limit/shutdown!)
 
     ;; Shutdown drain module
     (drain/shutdown!)
@@ -757,6 +770,65 @@
   "Print all draining backends."
   []
   (drain/print-drain-status))
+
+;;; =============================================================================
+;;; Rate Limiting
+;;; =============================================================================
+
+(defn set-source-rate-limit!
+  "Set per-source IP rate limit.
+
+   rate: requests per second allowed from each source IP
+   burst: maximum burst size (defaults to 2x rate)
+
+   Returns true if successful."
+  [rate & {:keys [burst]}]
+  (if burst
+    (rate-limit/set-source-rate-limit! rate :burst burst)
+    (rate-limit/set-source-rate-limit! rate)))
+
+(defn set-backend-rate-limit!
+  "Set per-backend rate limit.
+
+   rate: requests per second allowed to each backend
+   burst: maximum burst size (defaults to 2x rate)
+
+   Returns true if successful."
+  [rate & {:keys [burst]}]
+  (if burst
+    (rate-limit/set-backend-rate-limit! rate :burst burst)
+    (rate-limit/set-backend-rate-limit! rate)))
+
+(defn disable-source-rate-limit!
+  "Disable per-source rate limiting."
+  []
+  (rate-limit/disable-source-rate-limit!))
+
+(defn disable-backend-rate-limit!
+  "Disable per-backend rate limiting."
+  []
+  (rate-limit/disable-backend-rate-limit!))
+
+(defn clear-rate-limits!
+  "Disable all rate limiting."
+  []
+  (rate-limit/clear-rate-limits!))
+
+(defn get-rate-limit-config
+  "Get all rate limit configuration.
+   Returns {:per-source {...} :per-backend {...}} or nils for disabled limits."
+  []
+  (rate-limit/get-rate-limit-config))
+
+(defn rate-limiting-enabled?
+  "Check if any rate limiting is enabled."
+  []
+  (rate-limit/rate-limiting-enabled?))
+
+(defn print-rate-limit-status
+  "Print current rate limit status."
+  []
+  (rate-limit/print-rate-limit-status))
 
 ;;; =============================================================================
 ;;; CLI

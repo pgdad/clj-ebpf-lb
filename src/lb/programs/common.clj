@@ -81,6 +81,11 @@
 (def BPF-FUNC-ringbuf-submit 132)
 (def BPF-FUNC-ringbuf-discard 133)
 
+;; Rate limiting constants
+(def TOKEN-SCALE 1000)               ; Token scaling factor (same as in maps.clj)
+(def RATE-LIMIT-CONFIG-SRC 0)        ; Config map index for source rate limit
+(def RATE-LIMIT-CONFIG-BACKEND 1)    ; Config map index for backend rate limit
+
 ;; BPF_F flags for checksum helpers
 (def BPF-F-RECOMPUTE-CSUM 0x01)
 (def BPF-F-PSEUDO-HDR 0x10)
@@ -486,3 +491,169 @@
   (bpf/assemble
     [(dsl/mov :r0 TC-ACT-SHOT)
      (dsl/exit-insn)]))
+
+;;; =============================================================================
+;;; Rate Limiting Helpers
+;;; =============================================================================
+
+;; Rate limit bucket structure (16 bytes):
+;;   tokens (8 bytes) - current token count (scaled by 1000)
+;;   last_update (8 bytes) - last update timestamp in nanoseconds
+
+;; Rate limit config structure (16 bytes):
+;;   rate (8 bytes) - tokens per second (scaled by 1000)
+;;   burst (8 bytes) - max tokens (scaled by 1000)
+
+(defn build-rate-limit-check
+  "Generate BPF instructions for token bucket rate limit check.
+
+   This implements a token bucket algorithm:
+   1. Load config from config-map at config-index
+   2. If rate == 0, skip (rate limiting disabled)
+   3. Load/create bucket from bucket-map using key at key-stack-off
+   4. Calculate elapsed time since last update
+   5. Add tokens: new_tokens = old_tokens + elapsed_ns * rate / 1e9
+   6. Cap at burst
+   7. If tokens >= 1 (1000 scaled), consume and continue
+   8. Else jump to drop-label
+
+   Stack usage (relative to current-stack-off):
+   offset 0-15: rate limit config (rate, burst)
+   offset 16-31: bucket state (tokens, last_update)
+
+   Parameters:
+   config-map-fd: FD for rate_limit_config array map
+   config-index: 0 for source, 1 for backend
+   bucket-map-fd: FD for rate_limit_src or rate_limit_backend LRU map
+   key-stack-off: Stack offset where lookup key is stored
+   scratch-stack-off: Stack offset for scratch space (needs 32 bytes)
+   skip-label: Label to jump to if rate limiting disabled/passed
+   drop-label: Label to jump to if rate limited"
+  [config-map-fd config-index bucket-map-fd key-stack-off scratch-stack-off skip-label drop-label]
+  (when (and config-map-fd bucket-map-fd)
+    (let [config-off scratch-stack-off        ; 16 bytes for config
+          bucket-off (- scratch-stack-off 16) ; 16 bytes for bucket
+          key-off (- scratch-stack-off 20)]   ; 4 bytes for config key
+      (concat
+        ;; Store config index as key
+        [(dsl/mov :r0 config-index)
+         (dsl/stx :w :r10 :r0 key-off)]
+
+        ;; Look up rate limit config
+        [(dsl/ld-map-fd :r1 config-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 key-off)
+         (dsl/call BPF-FUNC-map-lookup-elem)]
+
+        ;; If no config, skip rate limiting
+        [(clj-ebpf.asm/jmp-imm :jeq :r0 0 skip-label)]
+
+        ;; Load rate (offset 0) - if 0, rate limiting disabled
+        [(dsl/ldx :dw :r1 :r0 0)               ; r1 = rate (scaled)
+         (clj-ebpf.asm/jmp-imm :jeq :r1 0 skip-label)]
+
+        ;; Save config to stack
+        [(dsl/ldx :dw :r2 :r0 8)               ; r2 = burst (scaled)
+         (dsl/stx :dw :r10 :r1 config-off)     ; save rate
+         (dsl/stx :dw :r10 :r2 (- config-off 8))] ; save burst
+
+        ;; Look up bucket
+        [(dsl/ld-map-fd :r1 bucket-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 key-stack-off)
+         (dsl/call BPF-FUNC-map-lookup-elem)]
+
+        ;; Get current time
+        [(dsl/call BPF-FUNC-ktime-get-ns)      ; r0 = now
+         (dsl/stx :dw :r10 :r0 (- bucket-off 8))] ; save now as new last_update
+
+        ;; Look up bucket again (r0 was clobbered by ktime)
+        [(dsl/ld-map-fd :r1 bucket-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 key-stack-off)
+         (dsl/call BPF-FUNC-map-lookup-elem)]
+
+        ;; If bucket doesn't exist, create new one with burst tokens
+        [(clj-ebpf.asm/jmp-imm :jne :r0 0 :bucket_exists)]
+
+        ;; New bucket: set tokens = burst, allow first packet
+        [(dsl/ldx :dw :r1 :r10 (- config-off 8)) ; r1 = burst
+         (dsl/sub :r1 TOKEN-SCALE)             ; consume 1 token for this packet
+         (dsl/stx :dw :r10 :r1 bucket-off)     ; tokens
+         (dsl/ldx :dw :r1 :r10 (- bucket-off 8)) ; r1 = now
+         (dsl/stx :dw :r10 :r1 (- bucket-off 8))] ; last_update = now
+
+        ;; Update bucket in map
+        [(dsl/ld-map-fd :r1 bucket-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 key-stack-off)
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 bucket-off)
+         (dsl/mov :r4 0)                       ; BPF_ANY
+         (dsl/call BPF-FUNC-map-update-elem)]
+
+        ;; Skip to continue (new bucket, first packet allowed)
+        [(clj-ebpf.asm/jmp skip-label)]
+
+        ;; Existing bucket: check and update
+        [(clj-ebpf.asm/label :bucket_exists)]
+
+        ;; r0 = bucket pointer
+        ;; Load current tokens and last_update
+        [(dsl/ldx :dw :r1 :r0 0)               ; r1 = current tokens
+         (dsl/ldx :dw :r2 :r0 8)               ; r2 = last_update
+         (dsl/stx :dw :r10 :r1 bucket-off)     ; save tokens
+         (dsl/ldx :dw :r3 :r10 (- bucket-off 8))] ; r3 = now
+
+        ;; Calculate elapsed = now - last_update
+        [(dsl/sub-reg :r3 :r2)                 ; r3 = elapsed_ns
+         ;; Clamp elapsed to prevent overflow (max ~10 seconds worth)
+         (dsl/mov :r4 10000000000)             ; 10 seconds in ns
+         (clj-ebpf.asm/jmp-reg :jle :r3 :r4 :elapsed_ok)
+         (dsl/mov-reg :r3 :r4)]                ; clamp to 10s
+
+        [(clj-ebpf.asm/label :elapsed_ok)]
+
+        ;; Calculate tokens to add: elapsed_ns * rate / 1e9
+        ;; To avoid overflow, we do: (elapsed_ns / 1000) * rate / 1000000
+        ;; This gives us tokens (still scaled by 1000)
+        [(dsl/ldx :dw :r4 :r10 config-off)     ; r4 = rate (scaled)
+         ;; elapsed_us = elapsed_ns / 1000
+         (dsl/div :r3 1000)                    ; r3 = elapsed_us
+         ;; tokens_to_add = elapsed_us * rate / 1000000
+         (dsl/mul-reg :r3 :r4)                 ; r3 = elapsed_us * rate
+         (dsl/div :r3 1000000)]                ; r3 = tokens to add (scaled)
+
+        ;; Add tokens: new_tokens = old_tokens + tokens_to_add
+        [(dsl/ldx :dw :r1 :r10 bucket-off)     ; r1 = old tokens
+         (dsl/add-reg :r1 :r3)                 ; r1 = old + new tokens
+
+         ;; Cap at burst
+         (dsl/ldx :dw :r2 :r10 (- config-off 8)) ; r2 = burst
+         (clj-ebpf.asm/jmp-reg :jle :r1 :r2 :tokens_capped)
+         (dsl/mov-reg :r1 :r2)]                ; cap at burst
+
+        [(clj-ebpf.asm/label :tokens_capped)]
+
+        ;; Check if we have at least 1 token (1000 scaled)
+        [(clj-ebpf.asm/jmp-imm :jlt :r1 TOKEN-SCALE drop-label)]
+
+        ;; Consume 1 token
+        [(dsl/sub :r1 TOKEN-SCALE)
+         (dsl/stx :dw :r10 :r1 bucket-off)]    ; update tokens
+
+        ;; Update last_update
+        [(dsl/ldx :dw :r1 :r10 (- bucket-off 8))
+         (dsl/stx :dw :r10 :r1 (- bucket-off 8))]
+
+        ;; Write updated bucket to map
+        [(dsl/ld-map-fd :r1 bucket-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 key-stack-off)
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 bucket-off)
+         (dsl/mov :r4 0)                       ; BPF_ANY
+         (dsl/call BPF-FUNC-map-update-elem)]
+
+        ;; Rate limit check passed - continue
+        ))))

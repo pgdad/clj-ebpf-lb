@@ -96,10 +96,30 @@
 (s/def ::default-drain-timeout-ms (s/and int? #(>= % 1000) #(<= % 3600000)))  ; 1s to 1h
 (s/def ::drain-check-interval-ms (s/and int? #(>= % 100) #(<= % 60000)))       ; 100ms to 60s
 
+;; Rate limit settings
+(s/def ::requests-per-sec (s/and int? pos?))  ; Tokens per second
+(s/def ::burst (s/and int? pos?))              ; Max burst size
+
+(s/def ::per-source-rate-limit
+  (s/keys :req-un [::requests-per-sec]
+          :opt-un [::burst]))
+
+(s/def ::per-backend-rate-limit
+  (s/keys :req-un [::requests-per-sec]
+          :opt-un [::burst]))
+
+(s/def ::rate-limits
+  (s/keys :opt-un [::per-source ::per-backend]))
+
+;; Alias per-source and per-backend to rate limit specs
+(s/def ::per-source ::per-source-rate-limit)
+(s/def ::per-backend ::per-backend-rate-limit)
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
-                   ::default-drain-timeout-ms ::drain-check-interval-ms]))
+                   ::default-drain-timeout-ms ::drain-check-interval-ms
+                   ::rate-limits]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))

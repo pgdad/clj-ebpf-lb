@@ -15,6 +15,8 @@
    :max-listen-ports 256       ; Maximum listen port configurations
    :max-connections 100000     ; Maximum concurrent connections
    :max-sni-routes 1000        ; Maximum SNI-based routes
+   :max-rate-limit-src 65536   ; Maximum tracked source IPs for rate limiting
+   :max-rate-limit-backend 1024 ; Maximum tracked backends for rate limiting
    :ringbuf-size (* 256 1024)  ; 256KB ring buffer for stats
    :settings-entries 16})      ; Number of settings slots
 
@@ -108,9 +110,68 @@
                    :max-entries max-sni-routes
                    :map-name "proxy_sni"}))
 
+;;; =============================================================================
+;;; Rate Limit Maps
+;;; =============================================================================
+
+;; Rate limit bucket structure (16 bytes):
+;;   tokens (8 bytes) - current token count (scaled by 1000)
+;;   last_update (8 bytes) - last update timestamp in nanoseconds
+(def ^:const RATE-BUCKET-SIZE 16)
+
+;; Rate limit config structure (16 bytes):
+;;   rate (8 bytes) - tokens per second (scaled by 1000)
+;;   burst (8 bytes) - max tokens (scaled by 1000)
+(def ^:const RATE-CONFIG-SIZE 16)
+
+;; Config map indices
+(def ^:const RATE-LIMIT-CONFIG-SRC 0)
+(def ^:const RATE-LIMIT-CONFIG-BACKEND 1)
+
+(defn create-rate-limit-config-map
+  "Create array map for rate limit configuration.
+   Index 0: per-source rate limit config
+   Index 1: per-backend rate limit config
+   Each entry is 16 bytes: rate(8) + burst(8)"
+  [_opts]
+  (log/info "Creating rate limit config array map")
+  (bpf/create-map {:map-type :array
+                   :key-size 4
+                   :value-size RATE-CONFIG-SIZE
+                   :max-entries 2
+                   :map-name "rate_limit_config"}))
+
+(defn create-rate-limit-src-map
+  "Create LRU per-CPU hash map for per-source IP rate limiting.
+   Key: source IP (4 bytes)
+   Value: rate bucket (16 bytes): tokens(8) + last_update(8)
+   Using LRU for automatic eviction of stale entries."
+  [{:keys [max-rate-limit-src] :or {max-rate-limit-src (:max-rate-limit-src default-config)}}]
+  (log/info "Creating rate limit source LRU map with max-entries:" max-rate-limit-src)
+  (bpf/create-map {:map-type :lru-percpu-hash
+                   :key-size 4
+                   :value-size RATE-BUCKET-SIZE
+                   :max-entries max-rate-limit-src
+                   :map-name "rate_limit_src"}))
+
+(defn create-rate-limit-backend-map
+  "Create LRU per-CPU hash map for per-backend rate limiting.
+   Key: backend IP:port (8 bytes): ip(4) + port(2) + pad(2)
+   Value: rate bucket (16 bytes): tokens(8) + last_update(8)
+   Using LRU for automatic eviction of stale entries."
+  [{:keys [max-rate-limit-backend] :or {max-rate-limit-backend (:max-rate-limit-backend default-config)}}]
+  (log/info "Creating rate limit backend LRU map with max-entries:" max-rate-limit-backend)
+  (bpf/create-map {:map-type :lru-percpu-hash
+                   :key-size 8
+                   :value-size RATE-BUCKET-SIZE
+                   :max-entries max-rate-limit-backend
+                   :map-name "rate_limit_backend"}))
+
 (defn create-all-maps
   "Create all maps required for the reverse proxy.
-   Returns a map of {:config-map :listen-map :sni-map :conntrack-map :settings-map :stats-ringbuf}"
+   Returns a map of {:config-map :listen-map :sni-map :conntrack-map :settings-map
+                     :stats-ringbuf :rate-limit-config-map :rate-limit-src-map
+                     :rate-limit-backend-map}"
   ([]
    (create-all-maps {}))
   ([opts]
@@ -120,18 +181,25 @@
       :sni-map (create-sni-map config)
       :conntrack-map (create-conntrack-map config)
       :settings-map (create-settings-map config)
-      :stats-ringbuf (create-stats-ringbuf config)})))
+      :stats-ringbuf (create-stats-ringbuf config)
+      :rate-limit-config-map (create-rate-limit-config-map config)
+      :rate-limit-src-map (create-rate-limit-src-map config)
+      :rate-limit-backend-map (create-rate-limit-backend-map config)})))
 
 (defn close-all-maps
   "Close all maps and release resources."
-  [{:keys [config-map listen-map sni-map conntrack-map settings-map stats-ringbuf]}]
+  [{:keys [config-map listen-map sni-map conntrack-map settings-map stats-ringbuf
+           rate-limit-config-map rate-limit-src-map rate-limit-backend-map]}]
   (log/info "Closing all eBPF maps")
   (when config-map (bpf/close-map config-map))
   (when listen-map (bpf/close-map listen-map))
   (when sni-map (bpf/close-map sni-map))
   (when conntrack-map (bpf/close-map conntrack-map))
   (when settings-map (bpf/close-map settings-map))
-  (when stats-ringbuf (bpf/close-map stats-ringbuf)))
+  (when stats-ringbuf (bpf/close-map stats-ringbuf))
+  (when rate-limit-config-map (bpf/close-map rate-limit-config-map))
+  (when rate-limit-src-map (bpf/close-map rate-limit-src-map))
+  (when rate-limit-backend-map (bpf/close-map rate-limit-backend-map)))
 
 ;;; =============================================================================
 ;;; Config Map Operations (LPM Trie - Source Routing)
@@ -436,3 +504,71 @@
     ;; If the map object has a method to get the fd
     (instance? clojure.lang.ILookup m) (or (:fd m) (:file-descriptor m) m)
     :else (throw (ex-info "Cannot get file descriptor from map" {:map m :type (type m)}))))
+
+;;; =============================================================================
+;;; Rate Limit Map Operations
+;;; =============================================================================
+
+(def ^:const TOKEN-SCALE 1000)  ; Scale factor for token values (allows sub-token precision)
+
+(defn encode-rate-config
+  "Encode rate limit configuration to bytes.
+   rate: tokens per second
+   burst: max tokens (burst size)
+   Returns 16-byte buffer: rate(8) + burst(8)"
+  [rate burst]
+  (let [buf (java.nio.ByteBuffer/allocate RATE-CONFIG-SIZE)]
+    (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)
+    (.putLong buf (* (long rate) TOKEN-SCALE))   ; rate scaled
+    (.putLong buf (* (long burst) TOKEN-SCALE))  ; burst scaled
+    (.array buf)))
+
+(defn decode-rate-config
+  "Decode rate limit configuration from bytes.
+   Returns {:rate <tokens/sec> :burst <max-tokens>}"
+  [bytes]
+  (when bytes
+    (let [buf (java.nio.ByteBuffer/wrap bytes)]
+      (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)
+      {:rate (quot (.getLong buf) TOKEN-SCALE)
+       :burst (quot (.getLong buf) TOKEN-SCALE)})))
+
+(defn set-rate-limit-config
+  "Set rate limit configuration.
+   config-map: the rate_limit_config array map
+   limit-type: :source or :backend
+   rate: tokens per second
+   burst: max tokens (burst size)"
+  [config-map limit-type rate burst]
+  (let [index (case limit-type
+                :source RATE-LIMIT-CONFIG-SRC
+                :backend RATE-LIMIT-CONFIG-BACKEND)
+        value (encode-rate-config rate burst)]
+    (log/info "Setting" (name limit-type) "rate limit: rate=" rate "/sec, burst=" burst)
+    (bpf/map-update config-map index value)))
+
+(defn get-rate-limit-config
+  "Get rate limit configuration.
+   config-map: the rate_limit_config array map
+   limit-type: :source or :backend
+   Returns {:rate <tokens/sec> :burst <max-tokens>} or nil if not set"
+  [config-map limit-type]
+  (let [index (case limit-type
+                :source RATE-LIMIT-CONFIG-SRC
+                :backend RATE-LIMIT-CONFIG-BACKEND)]
+    (when-let [bytes (bpf/map-lookup config-map index)]
+      (decode-rate-config bytes))))
+
+(defn disable-rate-limit
+  "Disable rate limiting by setting rate to 0.
+   config-map: the rate_limit_config array map
+   limit-type: :source or :backend"
+  [config-map limit-type]
+  (log/info "Disabling" (name limit-type) "rate limiting")
+  (set-rate-limit-config config-map limit-type 0 0))
+
+(defn rate-limit-enabled?
+  "Check if rate limiting is enabled for the given type."
+  [config-map limit-type]
+  (when-let [config (get-rate-limit-config config-map limit-type)]
+    (pos? (:rate config))))
