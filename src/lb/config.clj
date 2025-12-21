@@ -91,9 +91,15 @@
 (s/def ::max-connections (s/and int? pos?))
 (s/def ::health-check-enabled boolean?)
 (s/def ::health-check-defaults ::health-check)
+
+;; Drain settings
+(s/def ::default-drain-timeout-ms (s/and int? #(>= % 1000) #(<= % 3600000)))  ; 1s to 1h
+(s/def ::drain-check-interval-ms (s/and int? #(>= % 100) #(<= % 60000)))       ; 100ms to 60s
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
-                   ::health-check-enabled ::health-check-defaults]))
+                   ::health-check-enabled ::health-check-defaults
+                   ::default-drain-timeout-ms ::drain-check-interval-ms]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -152,7 +158,8 @@
 (defrecord ProxyConfig [name listen default-target source-routes sni-routes])
 
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
-                     health-check-enabled health-check-defaults])
+                     health-check-enabled health-check-defaults
+                     default-drain-timeout-ms drain-check-interval-ms])
 (defrecord Config [proxies settings])
 
 ;;; =============================================================================
@@ -290,7 +297,9 @@
     (get settings :connection-timeout-sec 300)
     (get settings :max-connections 100000)
     (get settings :health-check-enabled false)
-    (get settings :health-check-defaults default-health-check-config)))
+    (get settings :health-check-defaults default-health-check-config)
+    (get settings :default-drain-timeout-ms 30000)       ; 30 seconds default
+    (get settings :drain-check-interval-ms 1000)))
 
 (defn parse-config
   "Parse full configuration from EDN map."
@@ -416,7 +425,9 @@
     :connection-timeout-sec (get-in config [:settings :connection-timeout-sec])
     :max-connections (get-in config [:settings :max-connections])
     :health-check-enabled (get-in config [:settings :health-check-enabled])
-    :health-check-defaults (get-in config [:settings :health-check-defaults])}})
+    :health-check-defaults (get-in config [:settings :health-check-defaults])
+    :default-drain-timeout-ms (get-in config [:settings :default-drain-timeout-ms])
+    :drain-check-interval-ms (get-in config [:settings :drain-check-interval-ms])}})
 
 (defn save-config-file
   "Save configuration to an EDN file."
@@ -431,7 +442,7 @@
 
 (def default-settings
   "Default settings values."
-  (->Settings false 300 100000 false default-health-check-config))
+  (->Settings false 300 100000 false default-health-check-config 30000 1000))
 
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
@@ -475,7 +486,8 @@
        (make-single-target-group target-ip target-port)
        []   ; source-routes
        [])] ; sni-routes
-    (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config)))
+    (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config
+                30000 1000)))
 
 ;;; =============================================================================
 ;;; Configuration Modification

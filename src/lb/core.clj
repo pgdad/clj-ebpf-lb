@@ -9,6 +9,7 @@
             [lb.conntrack :as conntrack]
             [lb.stats :as stats]
             [lb.health :as health]
+            [lb.drain :as drain]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -130,6 +131,12 @@
               ;; Register health checks if enabled
               (register-health-checks! ebpf-maps config)
 
+              ;; Initialize drain module
+              (let [drain-settings (:settings config)
+                    drain-update-fn (create-drain-update-fn ebpf-maps)]
+                (drain/init! (:conntrack-map ebpf-maps) drain-update-fn
+                             :check-interval-ms (or (:drain-check-interval-ms drain-settings) 1000)))
+
               (log/info "Load balancer initialized successfully")
               state))))
 
@@ -143,6 +150,9 @@
   []
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
+
+    ;; Shutdown drain module
+    (drain/shutdown!)
 
     ;; Stop health checking
     (unregister-health-checks! (:config state))
@@ -607,6 +617,25 @@
             new-target-group
             :flags 0))))))
 
+(defn- create-drain-update-fn
+  "Create a callback function for drain weight updates.
+   Updates BPF maps when target weights change due to drain status."
+  [ebpf-maps]
+  (let [{:keys [listen-map]} ebpf-maps]
+    (fn [proxy-name new-target-group]
+      (with-lb-state [state]
+        (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
+          (let [{:keys [listen]} proxy-cfg
+                {:keys [interfaces port]} listen]
+            (log/info "Updating drain weights for proxy" proxy-name
+                      "new cumulative weights:" (:cumulative-weights new-target-group))
+            ;; Update listen map entries for all interfaces
+            (doseq [iface interfaces]
+              (when-let [ifindex (util/get-interface-index iface)]
+                (maps/add-listen-port-weighted listen-map ifindex port
+                  new-target-group
+                  :flags 0)))))))))
+
 (defn- register-health-checks!
   "Register all proxies for health checking."
   [ebpf-maps config]
@@ -654,6 +683,80 @@
   []
   (with-lb-state [state]
     (get-in state [:config :settings :health-check-enabled])))
+
+;;; =============================================================================
+;;; Connection Draining
+;;; =============================================================================
+
+(defn drain-backend!
+  "Start draining a backend. Stops new connections while existing ones complete.
+
+   proxy-name: Name of the proxy (e.g., \"web\")
+   target: Target specification - \"ip:port\" string or {:ip :port} map
+
+   Options:
+     :timeout-ms - Drain timeout in ms (default from config or 30000)
+     :on-complete - Callback fn called with status (:completed, :timeout, :cancelled)
+
+   Returns DrainState or throws if target not found/already draining."
+  [proxy-name target & {:keys [timeout-ms on-complete]}]
+  (with-lb-state [state]
+    (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
+      (let [target-group (:default-target proxy-cfg)
+            default-timeout (get-in state [:config :settings :default-drain-timeout-ms] 30000)
+            actual-timeout (or timeout-ms default-timeout)]
+        (drain/drain-backend! proxy-name target-group target
+                              :timeout-ms actual-timeout
+                              :on-complete on-complete)))))
+
+(defn undrain-backend!
+  "Cancel draining and restore traffic to a backend.
+
+   proxy-name: Name of the proxy
+   target: Target specification - \"ip:port\" string or {:ip :port} map
+
+   Returns true if undrain succeeded, false if target wasn't draining."
+  [proxy-name target]
+  (with-lb-state [state]
+    (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
+      (let [target-group (:default-target proxy-cfg)]
+        (drain/undrain-backend! proxy-name target-group target)))))
+
+(defn get-drain-status
+  "Get drain status for a backend.
+
+   target: Target specification - \"ip:port\" string or {:ip :port} map
+
+   Returns map with :target-id :status :elapsed-ms :current-connections
+   or nil if not draining."
+  [target]
+  (drain/get-drain-status target))
+
+(defn get-all-draining
+  "Get all currently draining backends.
+
+   Returns seq of drain status maps."
+  []
+  (drain/get-all-draining))
+
+(defn wait-for-drain!
+  "Block until drain completes or times out.
+
+   target: Target specification - \"ip:port\" string or {:ip :port} map
+
+   Returns :completed, :timeout, or :cancelled."
+  [target]
+  (drain/wait-for-drain! target))
+
+(defn draining?
+  "Check if a target is currently draining."
+  [target]
+  (drain/draining? target))
+
+(defn print-drain-status
+  "Print all draining backends."
+  []
+  (drain/print-drain-status))
 
 ;;; =============================================================================
 ;;; CLI

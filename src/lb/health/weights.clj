@@ -157,3 +157,23 @@
     (map (fn [t w]
            (str (util/u32->ip-string (:ip t)) ":" (:port t) " -> " w "%"))
          targets effective-weights)))
+
+;;; =============================================================================
+;;; Drain-Aware Weight Computation
+;;; =============================================================================
+
+(defn compute-drain-weights
+  "Compute effective weights with draining targets excluded.
+
+   original-weights: Vector of configured weights
+   health-statuses: Vector of booleans (true = healthy)
+   drain-statuses: Vector of booleans (true = draining)
+
+   A target receives traffic only if healthy AND NOT draining.
+   Returns vector of effective weights with draining targets at 0."
+  [original-weights health-statuses drain-statuses]
+  (let [;; Active = healthy AND NOT draining
+        active-statuses (mapv (fn [healthy? draining?]
+                                (and healthy? (not draining?)))
+                              health-statuses drain-statuses)]
+    (compute-effective-weights original-weights active-statuses)))
