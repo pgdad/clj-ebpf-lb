@@ -95,13 +95,19 @@
   []
   (manager/get-all-health))
 
+(defn get-target-status
+  "Get health status for a specific target.
+   Returns :healthy, :unhealthy, :unknown, or nil if target not found."
+  [proxy-name target-id]
+  (when-let [status (get-status proxy-name)]
+    (when-let [target (first (filter #(= (:target-id %) target-id)
+                                      (:targets status)))]
+      (:status target))))
+
 (defn healthy?
   "Check if a specific target is healthy."
   [proxy-name target-id]
-  (when-let [status (get-status proxy-name)]
-    (some #(and (= (:target-id %) target-id)
-                (= :healthy (:status %)))
-          (:targets status))))
+  (= :healthy (get-target-status proxy-name target-id)))
 
 (defn all-healthy?
   "Check if all targets for a proxy are healthy."

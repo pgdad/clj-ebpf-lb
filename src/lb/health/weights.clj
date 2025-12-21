@@ -177,3 +177,66 @@
                                 (and healthy? (not draining?)))
                               health-statuses drain-statuses)]
     (compute-effective-weights original-weights active-statuses)))
+
+;;; =============================================================================
+;;; Circuit Breaker Weight Computation
+;;; =============================================================================
+
+(def half-open-weight-fraction
+  "Fraction of original weight to use when circuit is half-open."
+  0.10)
+
+(defn compute-circuit-breaker-weights
+  "Apply circuit breaker state to weights.
+
+   health-weights: Vector of health-adjusted weights (from health system)
+   cb-states: Vector of circuit breaker states (:closed, :open, :half-open, or nil)
+   original-weights: Vector of original configured weights
+
+   Returns vector of final effective weights:
+   - :open -> 0 (no traffic)
+   - :half-open -> 10% of original weight (test traffic)
+   - :closed or nil -> use health weight
+
+   If all circuits are open, returns health weights for graceful degradation."
+  [health-weights cb-states original-weights]
+  (let [;; Apply circuit breaker state to each weight
+        with-cb (mapv (fn [health-w cb-state orig-w]
+                        (case cb-state
+                          :open 0
+                          :half-open (max 1 (int (Math/round (* orig-w half-open-weight-fraction))))
+                          :closed health-w
+                          nil health-w  ; No circuit breaker for this target
+                          health-w))    ; Default fallback
+                      health-weights cb-states original-weights)
+        ;; Check if any circuits are not open
+        has-active? (some pos? with-cb)]
+    (if (not has-active?)
+      ;; All circuits open - graceful degradation, use health weights
+      (do
+        (log/warn "All circuits open, keeping health weights for graceful degradation")
+        health-weights)
+      ;; Normalize to sum to 100
+      (let [total (reduce + with-cb)]
+        (if (zero? total)
+          health-weights
+          (fix-weight-rounding
+            (mapv #(if (zero? %)
+                     0
+                     (int (Math/round (* 100.0 (/ % total)))))
+                  with-cb)))))))
+
+(defn compute-all-weights
+  "Compute final weights considering health, drain, and circuit breaker states.
+
+   original-weights: Vector of configured weights
+   health-statuses: Vector of booleans (true = healthy)
+   drain-statuses: Vector of booleans (true = draining)
+   cb-states: Vector of circuit breaker states (:closed, :open, :half-open, or nil)
+
+   Returns vector of final effective weights."
+  [original-weights health-statuses drain-statuses cb-states]
+  (let [;; First compute drain-aware health weights
+        health-weights (compute-drain-weights original-weights health-statuses drain-statuses)]
+    ;; Then apply circuit breaker overlay
+    (compute-circuit-breaker-weights health-weights cb-states original-weights)))

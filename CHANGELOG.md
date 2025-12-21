@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Circuit breaker pattern for automatic failure detection and recovery
+  - Prevents cascade failures by stopping traffic to failing backends
+  - Three-state machine: CLOSED (normal), OPEN (blocking), HALF-OPEN (testing)
+  - Configurable error threshold, minimum requests, and recovery timeout
+  - Sliding window for error rate calculation
+  - Automatic transition from OPEN to HALF-OPEN after timeout
+  - Gradual traffic restoration with 10% test traffic in HALF-OPEN
+  - Graceful degradation when all circuits open (traffic continues)
+  - Integration with health check events for error tracking
+  - Weight computation combines health, drain, and circuit breaker states
+  - Prometheus metrics: `lb_circuit_breaker_state`, `lb_circuit_breaker_error_rate`
+  - Runtime API: `circuit-open?`, `circuit-half-open?`, `force-open-circuit!`, `force-close-circuit!`, `reset-circuit!`
+  - Event subscription for state change notifications
+  - Configuration: `{:settings {:circuit-breaker {:enabled true :error-threshold-pct 50 :min-requests 10 :open-duration-ms 30000}}}`
+  - New module: `lb.circuit-breaker`
+  - Comprehensive examples in `examples/circuit_breaker.clj`
+
 ## [0.4.0] - 2025-12-21
 
 ### Added

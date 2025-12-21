@@ -135,11 +135,22 @@
 ;; Alias for nested map keys
 (s/def ::enabled boolean?)
 
+;; Circuit breaker settings
+(s/def ::error-threshold-pct (s/and int? #(>= % 1) #(<= % 100)))
+(s/def ::cb-min-requests (s/and int? #(>= % 1) #(<= % 10000)))
+(s/def ::open-duration-ms (s/and int? #(>= % 1000) #(<= % 600000)))
+(s/def ::half-open-requests (s/and int? #(>= % 1) #(<= % 100)))
+(s/def ::window-size-ms (s/and int? #(>= % 1000) #(<= % 300000)))
+
+(s/def ::circuit-breaker
+  (s/keys :opt-un [::enabled ::error-threshold-pct ::cb-min-requests
+                   ::open-duration-ms ::half-open-requests ::window-size-ms]))
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
                    ::default-drain-timeout-ms ::drain-check-interval-ms
-                   ::rate-limits ::metrics]))
+                   ::rate-limits ::metrics ::circuit-breaker]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -195,6 +206,25 @@
 ;; dns-targets: vector of DNSWeightedTarget
 ;; static-targets: vector of WeightedTarget (already resolved)
 (defrecord DNSTargetGroup [dns-targets static-targets])
+
+;; Circuit breaker configuration
+;; enabled: whether circuit breaker is active
+;; error-threshold-pct: error rate percentage to trigger open state (1-100)
+;; min-requests: minimum requests in window before evaluating threshold
+;; open-duration-ms: time to stay in open state before trying half-open
+;; half-open-requests: successful requests needed in half-open to close
+;; window-size-ms: sliding window size for error rate calculation
+(defrecord CircuitBreakerConfig [enabled error-threshold-pct min-requests
+                                  open-duration-ms half-open-requests window-size-ms])
+
+;; Default circuit breaker configuration values
+(def default-circuit-breaker-config
+  {:enabled false
+   :error-threshold-pct 50
+   :min-requests 10
+   :open-duration-ms 30000
+   :half-open-requests 3
+   :window-size-ms 60000})
 
 ;; Source route now holds a TargetGroup instead of single Target
 (defrecord SourceRoute [source prefix-len target-group])
@@ -266,6 +296,18 @@
         (:healthy-threshold merged)
         (:unhealthy-threshold merged)
         (:expected-codes merged)))))
+
+(defn parse-circuit-breaker-config
+  "Parse circuit breaker configuration, merging with defaults."
+  [cb-config-map]
+  (let [merged (merge default-circuit-breaker-config cb-config-map)]
+    (->CircuitBreakerConfig
+      (:enabled merged)
+      (:error-threshold-pct merged)
+      (:min-requests merged)
+      (:open-duration-ms merged)
+      (:half-open-requests merged)
+      (:window-size-ms merged))))
 
 (defn dns-target?
   "Check if a target specification uses DNS (has :host instead of :ip)."

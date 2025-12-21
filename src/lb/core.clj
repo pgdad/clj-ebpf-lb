@@ -9,7 +9,9 @@
             [lb.conntrack :as conntrack]
             [lb.stats :as stats]
             [lb.health :as health]
+            [lb.health.weights :as weights]
             [lb.drain :as drain]
+            [lb.circuit-breaker :as circuit-breaker]
             [lb.rate-limit :as rate-limit]
             [lb.reload :as reload]
             [lb.dns :as dns]
@@ -27,7 +29,9 @@
 (declare apply-config! attach-interfaces! detach-interfaces!
          register-health-checks! unregister-health-checks!
          register-dns-targets! unregister-dns-targets!
-         create-drain-update-fn register-reload-functions!)
+         register-circuit-breakers! unregister-circuit-breakers!
+         create-drain-update-fn create-circuit-breaker-update-fn
+         register-reload-functions!)
 
 ;;; =============================================================================
 ;;; Proxy State
@@ -156,6 +160,9 @@
               (dns/start!)
               (register-dns-targets! ebpf-maps config)
 
+              ;; Initialize circuit breaker if enabled
+              (register-circuit-breakers! ebpf-maps config)
+
               ;; Register reload functions for hot reload support
               (register-reload-functions!)
 
@@ -165,7 +172,8 @@
                 (metrics/register-data-sources!
                   {:conntrack-fn #(conntrack/get-all-connections (:conntrack-map ebpf-maps))
                    :health-fn #(health/get-all-status)
-                   :dns-fn #(dns/get-all-status)})
+                   :dns-fn #(dns/get-all-status)
+                   :circuit-breaker-fn #(circuit-breaker/get-status)})
                 (metrics/start! (get-in config [:settings :metrics])))
 
               (log/info "Load balancer initialized successfully")
@@ -196,6 +204,9 @@
 
     ;; Shutdown rate limiting
     (rate-limit/shutdown!)
+
+    ;; Shutdown circuit breaker
+    (unregister-circuit-breakers! (:config state))
 
     ;; Shutdown drain module
     (drain/shutdown!)
@@ -925,6 +936,115 @@
   "Print current rate limit status."
   []
   (rate-limit/print-rate-limit-status))
+
+;;; =============================================================================
+;;; Circuit Breaker
+;;; =============================================================================
+
+(defn- create-circuit-breaker-update-fn
+  "Create a callback function for circuit breaker weight updates.
+   Recalculates and applies weights when circuit state changes."
+  [ebpf-maps]
+  (let [{:keys [listen-map]} ebpf-maps]
+    (fn [proxy-name]
+      (with-lb-state [state]
+        (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
+          (let [{:keys [listen default-target]} proxy-cfg
+                {:keys [interfaces port]} listen
+                targets (:targets default-target)
+                original-weights (mapv :weight targets)
+                ;; Get health statuses (from health module if available)
+                health-statuses (mapv (fn [t]
+                                        (let [tid (circuit-breaker/target-id (:ip t) (:port t))
+                                              status (health/get-target-status proxy-name tid)]
+                                          (or (nil? status) (= :healthy status))))
+                                      targets)
+                ;; Get drain statuses
+                drain-statuses (mapv (fn [t]
+                                       (let [tid (circuit-breaker/target-id (:ip t) (:port t))]
+                                         (drain/draining? tid)))
+                                     targets)
+                ;; Get circuit breaker states
+                cb-states (mapv (fn [t]
+                                  (let [tid (circuit-breaker/target-id (:ip t) (:port t))
+                                        cb (circuit-breaker/get-circuit tid)]
+                                    (:state cb)))
+                                targets)
+                ;; Compute final weights
+                final-weights (weights/compute-all-weights
+                                original-weights health-statuses drain-statuses cb-states)
+                cumulative (weights/weights->cumulative final-weights)
+                new-target-group (assoc default-target
+                                        :cumulative-weights cumulative
+                                        :effective-weights final-weights)]
+            (log/info "Updating circuit breaker weights for proxy" proxy-name
+                      "cb-states:" cb-states
+                      "final weights:" final-weights)
+            ;; Update listen map entries for all interfaces
+            (doseq [iface interfaces]
+              (when-let [ifindex (util/get-interface-index iface)]
+                (maps/add-listen-port-weighted listen-map ifindex port
+                  new-target-group
+                  :flags 0)))))))))
+
+(defn- register-circuit-breakers!
+  "Register all proxies for circuit breaker tracking."
+  [ebpf-maps config]
+  (when (get-in config [:settings :circuit-breaker :enabled])
+    (log/info "Starting circuit breaker system")
+    (let [cb-config (config/parse-circuit-breaker-config
+                      (get-in config [:settings :circuit-breaker]))
+          update-fn (create-circuit-breaker-update-fn ebpf-maps)]
+      (circuit-breaker/init! update-fn)
+      (doseq [proxy-cfg (:proxies config)]
+        (let [target-group (:default-target proxy-cfg)]
+          (circuit-breaker/register-proxy! (:name proxy-cfg) target-group cb-config)
+          (log/info "Registered proxy" (:name proxy-cfg) "for circuit breaker"))))))
+
+(defn- unregister-circuit-breakers!
+  "Unregister all proxies from circuit breaker and stop the system."
+  [config]
+  (when (get-in config [:settings :circuit-breaker :enabled])
+    (doseq [proxy-cfg (:proxies config)]
+      (circuit-breaker/unregister-proxy! (:name proxy-cfg)))
+    (circuit-breaker/shutdown!)
+    (log/info "Circuit breaker system stopped")))
+
+(defn get-circuit-breaker-status
+  "Get circuit breaker status for a specific target."
+  [target-id]
+  (circuit-breaker/get-circuit target-id))
+
+(defn get-all-circuit-breaker-status
+  "Get circuit breaker status for all targets."
+  []
+  (circuit-breaker/get-status))
+
+(defn circuit-breaker-enabled?
+  "Check if circuit breaker is enabled."
+  []
+  (with-lb-state [state]
+    (get-in state [:config :settings :circuit-breaker :enabled])))
+
+(defn force-circuit-open!
+  "Manually force a circuit to OPEN state (stop all traffic)."
+  [target-id]
+  (circuit-breaker/force-open! target-id))
+
+(defn force-circuit-close!
+  "Manually force a circuit to CLOSED state (resume traffic)."
+  [target-id]
+  (circuit-breaker/force-close! target-id))
+
+(defn reset-circuit!
+  "Reset a circuit to initial CLOSED state with zero counts."
+  [target-id]
+  (circuit-breaker/reset-circuit! target-id))
+
+(defn print-circuit-breaker-status
+  "Print circuit breaker status for all targets."
+  []
+  (circuit-breaker/print-status))
 
 ;;; =============================================================================
 ;;; Hot Reload

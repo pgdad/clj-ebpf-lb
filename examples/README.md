@@ -17,6 +17,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [dns_resolution.clj](#dns-resolution) | DNS-based backend discovery | Advanced |
 | [rate_limiting.clj](#rate-limiting) | Token bucket rate limiting | Advanced |
 | [prometheus_metrics.clj](#prometheus-metrics) | Prometheus metrics export | Intermediate |
+| [circuit_breaker.clj](#circuit-breaker) | Automatic failure detection and recovery | Advanced |
 
 ## Prerequisites
 
@@ -372,6 +373,84 @@ The example demonstrates:
 - Prometheus scrape configuration
 - Grafana query examples
 - Custom data source registration
+
+---
+
+### Circuit Breaker
+
+Automatic failure detection and recovery using the circuit breaker pattern.
+
+**File: `circuit_breaker.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'circuit-breaker) (circuit-breaker/-main)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'circuit-breaker)
+(circuit-breaker/-main)
+```
+
+The example demonstrates:
+- Circuit breaker state machine (CLOSED -> OPEN -> HALF-OPEN -> CLOSED)
+- Configuring error thresholds and recovery timeouts
+- Manual control: force-open, force-close, reset
+- Event subscription for state change notifications
+- Weight computation effects on traffic distribution
+- Integration with health checks
+
+**Key API Functions**:
+```clojure
+;; Check circuit state
+(lb/circuit-open? "ip:port")           ; => true if blocking traffic
+(lb/circuit-half-open? "ip:port")      ; => true if testing recovery
+(lb/get-circuit-status)                ; => all circuits with details
+
+;; Manual control
+(lb/force-open-circuit! "ip:port")     ; Stop traffic immediately
+(lb/force-close-circuit! "ip:port")    ; Resume traffic immediately
+(lb/reset-circuit! "ip:port")          ; Reset counters
+
+;; Event subscription
+(require '[lb.circuit-breaker :as cb])
+(cb/subscribe! (fn [event]
+                 (println (:type event) (:target-id event))))
+```
+
+**State Machine**:
+```
+  CLOSED (normal)
+     |
+     | error rate >= 50%
+     v
+  OPEN (blocking)
+     |
+     | 30 seconds elapsed
+     v
+  HALF-OPEN (testing)
+    /  \
+   /    \
+  v      v
+CLOSED  OPEN
+(success) (failure)
+```
+
+**Configuration**:
+```clojure
+{:settings
+ {:circuit-breaker
+  {:enabled true
+   :error-threshold-pct 50      ; Trip when >50% requests fail
+   :min-requests 10             ; Need 10 requests to evaluate
+   :open-duration-ms 30000      ; Stay open for 30 seconds
+   :half-open-requests 3        ; Need 3 successes to close
+   :window-size-ms 60000}}}     ; 60 second sliding window
+```
 
 ---
 

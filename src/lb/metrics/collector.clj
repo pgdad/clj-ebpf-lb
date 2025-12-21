@@ -255,6 +255,55 @@
         "Health check latency in seconds"
         [:proxy_name :target_id]))))
 
+(defn- collect-circuit-breaker-state
+  "Collect lb_circuit_breaker_state gauge - circuit breaker state (0=closed, 1=half-open, 2=open)."
+  []
+  (when-let [cb-fn (:circuit-breaker-fn @data-sources)]
+    (try
+      (let [all-circuits (cb-fn)
+            state->value {:closed 0 :half-open 1 :open 2}
+            lines (for [circuit all-circuits
+                        :let [{:keys [target-id proxy-name state error-rate]} circuit
+                              [ip port] (str/split target-id #":")]]
+                    (format-metric-line "lb_circuit_breaker_state"
+                                        {:proxy_name proxy-name
+                                         :target_ip ip
+                                         :target_port (or port "0")}
+                                        (get state->value state 0)))]
+        (when (seq lines)
+          (format-metric-family
+            "lb_circuit_breaker_state"
+            "gauge"
+            "Circuit breaker state (0=closed, 1=half-open, 2=open)"
+            lines)))
+      (catch Exception e
+        (log/warn e "Error collecting lb_circuit_breaker_state")
+        nil))))
+
+(defn- collect-circuit-breaker-error-rate
+  "Collect lb_circuit_breaker_error_rate gauge - current error rate."
+  []
+  (when-let [cb-fn (:circuit-breaker-fn @data-sources)]
+    (try
+      (let [all-circuits (cb-fn)
+            lines (for [circuit all-circuits
+                        :let [{:keys [target-id proxy-name error-rate]} circuit
+                              [ip port] (str/split target-id #":")]]
+                    (format-metric-line "lb_circuit_breaker_error_rate"
+                                        {:proxy_name proxy-name
+                                         :target_ip ip
+                                         :target_port (or port "0")}
+                                        error-rate))]
+        (when (seq lines)
+          (format-metric-family
+            "lb_circuit_breaker_error_rate"
+            "gauge"
+            "Circuit breaker error rate (0.0-1.0)"
+            lines)))
+      (catch Exception e
+        (log/warn e "Error collecting lb_circuit_breaker_error_rate")
+        nil))))
+
 (defn- collect-info
   "Collect lb_info gauge - load balancer information."
   []
@@ -262,7 +311,7 @@
     "lb_info"
     "gauge"
     "Load balancer information"
-    [(format-metric-line "lb_info" {:version "0.4.0"} 1)]))
+    [(format-metric-line "lb_info" {:version "0.5.0"} 1)]))
 
 (defn- collect-up
   "Collect lb_up gauge - whether the load balancer is running."
@@ -289,5 +338,7 @@
                  (collect-packets-total)
                  (collect-backend-health)
                  (collect-dns-status)
-                 (collect-health-latency-histogram)]]
+                 (collect-health-latency-histogram)
+                 (collect-circuit-breaker-state)
+                 (collect-circuit-breaker-error-rate)]]
     (str (str/join "\n\n" (filter some? metrics)) "\n")))
