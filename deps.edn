@@ -21,6 +21,15 @@
    :main-opts ["-m" "cognitect.test-runner"]
    :exec-fn cognitect.test-runner.api/test}
 
+  ;; CI-safe tests (excludes tests requiring root/BPF privileges)
+  :test-ci
+  {:extra-paths ["test"]
+   :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1"
+                                                       :git/sha "dfb30dd"}}
+   :main-opts ["-m" "cognitect.test-runner" "-e" ":integration"]
+   :exec-fn cognitect.test-runner.api/test
+   :exec-args {:excludes [:integration]}}
+
   :run
   {:main-opts ["-m" "lb.core"]}
 
@@ -29,4 +38,10 @@
    :exec-fn hf.depstar/uberjar
    :exec-args {:jar "target/clj-ebpf-lb.jar"
                :aot true
-               :main-class lb.core}}}}
+               :main-class lb.core}}
+
+  ;; Build jar for Clojars deployment
+  :build
+  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
+          slipset/deps-deploy {:mvn/version "0.2.2"}}
+   :ns-default build}}}
