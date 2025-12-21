@@ -532,7 +532,7 @@ sudo tcpdump -i eth0 -n port 80
 
 ## License
 
-Copyright (c) 2025. All rights reserved.
+MIT License. See [LICENSE](LICENSE) for details.
 
 ## See Also
 
