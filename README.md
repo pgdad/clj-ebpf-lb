@@ -15,6 +15,7 @@ A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP
 - **Source-Based Routing**: Route traffic to different backends based on client IP/subnet
 - **SNI-Based Routing**: Route TLS traffic based on hostname without terminating TLS (layer 4 passthrough)
 - **Weighted Load Balancing**: Distribute traffic across multiple backends with configurable weights
+- **Connection Draining**: Gracefully remove backends by stopping new connections while existing ones complete
 - **Runtime Configuration**: Add/remove proxies and routes without restart
 - **Statistics Collection**: Real-time connection and traffic statistics via ring buffer
 - **ARM64 Support**: Full cross-platform support with QEMU-based ARM64 testing
@@ -304,6 +305,82 @@ When a backend recovers, traffic is gradually restored to prevent overwhelming i
 | `unhealthy-threshold` | `3` | Consecutive failures to mark unhealthy |
 | `expected-codes` | `[200 201 202 204]` | Valid HTTP response codes |
 
+### Connection Draining
+
+Gracefully remove backends from the load balancer by stopping new connections while allowing existing ones to complete. This is essential for zero-downtime deployments, maintenance windows, and rolling updates.
+
+**Basic draining:**
+```clojure
+;; Start draining - no new connections, existing ones continue
+(lb/drain-backend! "web" "10.0.0.1:8080")
+
+;; Check drain status
+(lb/get-drain-status "10.0.0.1:8080")
+;; => {:target-id "10.0.0.1:8080"
+;;     :status :draining
+;;     :elapsed-ms 5000
+;;     :current-connections 3
+;;     :initial-connections 10}
+
+;; Cancel drain and restore traffic
+(lb/undrain-backend! "web" "10.0.0.1:8080")
+```
+
+**Draining with timeout and callback:**
+```clojure
+;; Drain with 60 second timeout and completion callback
+(lb/drain-backend! "web" "10.0.0.1:8080"
+  :timeout-ms 60000
+  :on-complete (fn [status]
+                 (case status
+                   :completed (println "Drain complete, safe to remove")
+                   :timeout   (println "Drain timed out, forcing removal")
+                   :cancelled (println "Drain was cancelled"))))
+```
+
+**Synchronous draining (blocks until complete):**
+```clojure
+;; Block until drain completes or times out
+(let [status (lb/wait-for-drain! "10.0.0.1:8080")]
+  (when (= status :completed)
+    (lb/remove-backend! "web" "10.0.0.1:8080")))
+```
+
+**Rolling update example:**
+```clojure
+(defn rolling-update [proxy-name targets]
+  (doseq [target targets]
+    ;; Drain the old instance
+    (lb/drain-backend! proxy-name target :timeout-ms 30000)
+    (lb/wait-for-drain! target)
+    ;; Deploy and add new instance
+    (deploy-new-version! target)
+    (lb/undrain-backend! proxy-name target)))
+```
+
+**Drain Status Values:**
+
+| Status | Description |
+|--------|-------------|
+| `:draining` | Drain in progress, waiting for connections to close |
+| `:completed` | All connections closed, drain finished successfully |
+| `:timeout` | Timeout expired, some connections may still exist |
+| `:cancelled` | Drain cancelled via `undrain-backend!` |
+
+**Configuration:**
+```clojure
+:settings
+{:default-drain-timeout-ms 30000    ; Default timeout (30 seconds)
+ :drain-check-interval-ms 1000}     ; How often to check connection counts
+```
+
+**How it works:**
+1. `drain-backend!` sets the target's weight to 0 in BPF maps
+2. XDP program stops routing new connections to draining targets
+3. Background watcher monitors connection counts via conntrack
+4. Drain completes when connections reach 0 or timeout expires
+5. Optional callback notifies completion status
+
 ## Programmatic API
 
 Use the load balancer as a library in your Clojure application:
@@ -464,6 +541,43 @@ Use the load balancer as a library in your Clojure application:
 ;; Format status for display
 (health/print-status "web")
 (health/print-all-status)
+```
+
+### Connection Draining API
+
+```clojure
+;; Start draining a backend (stops new connections)
+(lb/drain-backend! "web" "10.0.0.1:8080")
+(lb/drain-backend! "web" "10.0.0.1:8080"
+  :timeout-ms 60000
+  :on-complete (fn [status] (println "Drain finished:" status)))
+
+;; Cancel drain and restore traffic
+(lb/undrain-backend! "web" "10.0.0.1:8080")
+
+;; Check if target is draining
+(lb/draining? "10.0.0.1:8080")  ; => true/false
+
+;; Get drain status for a target
+(lb/get-drain-status "10.0.0.1:8080")
+;; => {:target-id "10.0.0.1:8080"
+;;     :proxy-name "web"
+;;     :status :draining
+;;     :elapsed-ms 5000
+;;     :timeout-ms 30000
+;;     :current-connections 3
+;;     :initial-connections 10}
+
+;; Get all currently draining backends
+(lb/get-all-draining)
+;; => [{:target-id "10.0.0.1:8080" :status :draining ...}
+;;     {:target-id "10.0.0.2:8080" :status :draining ...}]
+
+;; Block until drain completes (returns :completed, :timeout, or :cancelled)
+(lb/wait-for-drain! "10.0.0.1:8080")
+
+;; Print drain status
+(lb/print-drain-status)
 ```
 
 ## How It Works
