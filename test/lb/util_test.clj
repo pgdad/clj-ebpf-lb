@@ -284,3 +284,370 @@
 (deftest weighted-route-value-size-test
   (testing "Value size calculation"
     (is (= util/WEIGHTED-ROUTE-MAX-SIZE (util/weighted-route-value-size)))))
+
+;;; =============================================================================
+;;; IPv6 Address Detection Tests
+;;; =============================================================================
+
+(deftest ipv6?-test
+  (testing "Valid IPv6 addresses"
+    (is (util/ipv6? "2001:db8::1"))
+    (is (util/ipv6? "::1"))
+    (is (util/ipv6? "::"))
+    (is (util/ipv6? "fe80::1"))
+    (is (util/ipv6? "2001:db8:cafe:babe::1"))
+    (is (util/ipv6? "2001:0db8:0000:0000:0000:0000:0000:0001")))
+
+  (testing "Non-IPv6 addresses"
+    (is (not (util/ipv6? "192.168.1.1")))
+    (is (not (util/ipv6? "10.0.0.1")))
+    (is (not (util/ipv6? "not-an-ip")))
+    (is (not (util/ipv6? "")))))
+
+(deftest ipv4?-test
+  (testing "Valid IPv4 addresses"
+    (is (util/ipv4? "192.168.1.1"))
+    (is (util/ipv4? "10.0.0.1"))
+    (is (util/ipv4? "0.0.0.0"))
+    (is (util/ipv4? "255.255.255.255")))
+
+  (testing "Non-IPv4 addresses"
+    (is (not (util/ipv4? "2001:db8::1")))
+    (is (not (util/ipv4? "::1")))
+    (is (not (util/ipv4? "not-an-ip")))
+    (is (not (util/ipv4? "")))))
+
+(deftest address-family-test
+  (testing "IPv4 detection"
+    (is (= :ipv4 (util/address-family "192.168.1.1")))
+    (is (= :ipv4 (util/address-family "10.0.0.1"))))
+
+  (testing "IPv6 detection"
+    (is (= :ipv6 (util/address-family "2001:db8::1")))
+    (is (= :ipv6 (util/address-family "::1")))
+    (is (= :ipv6 (util/address-family "::"))))
+
+  (testing "Unknown addresses"
+    (is (nil? (util/address-family "not-an-ip")))
+    (is (nil? (util/address-family "")))))
+
+;;; =============================================================================
+;;; IPv6 Address Conversion Tests
+;;; =============================================================================
+
+(deftest ipv6-string->bytes-test
+  (testing "Full IPv6 address"
+    (let [bytes (util/ipv6-string->bytes "2001:0db8:0000:0000:0000:0000:0000:0001")]
+      (is (= 16 (count bytes)))
+      (is (= 0x20 (bit-and 0xFF (aget bytes 0))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 1))))
+      (is (= 0x0d (bit-and 0xFF (aget bytes 2))))
+      (is (= 0xb8 (bit-and 0xFF (aget bytes 3))))
+      (is (= 0x00 (bit-and 0xFF (aget bytes 14))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 15))))))
+
+  (testing "Compressed IPv6 address"
+    (let [bytes (util/ipv6-string->bytes "2001:db8::1")]
+      (is (= 16 (count bytes)))
+      (is (= 0x20 (bit-and 0xFF (aget bytes 0))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 1))))
+      (is (= 0x0d (bit-and 0xFF (aget bytes 2))))
+      (is (= 0xb8 (bit-and 0xFF (aget bytes 3))))
+      ;; Middle should be zeros
+      (doseq [i (range 4 14)]
+        (is (= 0 (bit-and 0xFF (aget bytes i)))))
+      (is (= 0x00 (bit-and 0xFF (aget bytes 14))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 15))))))
+
+  (testing "Loopback address"
+    (let [bytes (util/ipv6-string->bytes "::1")]
+      (is (= 16 (count bytes)))
+      (doseq [i (range 15)]
+        (is (= 0 (bit-and 0xFF (aget bytes i)))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 15))))))
+
+  (testing "All zeros"
+    (let [bytes (util/ipv6-string->bytes "::")]
+      (is (= 16 (count bytes)))
+      (doseq [i (range 16)]
+        (is (= 0 (bit-and 0xFF (aget bytes i)))))))
+
+  (testing "Link-local address"
+    (let [bytes (util/ipv6-string->bytes "fe80::1")]
+      (is (= 16 (count bytes)))
+      (is (= 0xfe (bit-and 0xFF (aget bytes 0))))
+      (is (= 0x80 (bit-and 0xFF (aget bytes 1)))))))
+
+(deftest bytes->ipv6-string-test
+  (testing "Full address roundtrip"
+    (let [original "2001:db8::1"
+          bytes (util/ipv6-string->bytes original)
+          result (util/bytes->ipv6-string bytes)]
+      ;; Result should be equivalent (may be in different format)
+      (is (= (vec (util/ipv6-string->bytes result))
+             (vec bytes)))))
+
+  (testing "Loopback roundtrip"
+    (let [bytes (util/ipv6-string->bytes "::1")
+          result (util/bytes->ipv6-string bytes)]
+      (is (= (vec (util/ipv6-string->bytes result))
+             (vec bytes)))))
+
+  (testing "All zeros roundtrip"
+    (let [bytes (util/ipv6-string->bytes "::")
+          result (util/bytes->ipv6-string bytes)]
+      (is (= (vec (util/ipv6-string->bytes result))
+             (vec bytes))))))
+
+(deftest ipv6-roundtrip-test
+  (testing "IPv6 conversion roundtrip preserves address"
+    (doseq [ipv6 ["2001:db8::1"
+                  "::1"
+                  "::"
+                  "fe80::1"
+                  "2001:db8:cafe:babe:1234:5678:90ab:cdef"]]
+      (let [bytes (util/ipv6-string->bytes ipv6)
+            result (util/bytes->ipv6-string bytes)
+            result-bytes (util/ipv6-string->bytes result)]
+        (is (= (vec bytes) (vec result-bytes))
+            (str "Roundtrip failed for " ipv6))))))
+
+;;; =============================================================================
+;;; Unified IP Format Tests (16-byte)
+;;; =============================================================================
+
+(deftest ip-string->bytes16-ipv4-test
+  (testing "IPv4 addresses padded to 16 bytes"
+    (let [bytes (util/ip-string->bytes16 "192.168.1.1")]
+      (is (= 16 (count bytes)))
+      ;; First 12 bytes are zeros (IPv4-compatible prefix)
+      (doseq [i (range 12)]
+        (is (= 0 (bit-and 0xFF (aget bytes i)))
+            (str "Byte " i " should be zero")))
+      ;; Last 4 bytes are the IPv4 address
+      (is (= 192 (bit-and 0xFF (aget bytes 12))))
+      (is (= 168 (bit-and 0xFF (aget bytes 13))))
+      (is (= 1 (bit-and 0xFF (aget bytes 14))))
+      (is (= 1 (bit-and 0xFF (aget bytes 15)))))))
+
+(deftest ip-string->bytes16-ipv6-test
+  (testing "IPv6 addresses are 16 bytes"
+    (let [bytes (util/ip-string->bytes16 "2001:db8::1")]
+      (is (= 16 (count bytes)))
+      (is (= 0x20 (bit-and 0xFF (aget bytes 0))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 1))))
+      (is (= 0x01 (bit-and 0xFF (aget bytes 15)))))))
+
+(deftest bytes16->ip-string-test
+  (testing "IPv4 embedded in 16 bytes"
+    (let [bytes (util/ip-string->bytes16 "192.168.1.1")
+          result (util/bytes16->ip-string bytes)]
+      (is (= "192.168.1.1" result))))
+
+  (testing "IPv6 16 bytes"
+    (let [bytes (util/ip-string->bytes16 "2001:db8::1")
+          result (util/bytes16->ip-string bytes)]
+      ;; Result should be valid IPv6
+      (is (util/ipv6? result))
+      ;; Should round-trip to same bytes
+      (is (= (vec bytes) (vec (util/ip-string->bytes16 result)))))))
+
+(deftest unified-ip-roundtrip-test
+  (testing "IPv4 roundtrip through unified format"
+    (doseq [ip ["192.168.1.1" "10.0.0.1" "172.16.0.100" "8.8.8.8"]]
+      (is (= ip (-> ip util/ip-string->bytes16 util/bytes16->ip-string))
+          (str "Failed for " ip))))
+
+  (testing "IPv6 roundtrip through unified format"
+    (doseq [ip ["2001:db8::1" "::1" "fe80::1"]]
+      (let [bytes (util/ip-string->bytes16 ip)
+            result (util/bytes16->ip-string bytes)]
+        (is (= (vec bytes) (vec (util/ip-string->bytes16 result)))
+            (str "Failed for " ip))))))
+
+;;; =============================================================================
+;;; Unified CIDR Parsing Tests
+;;; =============================================================================
+
+(deftest parse-cidr-unified-ipv4-test
+  (testing "IPv4 CIDR with unified format"
+    (let [result (util/parse-cidr-unified "192.168.1.0/24")]
+      (is (= :ipv4 (:af result)))
+      (is (= 24 (:prefix-len result)))
+      (is (= 16 (count (:ip result))))
+      ;; First 12 bytes should be zeros
+      (doseq [i (range 12)]
+        (is (= 0 (bit-and 0xFF (aget (:ip result) i)))))
+      ;; Last 4 bytes should be 192.168.1.0
+      (is (= 192 (bit-and 0xFF (aget (:ip result) 12))))
+      (is (= 168 (bit-and 0xFF (aget (:ip result) 13))))
+      (is (= 1 (bit-and 0xFF (aget (:ip result) 14))))
+      (is (= 0 (bit-and 0xFF (aget (:ip result) 15)))))))
+
+(deftest parse-cidr-unified-ipv6-test
+  (testing "IPv6 CIDR with unified format"
+    (let [result (util/parse-cidr-unified "2001:db8::/32")]
+      (is (= :ipv6 (:af result)))
+      (is (= 32 (:prefix-len result)))
+      (is (= 16 (count (:ip result))))
+      (is (= 0x20 (bit-and 0xFF (aget (:ip result) 0))))
+      (is (= 0x01 (bit-and 0xFF (aget (:ip result) 1))))
+      (is (= 0x0d (bit-and 0xFF (aget (:ip result) 2))))
+      (is (= 0xb8 (bit-and 0xFF (aget (:ip result) 3))))))
+
+  (testing "IPv6 single IP treated as /128"
+    (let [result (util/parse-cidr-unified "2001:db8::1")]
+      (is (= :ipv6 (:af result)))
+      (is (= 128 (:prefix-len result))))))
+
+(deftest cidr-unified->string-test
+  (testing "IPv4 CIDR to string"
+    (let [cidr (util/parse-cidr-unified "192.168.1.0/24")
+          result (util/cidr-unified->string cidr)]
+      (is (= "192.168.1.0/24" result))))
+
+  (testing "IPv6 CIDR to string"
+    (let [cidr (util/parse-cidr-unified "2001:db8::/32")
+          result (util/cidr-unified->string cidr)]
+      ;; Should contain the prefix length
+      (is (clojure.string/ends-with? result "/32"))
+      ;; Should round-trip the IP correctly
+      (let [reparsed (util/parse-cidr-unified result)]
+        (is (= (vec (:ip cidr)) (vec (:ip reparsed))))))))
+
+;;; =============================================================================
+;;; Unified Key Encoding Tests
+;;; =============================================================================
+
+(deftest unified-constants-test
+  (testing "Unified key size constants"
+    (is (= 20 util/LPM-KEY-UNIFIED-SIZE))
+    (is (= 40 util/CONNTRACK-KEY-UNIFIED-SIZE))
+    (is (= 96 util/CONNTRACK-VALUE-UNIFIED-SIZE))
+    (is (= 168 util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE))))
+
+(deftest encode-lpm-key-unified-test
+  (testing "IPv4 LPM key encoding"
+    (let [ip-bytes (util/ip-string->bytes16 "192.168.1.0")
+          key-bytes (util/encode-lpm-key-unified 24 ip-bytes)]
+      (is (= 20 (count key-bytes)))
+      (let [decoded (util/decode-lpm-key-unified key-bytes)]
+        (is (= 24 (:prefix-len decoded)))
+        (is (= (vec ip-bytes) (vec (:ip decoded)))))))
+
+  (testing "IPv6 LPM key encoding"
+    (let [ip-bytes (util/ip-string->bytes16 "2001:db8::")
+          key-bytes (util/encode-lpm-key-unified 32 ip-bytes)]
+      (is (= 20 (count key-bytes)))
+      (let [decoded (util/decode-lpm-key-unified key-bytes)]
+        (is (= 32 (:prefix-len decoded)))
+        (is (= (vec ip-bytes) (vec (:ip decoded))))))))
+
+(deftest encode-conntrack-key-unified-test
+  (testing "IPv4 conntrack key encoding"
+    (let [src-bytes (util/ip-string->bytes16 "192.168.1.100")
+          dst-bytes (util/ip-string->bytes16 "10.0.0.1")
+          key {:src-ip src-bytes
+               :dst-ip dst-bytes
+               :src-port 12345
+               :dst-port 80
+               :protocol 6}
+          key-bytes (util/encode-conntrack-key-unified key)]
+      (is (= 40 (count key-bytes)))
+      (let [decoded (util/decode-conntrack-key-unified key-bytes)]
+        (is (= (vec src-bytes) (vec (:src-ip decoded))))
+        (is (= (vec dst-bytes) (vec (:dst-ip decoded))))
+        (is (= 12345 (:src-port decoded)))
+        (is (= 80 (:dst-port decoded)))
+        (is (= 6 (:protocol decoded))))))
+
+  (testing "IPv6 conntrack key encoding"
+    (let [src-bytes (util/ip-string->bytes16 "2001:db8::1")
+          dst-bytes (util/ip-string->bytes16 "2001:db8::2")
+          key {:src-ip src-bytes
+               :dst-ip dst-bytes
+               :src-port 54321
+               :dst-port 443
+               :protocol 6}
+          key-bytes (util/encode-conntrack-key-unified key)]
+      (is (= 40 (count key-bytes)))
+      (let [decoded (util/decode-conntrack-key-unified key-bytes)]
+        (is (= (vec src-bytes) (vec (:src-ip decoded))))
+        (is (= (vec dst-bytes) (vec (:dst-ip decoded))))
+        (is (= 54321 (:src-port decoded)))
+        (is (= 443 (:dst-port decoded)))
+        (is (= 6 (:protocol decoded)))))))
+
+(deftest encode-weighted-route-value-unified-test
+  (testing "Single IPv4 target unified encoding"
+    (let [target-group {:targets [{:ip (util/ip-string->bytes16 "10.0.0.1")
+                                   :port 8080
+                                   :weight 100}]
+                        :cumulative-weights [100]}
+          encoded (util/encode-weighted-route-value-unified target-group 0)]
+      (is (= util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE (count encoded)))
+      (let [decoded (util/decode-weighted-route-value-unified encoded)]
+        (is (= 1 (:target-count decoded)))
+        (is (= 0 (:flags decoded)))
+        (is (= 1 (count (:targets decoded))))
+        (is (= "10.0.0.1"
+               (util/bytes16->ip-string (get-in decoded [:targets 0 :ip]))))
+        (is (= 8080 (get-in decoded [:targets 0 :port])))
+        (is (= 100 (get-in decoded [:targets 0 :cumulative-weight]))))))
+
+  (testing "Multiple IPv6 targets unified encoding"
+    (let [target-group {:targets [{:ip (util/ip-string->bytes16 "2001:db8::1")
+                                   :port 8080
+                                   :weight 50}
+                                  {:ip (util/ip-string->bytes16 "2001:db8::2")
+                                   :port 8080
+                                   :weight 30}
+                                  {:ip (util/ip-string->bytes16 "2001:db8::3")
+                                   :port 8080
+                                   :weight 20}]
+                        :cumulative-weights [50 80 100]}
+          encoded (util/encode-weighted-route-value-unified target-group 1)]
+      (is (= util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE (count encoded)))
+      (let [decoded (util/decode-weighted-route-value-unified encoded)]
+        (is (= 3 (:target-count decoded)))
+        (is (= 1 (:flags decoded)))
+        (is (= 3 (count (:targets decoded))))
+        ;; Verify targets are IPv6
+        (let [first-ip (util/bytes16->ip-string (get-in decoded [:targets 0 :ip]))]
+          (is (util/ipv6? first-ip))))))
+
+  (testing "Mixed IPv4 and IPv6 targets"
+    (let [target-group {:targets [{:ip (util/ip-string->bytes16 "10.0.0.1")
+                                   :port 8080
+                                   :weight 50}
+                                  {:ip (util/ip-string->bytes16 "2001:db8::1")
+                                   :port 8080
+                                   :weight 50}]
+                        :cumulative-weights [50 100]}
+          encoded (util/encode-weighted-route-value-unified target-group 0)]
+      (is (= util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE (count encoded)))
+      (let [decoded (util/decode-weighted-route-value-unified encoded)]
+        (is (= 2 (:target-count decoded)))
+        ;; First target is IPv4
+        (is (= "10.0.0.1"
+               (util/bytes16->ip-string (get-in decoded [:targets 0 :ip]))))
+        ;; Second target is IPv6
+        (let [second-ip (util/bytes16->ip-string (get-in decoded [:targets 1 :ip]))]
+          (is (util/ipv6? second-ip)))))))
+
+(deftest encode-listen-key-unified-test
+  (testing "IPv4 listen key encoding"
+    (let [key-bytes (util/encode-listen-key-unified 2 80 :ipv4)]
+      (is (= 8 (count key-bytes)))
+      (let [decoded (util/decode-listen-key-unified key-bytes)]
+        (is (= 2 (:ifindex decoded)))
+        (is (= 80 (:port decoded)))
+        (is (= :ipv4 (:af decoded))))))
+
+  (testing "IPv6 listen key encoding"
+    (let [key-bytes (util/encode-listen-key-unified 3 443 :ipv6)]
+      (is (= 8 (count key-bytes)))
+      (let [decoded (util/decode-listen-key-unified key-bytes)]
+        (is (= 3 (:ifindex decoded)))
+        (is (= 443 (:port decoded)))
+        (is (= :ipv6 (:af decoded)))))))

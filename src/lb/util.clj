@@ -37,11 +37,12 @@
           (bit-and n 0xFF)))
 
 (defn ip->bytes
-  "Convert IP u32 to byte array (4 bytes, big-endian)."
+  "Convert IP u32 to byte array (4 bytes, big-endian).
+   Handles unsigned u32 values that may exceed Integer/MAX_VALUE."
   [ip-u32]
   (let [buf (ByteBuffer/allocate 4)]
     (.order buf ByteOrder/BIG_ENDIAN)
-    (.putInt buf ip-u32)
+    (.putInt buf (unchecked-int ip-u32))
     (.array buf)))
 
 (defn bytes->ip
@@ -287,7 +288,11 @@
    Returns {:ip <u32> :prefix-len <int>} or nil on failure."
   [source-spec]
   (cond
-    ;; Already looks like IP or CIDR
+    ;; IPv6 address or CIDR - use unified format
+    (ipv6? source-spec)
+    (parse-cidr-unified source-spec)
+
+    ;; IPv4 address or CIDR
     (re-matches #"\d+\.\d+\.\d+\.\d+(/\d+)?" source-spec)
     (parse-cidr source-spec)
 

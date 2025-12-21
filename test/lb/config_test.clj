@@ -400,3 +400,75 @@
           (config/make-weighted-target-group
             [{:ip "10.0.0.1" :port 8080 :weight 50}
              {:ip "10.0.0.2" :port 8080}])))))
+
+;;; =============================================================================
+;;; IPv6 Configuration Tests
+;;; =============================================================================
+
+(deftest ipv6-address-detection-test
+  (testing "IPv6 addresses are detected correctly"
+    (is (util/ipv6? "2001:db8::1"))
+    (is (util/ipv6? "::1"))
+    (is (util/ipv6? "fe80::1")))
+
+  (testing "IPv4 addresses are not detected as IPv6"
+    (is (not (util/ipv6? "192.168.1.1")))
+    (is (not (util/ipv6? "10.0.0.1")))))
+
+(deftest ipv6-source-route-test
+  (testing "Parse source route with IPv6 CIDR"
+    (let [route (config/parse-source-route
+                  {:source "2001:db8::/32"
+                   :target {:ip "10.0.0.1" :port 8080}}
+                  "test-proxy")]
+      ;; For IPv6 source routes, source is stored as bytes
+      (is (= :ipv6 (util/address-family "2001:db8::")))
+      (is (= 32 (:prefix-len route)))))
+
+  (testing "Parse source route with IPv6 single IP"
+    (let [route (config/parse-source-route
+                  {:source "2001:db8::1"
+                   :target {:ip "10.0.0.2" :port 9000}}
+                  "test-proxy")]
+      ;; Single IPv6 address should have /128 prefix
+      (is (= 128 (:prefix-len route))))))
+
+(deftest ipv6-proxy-config-test
+  (testing "Parse proxy with IPv6 source routes"
+    (let [proxy-cfg (config/parse-proxy-config
+                      {:name "ipv6-proxy"
+                       :listen {:interfaces ["eth0"] :port 80}
+                       :default-target {:ip "10.0.0.1" :port 8080}
+                       :source-routes
+                       [{:source "2001:db8::/32"
+                         :target {:ip "10.0.0.2" :port 8080}}
+                        {:source "fe80::/10"
+                         :target {:ip "10.0.0.3" :port 8080}}]})]
+      (is (= "ipv6-proxy" (:name proxy-cfg)))
+      (is (= 2 (count (:source-routes proxy-cfg))))))
+
+  (testing "Parse proxy with mixed IPv4 and IPv6 source routes"
+    (let [proxy-cfg (config/parse-proxy-config
+                      {:name "dual-stack-proxy"
+                       :listen {:interfaces ["eth0"] :port 80}
+                       :default-target {:ip "10.0.0.1" :port 8080}
+                       :source-routes
+                       [{:source "192.168.1.0/24"
+                         :target {:ip "10.0.0.2" :port 8080}}
+                        {:source "2001:db8::/32"
+                         :target {:ip "10.0.0.3" :port 8080}}]})]
+      (is (= 2 (count (:source-routes proxy-cfg)))))))
+
+(deftest ipv6-validate-config-test
+  (testing "Valid IPv6 configuration passes validation"
+    (let [config-map {:proxies
+                      [{:name "test"
+                        :listen {:interfaces ["eth0"] :port 80}
+                        :default-target {:ip "10.0.0.1" :port 8080}
+                        :source-routes
+                        [{:source "2001:db8::/32"
+                          :target {:ip "10.0.0.2" :port 8080}}]}]
+                      :settings {:stats-enabled false}}
+          result (config/validate-config config-map)]
+      (is (:valid result))
+      (is (some? (:config result))))))
