@@ -16,6 +16,7 @@ A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP
 - **SNI-Based Routing**: Route TLS traffic based on hostname without terminating TLS (layer 4 passthrough)
 - **Weighted Load Balancing**: Distribute traffic across multiple backends with configurable weights
 - **Connection Draining**: Gracefully remove backends by stopping new connections while existing ones complete
+- **DNS-Based Backends**: Use DNS hostnames for dynamic backend discovery with periodic re-resolution
 - **Runtime Configuration**: Add/remove proxies and routes without restart
 - **Statistics Collection**: Real-time connection and traffic statistics via ring buffer
 - **ARM64 Support**: Full cross-platform support with QEMU-based ARM64 testing
@@ -304,6 +305,83 @@ When a backend recovers, traffic is gradually restored to prevent overwhelming i
 | `healthy-threshold` | `2` | Consecutive successes to mark healthy |
 | `unhealthy-threshold` | `3` | Consecutive failures to mark unhealthy |
 | `expected-codes` | `[200 201 202 204]` | Valid HTTP response codes |
+
+### DNS-Based Backend Resolution
+
+Use DNS hostnames instead of static IPs for backend targets. Ideal for dynamic environments like Kubernetes, cloud deployments, or services with frequently changing IPs.
+
+**Basic DNS backend:**
+```clojure
+:default-target
+{:host "backend.service.local"   ; DNS hostname instead of :ip
+ :port 8080
+ :dns-refresh-seconds 30}        ; Re-resolve every 30 seconds (default)
+```
+
+**DNS with health checking:**
+```clojure
+:default-target
+{:host "api.backend.local"
+ :port 8080
+ :dns-refresh-seconds 15
+ :health-check {:type :http
+                :path "/health"
+                :interval-ms 5000}}
+```
+
+**Mixed static and DNS targets:**
+```clojure
+:default-target
+[{:ip "10.0.0.1" :port 8080 :weight 50}        ; Static IP
+ {:host "dynamic.backend.local"                 ; DNS hostname
+  :port 8080
+  :weight 50
+  :dns-refresh-seconds 10}]
+```
+
+**Kubernetes headless service pattern:**
+```clojure
+;; Headless services (clusterIP: None) return pod IPs as A records
+:default-target
+{:host "myapp.default.svc.cluster.local"
+ :port 8080
+ :dns-refresh-seconds 5}    ; Quick refresh for pod scaling
+```
+
+**Multiple A Record Handling:**
+
+When a hostname resolves to multiple A records, the weight is distributed equally:
+- Config: `{:host "backend.local" :port 8080 :weight 60}`
+- Resolves to 3 IPs: Each gets weight 20 (60 ÷ 3)
+
+**Failure Handling:**
+
+| Scenario | Startup | Runtime |
+|----------|---------|---------|
+| DNS timeout | Fatal error | Use last-known-good IPs |
+| Unknown host | Fatal error | Use last-known-good IPs |
+| Empty A records | Fatal error | Use last-known-good IPs |
+
+**DNS API:**
+```clojure
+;; Get DNS resolution status
+(lb/get-dns-status "proxy-name")
+;; => {:proxy-name "proxy-name"
+;;     :targets {"backend.local"
+;;               {:hostname "backend.local"
+;;                :port 8080
+;;                :last-ips ["10.0.0.1" "10.0.0.2"]
+;;                :consecutive-failures 0}}}
+
+(lb/get-all-dns-status)          ; All proxies
+(lb/force-dns-resolve! "proxy" "hostname")  ; Force refresh
+
+;; Subscribe to DNS events
+(require '[lb.dns :as dns])
+(dns/subscribe! (fn [event]
+  (println (:type event) (:hostname event))))
+;; Events: :dns-resolved, :dns-failed
+```
 
 ### Connection Draining
 
