@@ -4,7 +4,11 @@
             [lb.drain :as drain]
             [lb.config :as config]
             [lb.health.weights :as weights]
-            [lb.util :as util]))
+            [lb.maps :as maps]
+            [lb.conntrack :as conntrack]
+            [lb.util :as util]
+            [lb.test-util :refer [when-root]]
+            [clj-ebpf.core :as bpf]))
 
 ;;; =============================================================================
 ;;; Test Fixtures
@@ -248,3 +252,327 @@
     (let [settings (config/parse-settings {})]
       (is (= 30000 (:default-drain-timeout-ms settings)))
       (is (= 1000 (:drain-check-interval-ms settings))))))
+
+;;; =============================================================================
+;;; Integration Test Helpers - Mock Connection Tracking
+;;; =============================================================================
+
+;; We use a mock connection counter for integration tests because:
+;; 1. Per-CPU BPF map updates from userspace have complex requirements
+;; 2. The drain logic is what we're testing, not BPF map I/O
+;; 3. BPF map reading is tested in other integration tests
+
+;; Global atom for mock connections - accessible across threads
+(def mock-connections
+  "Mock connection counts by target IP. Map of ip-string -> count."
+  (atom {}))
+
+(defn mock-get-connections-for-target
+  "Mock implementation of get-connections-for-target."
+  [_conntrack-map target-id]
+  (let [{:keys [ip]} (drain/parse-target-id target-id)
+        ip-str (util/u32->ip-string ip)]
+    (get @mock-connections ip-str 0)))
+
+(defn set-mock-connections!
+  "Set the mock connection count for a target IP."
+  [ip-str count]
+  (swap! mock-connections assoc ip-str count))
+
+(defn clear-mock-connections!
+  "Clear all mock connections."
+  []
+  (reset! mock-connections {}))
+
+(defmacro with-mock-connections
+  "Run body with mocked connection counting.
+   Redefines drain/get-connections-for-target to use mock data."
+  [& body]
+  `(do
+     (clear-mock-connections!)
+     (with-redefs [drain/get-connections-for-target mock-get-connections-for-target]
+       (try
+         ~@body
+         (finally
+           (clear-mock-connections!))))))
+
+;;; =============================================================================
+;;; Integration Tests - Drain Lifecycle with Mock Connections
+;;; =============================================================================
+
+(deftest drain-lifecycle-completes-when-connections-close-test
+  (testing "Drain completes when all connections close"
+    (with-mock-connections
+      (let [callback-results (atom [])
+            target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 50}
+                            {:ip "10.1.1.2" :port 8080 :weight 50}])]
+
+        ;; Set initial mock connections
+        (set-mock-connections! "10.1.1.1" 2)
+
+        ;; Initialize drain module with fast check interval
+        (drain/init! :mock-conntrack-map
+                     (fn [_ _] nil)
+                     :check-interval-ms 50)
+
+        ;; Start draining
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 5000
+                              :on-complete #(swap! callback-results conj %))
+
+        (is (drain/draining? "10.1.1.1:8080"))
+
+        ;; Verify initial connection count
+        (let [status (drain/get-drain-status "10.1.1.1:8080")]
+          (is (= 2 (:initial-connections status))))
+
+        ;; Remove connections (simulating connections closing)
+        (set-mock-connections! "10.1.1.1" 0)
+
+        ;; Wait for drain watcher to detect completion
+        (Thread/sleep 200)
+
+        ;; Verify drain completed
+        (is (not (drain/draining? "10.1.1.1:8080")))
+        (is (= [:completed] @callback-results))
+
+        (drain/shutdown!)))))
+
+(deftest drain-lifecycle-timeout-test
+  (testing "Drain times out when connections remain"
+    (with-mock-connections
+      (let [callback-results (atom [])
+            target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 50}
+                            {:ip "10.1.1.2" :port 8080 :weight 50}])]
+
+        ;; Set mock connection that won't be removed
+        (set-mock-connections! "10.1.1.1" 1)
+
+        ;; Initialize with fast check interval
+        (drain/init! :mock-conntrack-map
+                     (fn [_ _] nil)
+                     :check-interval-ms 50)
+
+        ;; Start draining with very short timeout
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 200
+                              :on-complete #(swap! callback-results conj %))
+
+        ;; Wait for timeout
+        (Thread/sleep 400)
+
+        ;; Verify timeout occurred
+        (is (not (drain/draining? "10.1.1.1:8080")))
+        (is (= [:timeout] @callback-results))
+
+        (drain/shutdown!)))))
+
+(deftest drain-lifecycle-wait-for-drain-test
+  (testing "wait-for-drain! blocks until completion"
+    (with-mock-connections
+      (let [target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 100}])]
+
+        ;; Set initial mock connection
+        (set-mock-connections! "10.1.1.1" 1)
+
+        ;; Initialize with fast check interval
+        (drain/init! :mock-conntrack-map
+                     (fn [_ _] nil)
+                     :check-interval-ms 50)
+
+        ;; Start draining
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 5000)
+
+        ;; Remove connection in a separate thread after a delay
+        (future
+          (Thread/sleep 100)
+          (set-mock-connections! "10.1.1.1" 0))
+
+        ;; Wait synchronously
+        (let [result (drain/wait-for-drain! "10.1.1.1:8080")]
+          (is (= :completed result)))
+
+        (drain/shutdown!)))))
+
+(deftest drain-lifecycle-undrain-restores-traffic-test
+  (testing "undrain-backend! restores traffic"
+    (with-mock-connections
+      (let [weight-updates (atom [])
+            target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 50}
+                            {:ip "10.1.1.2" :port 8080 :weight 50}])]
+
+        ;; Initialize
+        (drain/init! :mock-conntrack-map
+                     (fn [proxy-name new-tg]
+                       (swap! weight-updates conj
+                              {:proxy proxy-name
+                               :weights (:effective-weights new-tg)}))
+                     :check-interval-ms 100)
+
+        ;; Start draining
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 30000)
+
+        ;; Verify weight was set to 0
+        (is (= 1 (count @weight-updates)))
+        (let [first-update (first @weight-updates)]
+          (is (= "test" (:proxy first-update)))
+          ;; First target (draining) should have weight 0
+          (is (= 0 (first (:weights first-update))))
+          ;; Second target should have weight 100 (redistributed)
+          (is (= 100 (second (:weights first-update)))))
+
+        ;; Undrain
+        (is (true? (drain/undrain-backend! "test" target-group "10.1.1.1:8080")))
+        (is (not (drain/draining? "10.1.1.1:8080")))
+
+        ;; Verify weights were restored
+        (is (= 2 (count @weight-updates)))
+        (let [second-update (second @weight-updates)]
+          ;; Both should now have their original weights (50 each)
+          (is (= [50 50] (:weights second-update))))
+
+        (drain/shutdown!)))))
+
+(deftest drain-lifecycle-cancelled-on-shutdown-test
+  (testing "Active drains are cancelled on shutdown"
+    (with-mock-connections
+      (let [callback-results (atom [])
+            target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 50}
+                            {:ip "10.1.1.2" :port 8080 :weight 50}])]
+
+        ;; Set mock connection so drain won't complete naturally
+        (set-mock-connections! "10.1.1.1" 1)
+
+        ;; Initialize
+        (drain/init! :mock-conntrack-map (fn [_ _] nil) :check-interval-ms 100)
+
+        ;; Start draining
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 60000
+                              :on-complete #(swap! callback-results conj %))
+
+        (is (drain/draining? "10.1.1.1:8080"))
+
+        ;; Shutdown
+        (drain/shutdown!)
+
+        ;; Verify drain was cancelled
+        (is (not (drain/draining? "10.1.1.1:8080")))
+        (is (= [:cancelled] @callback-results))))))
+
+(deftest drain-lifecycle-multiple-backends-test
+  (testing "Multiple backends can be drained simultaneously"
+    (with-mock-connections
+      (let [callback-results (atom {})
+            target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 34}
+                            {:ip "10.1.1.2" :port 8080 :weight 33}
+                            {:ip "10.1.1.3" :port 8080 :weight 33}])]
+
+        ;; Set mock connections to first two backends
+        (set-mock-connections! "10.1.1.1" 1)
+        (set-mock-connections! "10.1.1.2" 1)
+
+        ;; Initialize
+        (drain/init! :mock-conntrack-map (fn [_ _] nil) :check-interval-ms 50)
+
+        ;; Start draining both
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 5000
+                              :on-complete #(swap! callback-results assoc "10.1.1.1:8080" %))
+        (drain/drain-backend! "test" target-group "10.1.1.2:8080"
+                              :timeout-ms 5000
+                              :on-complete #(swap! callback-results assoc "10.1.1.2:8080" %))
+
+        (is (drain/draining? "10.1.1.1:8080"))
+        (is (drain/draining? "10.1.1.2:8080"))
+        (is (= 2 (count (drain/get-all-draining))))
+
+        ;; Remove all connections
+        (set-mock-connections! "10.1.1.1" 0)
+        (set-mock-connections! "10.1.1.2" 0)
+
+        ;; Wait for completion
+        (Thread/sleep 200)
+
+        ;; Verify both completed
+        (is (= :completed (get @callback-results "10.1.1.1:8080")))
+        (is (= :completed (get @callback-results "10.1.1.2:8080")))
+        (is (empty? (drain/get-all-draining)))
+
+        (drain/shutdown!)))))
+
+(deftest drain-lifecycle-status-tracking-test
+  (testing "Drain status is tracked correctly throughout lifecycle"
+    (with-mock-connections
+      (let [target-group (config/make-weighted-target-group
+                           [{:ip "10.1.1.1" :port 8080 :weight 100}])]
+
+        ;; Set initial mock connections
+        (set-mock-connections! "10.1.1.1" 3)
+
+        ;; Initialize
+        (drain/init! :mock-conntrack-map (fn [_ _] nil) :check-interval-ms 50)
+
+        ;; Start draining
+        (drain/drain-backend! "test" target-group "10.1.1.1:8080"
+                              :timeout-ms 10000)
+
+        ;; Check initial status
+        (let [status (drain/get-drain-status "10.1.1.1:8080")]
+          (is (= "10.1.1.1:8080" (:target-id status)))
+          (is (= "test" (:proxy-name status)))
+          (is (= :draining (:status status)))
+          (is (= 3 (:initial-connections status)))
+          (is (= 3 (:current-connections status)))
+          (is (< (:elapsed-ms status) 1000)))
+
+        ;; Reduce connections
+        (set-mock-connections! "10.1.1.1" 2)
+        (Thread/sleep 100)
+
+        ;; Check updated status
+        (let [status (drain/get-drain-status "10.1.1.1:8080")]
+          (is (= 3 (:initial-connections status)))
+          (is (= 2 (:current-connections status))))
+
+        ;; Remove remaining connections
+        (set-mock-connections! "10.1.1.1" 0)
+
+        ;; Wait for completion
+        (Thread/sleep 200)
+
+        ;; Drain should be complete
+        (is (nil? (drain/get-drain-status "10.1.1.1:8080")))
+
+        (drain/shutdown!)))))
+
+;;; =============================================================================
+;;; Integration Tests - Real BPF Maps (requires root)
+;;; =============================================================================
+
+(deftest ^:integration drain-with-real-conntrack-map-test
+  (when-root
+    (testing "Drain module initialization with real conntrack map"
+      (let [conntrack-map (maps/create-conntrack-map {:max-connections 1000})]
+        (try
+          (let [weight-updates (atom [])]
+            (drain/init! conntrack-map
+                         (fn [proxy-name tg]
+                           (swap! weight-updates conj {:proxy proxy-name :tg tg}))
+                         :check-interval-ms 100)
+
+            ;; Verify initialization
+            (is (some? (:conntrack-map @drain/drain-state)))
+            (is (some? (:update-weights-fn @drain/drain-state)))
+
+            (drain/shutdown!))
+          (finally
+            (bpf/close-map conntrack-map)))))))
