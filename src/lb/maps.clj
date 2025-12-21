@@ -167,6 +167,106 @@
                    :max-entries max-rate-limit-backend
                    :map-name "rate_limit_backend"}))
 
+;;; =============================================================================
+;;; Unified Map Creation (IPv4/IPv6 Support)
+;;; =============================================================================
+
+(defn create-config-map-unified
+  "Create unified LPM trie map for source IP -> target routing (IPv4/IPv6).
+   Key: {prefix_len (4 bytes) + ip (16 bytes)} = 20 bytes
+   Value: Unified weighted route format (168 bytes):
+     Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+     Per target (20 bytes each, max 8): ip(16) + port(2) + cumulative_weight(2)"
+  [{:keys [max-routes] :or {max-routes (:max-routes default-config)}}]
+  (log/info "Creating unified config LPM trie map with max-entries:" max-routes)
+  (bpf/create-map {:map-type :lpm-trie
+                   :key-size util/LPM-KEY-UNIFIED-SIZE  ; 20 bytes
+                   :value-size util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE  ; 168 bytes
+                   :max-entries max-routes
+                   :map-flags 1  ; BPF_F_NO_PREALLOC required for LPM
+                   :map-name "proxy_config_v6"}))
+
+(defn create-listen-map-unified
+  "Create unified hash map for listen interface/port -> default target (IPv4/IPv6).
+   Key: {ifindex (4 bytes) + port (2 bytes) + af (1 byte) + pad (1 byte)} = 8 bytes
+   Value: Unified weighted route format (168 bytes)"
+  [{:keys [max-listen-ports] :or {max-listen-ports (:max-listen-ports default-config)}}]
+  (log/info "Creating unified listen hash map with max-entries:" max-listen-ports)
+  (bpf/create-map {:map-type :hash
+                   :key-size util/LISTEN-KEY-UNIFIED-SIZE  ; 8 bytes
+                   :value-size util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE  ; 168 bytes
+                   :max-entries max-listen-ports
+                   :map-name "proxy_listen_v6"}))
+
+(defn create-conntrack-map-unified
+  "Create unified per-CPU hash map for connection tracking (IPv4/IPv6).
+   Key: 5-tuple (40 bytes): src_ip(16) + dst_ip(16) + ports(4) + proto(1) + pad(3)
+   Value: conntrack state (96 bytes):
+     orig_dst_ip(16) + orig_dst_port(2) + pad(2) + nat_dst_ip(16) + nat_dst_port(2) + pad(2) +
+     created_ns(8) + last_seen_ns(8) + packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8)"
+  [{:keys [max-connections] :or {max-connections (:max-connections default-config)}}]
+  (log/info "Creating unified conntrack per-CPU hash map with max-entries:" max-connections)
+  (bpf/create-map {:map-type :percpu-hash
+                   :key-size util/CONNTRACK-KEY-UNIFIED-SIZE  ; 40 bytes
+                   :value-size util/CONNTRACK-VALUE-UNIFIED-SIZE  ; 96 bytes
+                   :max-entries max-connections
+                   :map-name "proxy_conntrack_v6"}))
+
+(defn create-sni-map-unified
+  "Create unified hash map for TLS SNI hostname -> target routing (IPv4/IPv6).
+   Key: hostname_hash (8 bytes) - FNV-1a 64-bit hash of lowercase hostname
+   Value: Unified weighted route format (168 bytes)"
+  [{:keys [max-sni-routes] :or {max-sni-routes (:max-sni-routes default-config)}}]
+  (log/info "Creating unified SNI hash map with max-entries:" max-sni-routes)
+  (bpf/create-map {:map-type :hash
+                   :key-size util/SNI-KEY-SIZE  ; 8 bytes (same as before)
+                   :value-size util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE  ; 168 bytes
+                   :max-entries max-sni-routes
+                   :map-name "proxy_sni_v6"}))
+
+(defn create-rate-limit-src-map-unified
+  "Create unified LRU per-CPU hash map for per-source IP rate limiting (IPv4/IPv6).
+   Key: source IP (16 bytes)
+   Value: rate bucket (16 bytes): tokens(8) + last_update(8)"
+  [{:keys [max-rate-limit-src] :or {max-rate-limit-src (:max-rate-limit-src default-config)}}]
+  (log/info "Creating unified rate limit source LRU map with max-entries:" max-rate-limit-src)
+  (bpf/create-map {:map-type :lru-percpu-hash
+                   :key-size 16  ; 16-byte unified IP
+                   :value-size RATE-BUCKET-SIZE
+                   :max-entries max-rate-limit-src
+                   :map-name "rate_limit_src_v6"}))
+
+(defn create-rate-limit-backend-map-unified
+  "Create unified LRU per-CPU hash map for per-backend rate limiting (IPv4/IPv6).
+   Key: backend IP:port (20 bytes): ip(16) + port(2) + pad(2)
+   Value: rate bucket (16 bytes): tokens(8) + last_update(8)"
+  [{:keys [max-rate-limit-backend] :or {max-rate-limit-backend (:max-rate-limit-backend default-config)}}]
+  (log/info "Creating unified rate limit backend LRU map with max-entries:" max-rate-limit-backend)
+  (bpf/create-map {:map-type :lru-percpu-hash
+                   :key-size 20  ; ip(16) + port(2) + pad(2)
+                   :value-size RATE-BUCKET-SIZE
+                   :max-entries max-rate-limit-backend
+                   :map-name "rate_limit_backend_v6"}))
+
+(defn create-all-maps-unified
+  "Create all unified maps for IPv4/IPv6 dual-stack support.
+   Returns a map of {:config-map :listen-map :sni-map :conntrack-map :settings-map
+                     :stats-ringbuf :rate-limit-config-map :rate-limit-src-map
+                     :rate-limit-backend-map}"
+  ([]
+   (create-all-maps-unified {}))
+  ([opts]
+   (let [config (merge default-config opts)]
+     {:config-map (create-config-map-unified config)
+      :listen-map (create-listen-map-unified config)
+      :sni-map (create-sni-map-unified config)
+      :conntrack-map (create-conntrack-map-unified config)
+      :settings-map (create-settings-map config)  ; Same as before
+      :stats-ringbuf (create-stats-ringbuf config)  ; Same as before
+      :rate-limit-config-map (create-rate-limit-config-map config)  ; Same as before
+      :rate-limit-src-map (create-rate-limit-src-map-unified config)
+      :rate-limit-backend-map (create-rate-limit-backend-map-unified config)})))
+
 (defn create-all-maps
   "Create all maps required for the reverse proxy.
    Returns a map of {:config-map :listen-map :sni-map :conntrack-map :settings-map
@@ -596,3 +696,195 @@
   [config-map limit-type]
   (when-let [config (get-rate-limit-config config-map limit-type)]
     (pos? (:rate config))))
+
+;;; =============================================================================
+;;; Unified Map Operations (IPv4/IPv6 Support)
+;;; =============================================================================
+
+(defn add-source-route-unified
+  "Add a source IP/CIDR route with weighted targets to the unified config map.
+   source: {:ip <16-byte-array> :prefix-len <int>}
+   target-group: TargetGroup record with :targets (having :ip as 16-byte arrays) and :cumulative-weights
+   flags: optional flags (default 1 = enabled)
+   session-persistence: if true, enables sticky sessions based on source IP hash"
+  [config-map {:keys [ip prefix-len]} target-group & {:keys [flags session-persistence] :or {flags 1}}]
+  (let [effective-flags (cond-> flags
+                          session-persistence (bit-or util/FLAG-SESSION-PERSISTENCE))
+        key-bytes (util/encode-lpm-key-unified prefix-len ip)
+        value-bytes (util/encode-weighted-route-value-unified target-group effective-flags)
+        targets (:targets target-group)]
+    (log/debug "Adding unified source route:" (util/bytes16->ip-string ip) "/" prefix-len
+               "->" (count targets) "targets"
+               (when session-persistence "(session-persistence)"))
+    (bpf/map-update config-map key-bytes value-bytes)))
+
+(defn remove-source-route-unified
+  "Remove a source IP/CIDR route from the unified config map."
+  [config-map {:keys [ip prefix-len]}]
+  (let [key-bytes (util/encode-lpm-key-unified prefix-len ip)]
+    (log/debug "Removing unified source route:" (util/bytes16->ip-string ip) "/" prefix-len)
+    (bpf/map-delete config-map key-bytes)))
+
+(defn lookup-source-route-unified
+  "Look up a source IP in the unified config map.
+   Returns unified weighted route data with :target-count, :flags, and :targets (with :ip as 16-byte arrays)."
+  [config-map {:keys [ip prefix-len]}]
+  (let [key-bytes (util/encode-lpm-key-unified prefix-len ip)]
+    (when-let [value-bytes (bpf/map-lookup config-map key-bytes)]
+      (util/decode-weighted-route-value-unified value-bytes))))
+
+(defn list-source-routes-unified
+  "List all source routes in the unified config map.
+   Returns a sequence of {:source {...} :route {...}} maps with unified IP addresses."
+  [config-map]
+  (->> (bpf/map-entries config-map)
+       (map (fn [[k v]]
+              {:source (util/decode-lpm-key-unified k)
+               :route (util/decode-weighted-route-value-unified v)}))))
+
+(defn add-listen-port-unified
+  "Configure a listen interface/port with weighted targets for unified maps.
+   ifindex: network interface index
+   listen-port: listen port number
+   af: address family (:ipv4 or :ipv6)
+   target-group: TargetGroup record with :targets (having :ip as 16-byte arrays) and :cumulative-weights
+   flags: bit flags (bit 0 = stats enabled)
+   session-persistence: if true, enables sticky sessions based on source IP hash"
+  [listen-map ifindex listen-port af target-group & {:keys [flags session-persistence] :or {flags 0}}]
+  (let [effective-flags (cond-> flags
+                          session-persistence (bit-or util/FLAG-SESSION-PERSISTENCE))
+        key-bytes (util/encode-listen-key-unified ifindex listen-port af)
+        value-bytes (util/encode-weighted-route-value-unified target-group effective-flags)
+        targets (:targets target-group)]
+    (log/debug "Adding unified listen port: ifindex=" ifindex "port=" listen-port "af=" af
+               "->" (count targets) "targets"
+               (when session-persistence "(session-persistence)"))
+    (bpf/map-update listen-map key-bytes value-bytes)))
+
+(defn remove-listen-port-unified
+  "Remove a listen interface/port configuration from unified map."
+  [listen-map ifindex port af]
+  (let [key-bytes (util/encode-listen-key-unified ifindex port af)]
+    (log/debug "Removing unified listen port: ifindex=" ifindex "port=" port "af=" af)
+    (bpf/map-delete listen-map key-bytes)))
+
+(defn lookup-listen-port-unified
+  "Look up configuration for a listen interface/port in unified map.
+   Returns unified weighted route data."
+  [listen-map ifindex port af]
+  (let [key-bytes (util/encode-listen-key-unified ifindex port af)]
+    (when-let [value-bytes (bpf/map-lookup listen-map key-bytes)]
+      (util/decode-weighted-route-value-unified value-bytes))))
+
+(defn list-listen-ports-unified
+  "List all configured listen ports in unified map.
+   Returns a sequence of {:listen {...} :route {...}} maps with address family."
+  [listen-map]
+  (->> (bpf/map-entries listen-map)
+       (map (fn [[k v]]
+              {:listen (util/decode-listen-key-unified k)
+               :route (util/decode-weighted-route-value-unified v)}))))
+
+(defn add-sni-route-unified
+  "Add an SNI hostname route with unified weighted targets.
+   hostname: TLS SNI hostname (will be lowercased)
+   target-group: TargetGroup record with :targets (having :ip as 16-byte arrays) and :cumulative-weights
+   flags: optional flags (default 1 = enabled)
+   session-persistence: if true, enables sticky sessions based on source IP hash"
+  [sni-map hostname target-group & {:keys [flags session-persistence] :or {flags 1}}]
+  (let [effective-flags (cond-> flags
+                          session-persistence (bit-or util/FLAG-SESSION-PERSISTENCE))
+        normalized-hostname (clojure.string/lower-case hostname)
+        hostname-hash (util/hostname->hash normalized-hostname)
+        key-bytes (util/encode-sni-key hostname-hash)
+        value-bytes (util/encode-weighted-route-value-unified target-group effective-flags)
+        targets (:targets target-group)]
+    (log/debug "Adding unified SNI route:" normalized-hostname
+               "(hash:" hostname-hash ")->" (count targets) "targets"
+               (when session-persistence "(session-persistence)"))
+    (bpf/map-update sni-map key-bytes value-bytes)))
+
+(defn lookup-sni-route-unified
+  "Look up an SNI hostname in the unified SNI map.
+   Returns unified weighted route data."
+  [sni-map hostname]
+  (let [normalized-hostname (clojure.string/lower-case hostname)
+        hostname-hash (util/hostname->hash normalized-hostname)
+        key-bytes (util/encode-sni-key hostname-hash)]
+    (when-let [value-bytes (bpf/map-lookup sni-map key-bytes)]
+      (util/decode-weighted-route-value-unified value-bytes))))
+
+(defn list-sni-routes-unified
+  "List all SNI routes in the unified SNI map.
+   Returns a sequence of {:hostname-hash <long> :route {...}} maps."
+  [sni-map]
+  (->> (bpf/map-entries sni-map)
+       (map (fn [[k v]]
+              {:hostname-hash (:hostname-hash (util/decode-sni-key k))
+               :route (util/decode-weighted-route-value-unified v)}))))
+
+(defn lookup-connection-unified
+  "Look up a connection by its unified 5-tuple (with 16-byte IPs)."
+  [conntrack-map five-tuple]
+  (let [key-bytes (util/encode-conntrack-key-unified five-tuple)]
+    (when-let [values (bpf/map-lookup conntrack-map key-bytes)]
+      ;; Per-CPU map returns a vector of values, one per CPU
+      ;; Aggregate them
+      (if (vector? values)
+        (let [zero-ip (byte-array 16)]
+          (reduce (fn [acc v]
+                    (let [decoded (util/decode-conntrack-value-unified v)]
+                      {:orig-dst-ip (if (util/bytes16-zero? (:orig-dst-ip decoded))
+                                     (:orig-dst-ip acc)
+                                     (:orig-dst-ip decoded))
+                       :orig-dst-port (max (:orig-dst-port acc) (:orig-dst-port decoded))
+                       :nat-dst-ip (if (util/bytes16-zero? (:nat-dst-ip decoded))
+                                    (:nat-dst-ip acc)
+                                    (:nat-dst-ip decoded))
+                       :nat-dst-port (max (:nat-dst-port acc) (:nat-dst-port decoded))
+                       :last-seen (max (:last-seen acc) (:last-seen decoded))
+                       :packets-fwd (+ (:packets-fwd acc) (:packets-fwd decoded))
+                       :bytes-fwd (+ (:bytes-fwd acc) (:bytes-fwd decoded))
+                       :packets-rev (+ (:packets-rev acc) (:packets-rev decoded))
+                       :bytes-rev (+ (:bytes-rev acc) (:bytes-rev decoded))}))
+                  {:orig-dst-ip zero-ip :orig-dst-port 0
+                   :nat-dst-ip zero-ip :nat-dst-port 0
+                   :last-seen 0 :packets-fwd 0 :bytes-fwd 0 :packets-rev 0 :bytes-rev 0}
+                  values))
+        (util/decode-conntrack-value-unified values)))))
+
+(defn delete-connection-unified
+  "Delete a connection from the unified tracking map."
+  [conntrack-map five-tuple]
+  (let [key-bytes (util/encode-conntrack-key-unified five-tuple)]
+    (bpf/map-delete conntrack-map key-bytes)))
+
+(defn list-connections-unified
+  "List all active connections in unified map."
+  [conntrack-map]
+  (->> (bpf/map-entries conntrack-map)
+       (map (fn [[k v]]
+              {:key (util/decode-conntrack-key-unified k)
+               :value (if (vector? v)
+                        ;; Per-CPU: aggregate
+                        (let [zero-ip (byte-array 16)]
+                          (reduce (fn [acc val-bytes]
+                                    (let [d (util/decode-conntrack-value-unified val-bytes)]
+                                      (-> acc
+                                          (update :packets-fwd + (:packets-fwd d))
+                                          (update :bytes-fwd + (:bytes-fwd d))
+                                          (update :packets-rev + (:packets-rev d))
+                                          (update :bytes-rev + (:bytes-rev d))
+                                          (update :last-seen max (:last-seen d))
+                                          (assoc :orig-dst-ip (if (util/bytes16-zero? (:orig-dst-ip acc))
+                                                                (:orig-dst-ip d)
+                                                                (:orig-dst-ip acc)))
+                                          (assoc :nat-dst-ip (if (util/bytes16-zero? (:nat-dst-ip acc))
+                                                               (:nat-dst-ip d)
+                                                               (:nat-dst-ip acc))))))
+                                  {:orig-dst-ip zero-ip :orig-dst-port 0
+                                   :nat-dst-ip zero-ip :nat-dst-port 0
+                                   :last-seen 0 :packets-fwd 0 :bytes-fwd 0
+                                   :packets-rev 0 :bytes-rev 0}
+                                  v))
+                        (util/decode-conntrack-value-unified v))}))))

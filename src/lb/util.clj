@@ -1,8 +1,9 @@
 (ns lb.util
-  "Utility functions for IP address conversion, CIDR parsing, and binary encoding."
+  "Utility functions for IP address conversion, CIDR parsing, and binary encoding.
+   Supports both IPv4 and IPv6 addresses with unified 16-byte internal format."
   (:require [clojure.string :as str])
   (:import [java.nio ByteBuffer ByteOrder]
-           [java.net InetAddress UnknownHostException]))
+           [java.net InetAddress Inet4Address Inet6Address UnknownHostException]))
 
 ;;; =============================================================================
 ;;; IP Address Conversion
@@ -51,6 +52,105 @@
     (.getInt buf)))
 
 ;;; =============================================================================
+;;; IPv6 Address Conversion
+;;; =============================================================================
+
+(defn ipv6?
+  "Check if string is an IPv6 address (contains colon)."
+  [ip-str]
+  (and (string? ip-str) (str/includes? ip-str ":")))
+
+(defn ipv4?
+  "Check if string is an IPv4 address (dotted decimal, no colons)."
+  [ip-str]
+  (and (string? ip-str)
+       (re-matches #"\d+\.\d+\.\d+\.\d+" ip-str)))
+
+(defn address-family
+  "Determine address family from IP string.
+   Returns :ipv4, :ipv6, or nil if invalid."
+  [ip-str]
+  (cond
+    (ipv4? ip-str) :ipv4
+    (ipv6? ip-str) :ipv6
+    :else nil))
+
+(defn ipv6-string->bytes
+  "Convert IPv6 string to 16-byte array.
+   Uses Java's InetAddress for robust parsing (handles all IPv6 formats).
+   Example: \"2001:db8::1\" => [32 1 13 184 0 0 0 0 0 0 0 0 0 0 0 1]"
+  [^String ipv6-str]
+  (try
+    (let [addr (InetAddress/getByName ipv6-str)]
+      (when-not (instance? Inet6Address addr)
+        (throw (ex-info "Not an IPv6 address" {:ip ipv6-str})))
+      (.getAddress addr))
+    (catch Exception e
+      (throw (ex-info "Invalid IPv6 address" {:ip ipv6-str} e)))))
+
+(defn bytes->ipv6-string
+  "Convert 16-byte array to IPv6 string.
+   Example: [32 1 13 184 0 0 0 0 0 0 0 0 0 0 0 1] => \"2001:db8::1\""
+  [^bytes b]
+  (when (not= 16 (alength b))
+    (throw (ex-info "Invalid IPv6 byte array length" {:length (alength b)})))
+  (let [addr (InetAddress/getByAddress b)]
+    (.getHostAddress addr)))
+
+(defn ipv4-bytes->bytes16
+  "Pad 4-byte IPv4 address to 16 bytes with zero prefix.
+   Format: 00:00:00:00:00:00:00:00:00:00:00:00:AA:BB:CC:DD"
+  [^bytes ipv4-bytes]
+  (let [result (byte-array 16)]
+    ;; First 12 bytes are zero (already initialized)
+    ;; Copy IPv4 bytes to last 4 bytes
+    (System/arraycopy ipv4-bytes 0 result 12 4)
+    result))
+
+(defn u32->bytes16
+  "Convert IPv4 u32 to 16-byte unified format."
+  [ip-u32]
+  (ipv4-bytes->bytes16 (ip->bytes ip-u32)))
+
+(defn ip-string->bytes16
+  "Parse IPv4 or IPv6 string to unified 16-byte format.
+   IPv4: padded with 12 zero bytes prefix
+   IPv6: native 16 bytes"
+  [ip-str]
+  (if (ipv6? ip-str)
+    (ipv6-string->bytes ip-str)
+    (u32->bytes16 (ip-string->u32 ip-str))))
+
+(defn bytes16->ip-string
+  "Convert unified 16-byte format back to IP string.
+   Detects IPv4 (zero-prefixed) vs IPv6."
+  [^bytes b]
+  (when (not= 16 (alength b))
+    (throw (ex-info "Invalid unified IP byte array length" {:length (alength b)})))
+  ;; Check if it's an IPv4-mapped address (first 12 bytes are zero)
+  (let [is-ipv4 (every? zero? (take 12 b))]
+    (if is-ipv4
+      ;; Extract last 4 bytes as IPv4
+      (let [ipv4-bytes (byte-array 4)]
+        (System/arraycopy b 12 ipv4-bytes 0 4)
+        (u32->ip-string (bytes->ip ipv4-bytes)))
+      ;; Full IPv6 address
+      (bytes->ipv6-string b))))
+
+(defn bytes16->address-family
+  "Determine address family from unified 16-byte format.
+   Returns :ipv4 if first 12 bytes are zero, :ipv6 otherwise."
+  [^bytes b]
+  (if (every? zero? (take 12 b))
+    :ipv4
+    :ipv6))
+
+(defn bytes16-zero?
+  "Check if unified 16-byte address is all zeros."
+  [^bytes b]
+  (every? zero? b))
+
+;;; =============================================================================
 ;;; CIDR Parsing
 ;;; =============================================================================
 
@@ -83,6 +183,40 @@
       (= (bit-and ip-u32 mask)
          (bit-and ip mask)))))
 
+(defn parse-cidr-unified
+  "Parse CIDR notation string for IPv4 or IPv6.
+   Returns {:ip <16-byte-array> :prefix-len <int> :af <:ipv4|:ipv6>}
+
+   Examples:
+     \"192.168.1.0/24\"      => {:ip <bytes16> :prefix-len 24 :af :ipv4}
+     \"2001:db8::/32\"       => {:ip <bytes16> :prefix-len 32 :af :ipv6}
+     \"192.168.1.1\"         => {:ip <bytes16> :prefix-len 32 :af :ipv4}
+     \"2001:db8::1\"         => {:ip <bytes16> :prefix-len 128 :af :ipv6}"
+  [cidr-str]
+  (let [[ip-part prefix-part] (if (str/includes? cidr-str "/")
+                                 (str/split cidr-str #"/")
+                                 [cidr-str nil])
+        af (address-family ip-part)
+        _ (when-not af
+            (throw (ex-info "Invalid IP address" {:cidr cidr-str})))
+        max-prefix (if (= af :ipv6) 128 32)
+        default-prefix max-prefix
+        prefix-len (if prefix-part
+                     (let [p (Integer/parseInt prefix-part)]
+                       (when (or (< p 0) (> p max-prefix))
+                         (throw (ex-info "Invalid prefix length"
+                                        {:cidr cidr-str :prefix p :max max-prefix})))
+                       p)
+                     default-prefix)]
+    {:ip (ip-string->bytes16 ip-part)
+     :prefix-len prefix-len
+     :af af}))
+
+(defn cidr-unified->string
+  "Convert unified CIDR {:ip <bytes16> :prefix-len :af} back to string."
+  [{:keys [ip prefix-len]}]
+  (str (bytes16->ip-string ip) "/" prefix-len))
+
 ;;; =============================================================================
 ;;; Hostname Resolution
 ;;; =============================================================================
@@ -109,6 +243,35 @@
     (let [addresses (InetAddress/getAllByName hostname)]
       (mapv (fn [^InetAddress addr]
               (bytes->ip (.getAddress addr)))
+            addresses))
+    (catch UnknownHostException _
+      nil)))
+
+(defn resolve-hostname-bytes16
+  "Resolve hostname to 16-byte unified format.
+   Works for both IPv4 and IPv6 hostnames.
+   Returns nil if resolution fails."
+  [hostname]
+  (try
+    (let [addr (InetAddress/getByName hostname)
+          raw-bytes (.getAddress addr)]
+      (if (= 4 (alength raw-bytes))
+        (ipv4-bytes->bytes16 raw-bytes)
+        raw-bytes))
+    (catch UnknownHostException _
+      nil)))
+
+(defn resolve-hostname-all-bytes16
+  "Resolve hostname to ALL records in unified 16-byte format.
+   Returns vector of 16-byte arrays, or nil if resolution fails."
+  [hostname]
+  (try
+    (let [addresses (InetAddress/getAllByName hostname)]
+      (mapv (fn [^InetAddress addr]
+              (let [raw-bytes (.getAddress addr)]
+                (if (= 4 (alength raw-bytes))
+                  (ipv4-bytes->bytes16 raw-bytes)
+                  raw-bytes)))
             addresses))
     (catch UnknownHostException _
       nil)))
@@ -231,7 +394,7 @@
 ;;; Weighted Route Encoding (for load balancing)
 ;;; =============================================================================
 
-;; Weighted route value format (max 72 bytes):
+;; Weighted route value format (max 72 bytes for IPv4):
 ;;
 ;; Header (8 bytes):
 ;;   target_count: u8 (1-8)
@@ -251,6 +414,31 @@
 (def ^:const WEIGHTED-ROUTE-MAX-TARGETS 8)
 (def ^:const WEIGHTED-ROUTE-MAX-SIZE
   (+ WEIGHTED-ROUTE-HEADER-SIZE (* WEIGHTED-ROUTE-MAX-TARGETS WEIGHTED-ROUTE-TARGET-SIZE)))
+
+;;; =============================================================================
+;;; Unified (IPv4/IPv6) Key/Value Sizes
+;;; =============================================================================
+
+;; Unified LPM key: 20 bytes (prefix_len(4) + ip(16))
+(def ^:const LPM-KEY-UNIFIED-SIZE 20)
+
+;; Unified listen key: 8 bytes (ifindex(4) + port(2) + af(1) + pad(1))
+(def ^:const LISTEN-KEY-UNIFIED-SIZE 8)
+
+;; Unified conntrack key: 40 bytes
+;; (src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2) + protocol(1) + pad(3))
+(def ^:const CONNTRACK-KEY-UNIFIED-SIZE 40)
+
+;; Unified conntrack value: 96 bytes
+;; (orig_dst_ip(16) + orig_dst_port(2) + pad(2) + nat_dst_ip(16) + nat_dst_port(2) + pad(2) + counters(56))
+(def ^:const CONNTRACK-VALUE-UNIFIED-SIZE 96)
+
+;; Unified weighted route target: 20 bytes (ip(16) + port(2) + weight(2))
+(def ^:const WEIGHTED-ROUTE-TARGET-UNIFIED-SIZE 20)
+
+;; Unified weighted route value: 168 bytes (header(8) + 8 * 20)
+(def ^:const WEIGHTED-ROUTE-UNIFIED-MAX-SIZE
+  (+ WEIGHTED-ROUTE-HEADER-SIZE (* WEIGHTED-ROUTE-MAX-TARGETS WEIGHTED-ROUTE-TARGET-UNIFIED-SIZE)))
 
 ;; Route flags (stored in header bytes 4-5)
 (def ^:const FLAG-SESSION-PERSISTENCE 0x0001)
@@ -337,6 +525,246 @@
    All weighted routes use the same size for BPF map compatibility."
   []
   WEIGHTED-ROUTE-MAX-SIZE)
+
+;;; =============================================================================
+;;; Unified Key/Value Encoding (IPv4/IPv6 support)
+;;; =============================================================================
+
+(defn encode-lpm-key-unified
+  "Encode unified LPM trie key: {prefix_len (4 bytes) + ip (16 bytes)}.
+   Total: 20 bytes.
+   ip-bytes16 must be a 16-byte array in unified format."
+  [prefix-len ^bytes ip-bytes16]
+  (when (not= 16 (alength ip-bytes16))
+    (throw (ex-info "IP must be 16 bytes" {:length (alength ip-bytes16)})))
+  (let [buf (ByteBuffer/allocate LPM-KEY-UNIFIED-SIZE)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putInt buf (unchecked-int prefix-len))
+    (.put buf ip-bytes16)
+    (.array buf)))
+
+(defn decode-lpm-key-unified
+  "Decode unified LPM trie key from byte array.
+   Returns {:prefix-len :ip (16-byte array) :af}."
+  [^bytes b]
+  (when (< (alength b) LPM-KEY-UNIFIED-SIZE)
+    (throw (ex-info "Buffer too small for LPM key" {:size (alength b)})))
+  (let [buf (ByteBuffer/wrap b)
+        _ (.order buf ByteOrder/BIG_ENDIAN)
+        prefix-len (.getInt buf)
+        ip-bytes (byte-array 16)]
+    (.get buf ip-bytes)
+    {:prefix-len prefix-len
+     :ip ip-bytes
+     :af (bytes16->address-family ip-bytes)}))
+
+(defn encode-listen-key-unified
+  "Encode unified listen map key: {ifindex (4 bytes) + port (2 bytes) + af (1 byte) + pad (1 byte)}.
+   Total: 8 bytes (same size as before, but includes address family).
+   af is :ipv4 or :ipv6."
+  [ifindex port af]
+  (let [buf (ByteBuffer/allocate LISTEN-KEY-UNIFIED-SIZE)
+        af-byte (case af :ipv4 4 :ipv6 6 4)]
+    (.order buf (ByteOrder/nativeOrder))
+    (.putInt buf (unchecked-int ifindex))
+    ;; Port must be in network byte order (big-endian) to match packet bytes
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.putShort buf (unchecked-short port))
+    ;; Address family and padding
+    (.put buf (unchecked-byte af-byte))
+    (.put buf (byte 0))  ; padding
+    (.array buf)))
+
+(defn decode-listen-key-unified
+  "Decode unified listen map key from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf (ByteOrder/nativeOrder))
+    (let [ifindex (.getInt buf)]
+      ;; Port is stored in network byte order (big-endian)
+      (.order buf ByteOrder/BIG_ENDIAN)
+      (let [port (bit-and (.getShort buf) 0xFFFF)
+            af-byte (bit-and (.get buf) 0xFF)]
+        {:ifindex ifindex
+         :port port
+         :af (case af-byte 4 :ipv4 6 :ipv6 :ipv4)}))))
+
+(defn encode-conntrack-key-unified
+  "Encode unified connection tracking 5-tuple key.
+   {src_ip (16) + dst_ip (16) + src_port (2) + dst_port (2) + protocol (1) + padding (3)}
+   Total: 40 bytes (aligned).
+   src-ip and dst-ip must be 16-byte arrays."
+  [{:keys [src-ip dst-ip src-port dst-port protocol]}]
+  (let [buf (ByteBuffer/allocate CONNTRACK-KEY-UNIFIED-SIZE)]
+    ;; IPs in network byte order (already big-endian as bytes)
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.put buf ^bytes src-ip)
+    (.put buf ^bytes dst-ip)
+    (.putShort buf (unchecked-short src-port))
+    (.putShort buf (unchecked-short dst-port))
+    (.put buf (unchecked-byte protocol))
+    (.put buf (byte 0))  ; padding
+    (.putShort buf (short 0))  ; padding
+    (.array buf)))
+
+(defn decode-conntrack-key-unified
+  "Decode unified connection tracking key from byte array."
+  [^bytes b]
+  (when (< (alength b) CONNTRACK-KEY-UNIFIED-SIZE)
+    (throw (ex-info "Buffer too small for conntrack key" {:size (alength b)})))
+  (let [buf (ByteBuffer/wrap b)
+        _ (.order buf ByteOrder/BIG_ENDIAN)
+        src-ip (byte-array 16)
+        dst-ip (byte-array 16)]
+    (.get buf src-ip)
+    (.get buf dst-ip)
+    {:src-ip src-ip
+     :dst-ip dst-ip
+     :src-port (bit-and (.getShort buf) 0xFFFF)
+     :dst-port (bit-and (.getShort buf) 0xFFFF)
+     :protocol (bit-and (.get buf) 0xFF)
+     :af (bytes16->address-family src-ip)}))
+
+(defn encode-conntrack-value-unified
+  "Encode unified connection tracking value.
+   {orig_dst_ip (16) + orig_dst_port (2) + padding (2) + nat_dst_ip (16) + nat_dst_port (2) + padding (2) +
+    created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
+   Total: 96 bytes.
+   IPs in network byte order, counters in native order."
+  [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
+           created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev]}]
+  (let [buf (ByteBuffer/allocate CONNTRACK-VALUE-UNIFIED-SIZE)
+        zero-ip (byte-array 16)]
+    ;; IPs in network byte order
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.put buf ^bytes (or orig-dst-ip zero-ip))
+    (.putShort buf (unchecked-short (or orig-dst-port 0)))
+    (.putShort buf (short 0))  ; padding
+    (.put buf ^bytes (or nat-dst-ip zero-ip))
+    (.putShort buf (unchecked-short (or nat-dst-port 0)))
+    (.putShort buf (short 0))  ; padding
+    ;; Counters in native order (written by XDP/TC directly)
+    (.order buf (ByteOrder/nativeOrder))
+    (.putLong buf (or created-ns 0))
+    (.putLong buf (or last-seen 0))
+    (.putLong buf (or packets-fwd 0))
+    (.putLong buf (or packets-rev 0))
+    (.putLong buf (or bytes-fwd 0))
+    (.putLong buf (or bytes-rev 0))
+    (.array buf)))
+
+(defn decode-conntrack-value-unified
+  "Decode unified connection tracking value from byte array (96 bytes)."
+  [^bytes b]
+  (when (< (alength b) CONNTRACK-VALUE-UNIFIED-SIZE)
+    (throw (ex-info "Buffer too small for conntrack value" {:size (alength b)})))
+  (let [buf (ByteBuffer/wrap b)
+        orig-dst-ip (byte-array 16)
+        nat-dst-ip (byte-array 16)]
+    ;; IPs in network byte order
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (.get buf orig-dst-ip)
+    (let [orig-dst-port (bit-and (.getShort buf) 0xFFFF)
+          _ (.getShort buf)]  ; padding
+      (.get buf nat-dst-ip)
+      (let [nat-dst-port (bit-and (.getShort buf) 0xFFFF)
+            _ (.getShort buf)]  ; padding
+        ;; Counters in native order
+        (.order buf (ByteOrder/nativeOrder))
+        {:orig-dst-ip orig-dst-ip
+         :orig-dst-port orig-dst-port
+         :nat-dst-ip nat-dst-ip
+         :nat-dst-port nat-dst-port
+         :created-ns (.getLong buf)
+         :last-seen (.getLong buf)
+         :packets-fwd (.getLong buf)
+         :packets-rev (.getLong buf)
+         :bytes-fwd (.getLong buf)
+         :bytes-rev (.getLong buf)
+         :af (bytes16->address-family orig-dst-ip)}))))
+
+(defn encode-weighted-route-value-unified
+  "Encode unified weighted route value for BPF map.
+   target-group has :targets with :ip as 16-byte arrays, and :cumulative-weights.
+   flags is optional (default 0).
+
+   Format (max 168 bytes):
+   - Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+   - Per target (20 bytes each): ip(16) + port(2) + cumulative_weight(2)
+
+   IP bytes are stored in network byte order (big-endian)."
+  ([target-group] (encode-weighted-route-value-unified target-group 0))
+  ([target-group flags]
+   (let [targets (:targets target-group)
+         cumulative-weights (:cumulative-weights target-group)
+         target-count (count targets)
+         _ (when (> target-count WEIGHTED-ROUTE-MAX-TARGETS)
+             (throw (ex-info "Too many targets" {:count target-count :max WEIGHTED-ROUTE-MAX-TARGETS})))
+         ;; Always allocate max size for consistent map value size
+         buf (ByteBuffer/allocate WEIGHTED-ROUTE-UNIFIED-MAX-SIZE)]
+
+     ;; Header: target_count (1 byte)
+     (.order buf ByteOrder/BIG_ENDIAN)
+     (.put buf (unchecked-byte target-count))
+     ;; Reserved (3 bytes)
+     (.put buf (byte 0))
+     (.put buf (byte 0))
+     (.put buf (byte 0))
+     ;; Flags (2 bytes) in native order
+     (.order buf (ByteOrder/nativeOrder))
+     (.putShort buf (unchecked-short flags))
+     ;; Reserved (2 bytes)
+     (.putShort buf (short 0))
+
+     ;; Per-target entries
+     (.order buf ByteOrder/BIG_ENDIAN)
+     (doseq [[target cumulative-weight] (map vector targets cumulative-weights)]
+       (let [ip-bytes (:ip target)]
+         (.put buf ^bytes ip-bytes)  ; 16-byte IP
+         (.putShort buf (unchecked-short (:port target)))
+         (.putShort buf (unchecked-short cumulative-weight))))
+
+     ;; Zero-fill remaining target slots (20 bytes each)
+     (dotimes [_ (- WEIGHTED-ROUTE-MAX-TARGETS target-count)]
+       (.put buf (byte-array WEIGHTED-ROUTE-TARGET-UNIFIED-SIZE)))
+
+     (.array buf))))
+
+(defn decode-weighted-route-value-unified
+  "Decode unified weighted route value from byte array (168 bytes).
+   Returns {:target-count :flags :targets} where targets is a vector of
+   {:ip <16-byte-array> :port :cumulative-weight} maps."
+  [^bytes b]
+  (when (< (alength b) WEIGHTED-ROUTE-UNIFIED-MAX-SIZE)
+    (throw (ex-info "Buffer too small for unified weighted route"
+                   {:size (alength b) :expected WEIGHTED-ROUTE-UNIFIED-MAX-SIZE})))
+  (let [buf (ByteBuffer/wrap b)]
+    ;; Header
+    (.order buf ByteOrder/BIG_ENDIAN)
+    (let [target-count (bit-and (.get buf) 0xFF)
+          _ (.get buf)  ; reserved
+          _ (.get buf)  ; reserved
+          _ (.get buf)  ; reserved
+          ;; Flags in native order
+          _ (.order buf (ByteOrder/nativeOrder))
+          flags (bit-and (.getShort buf) 0xFFFF)
+          _ (.getShort buf)  ; reserved
+          ;; Targets in network byte order
+          _ (.order buf ByteOrder/BIG_ENDIAN)
+          targets (vec (for [_ (range target-count)]
+                         (let [ip-bytes (byte-array 16)]
+                           (.get buf ip-bytes)
+                           {:ip ip-bytes
+                            :port (bit-and (.getShort buf) 0xFFFF)
+                            :cumulative-weight (bit-and (.getShort buf) 0xFFFF)})))]
+      {:target-count target-count
+       :flags flags
+       :targets targets})))
+
+(defn weighted-route-unified-value-size
+  "Return the fixed size of unified weighted route values (168 bytes)."
+  []
+  WEIGHTED-ROUTE-UNIFIED-MAX-SIZE)
 
 ;;; =============================================================================
 ;;; SNI Hostname Hashing (for TLS SNI-based routing)
@@ -576,9 +1004,11 @@
 (def IPPROTO-ICMP 1)
 (def IPPROTO-TCP 6)
 (def IPPROTO-UDP 17)
+(def IPPROTO-ICMPV6 58)
 
 (def ETH-HLEN 14)
 (def IP-HLEN-MIN 20)
+(def IPV6-HLEN 40)
 (def TCP-HLEN-MIN 20)
 (def UDP-HLEN 8)
 
