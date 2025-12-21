@@ -1,6 +1,6 @@
-# QEMU ARM64 Testing for clj-ebpf-reverse-proxy
+# QEMU ARM64 Testing for clj-ebpf-lb
 
-This directory contains tools for running clj-ebpf-reverse-proxy tests on an ARM64 Linux virtual machine using QEMU system emulation.
+This directory contains tools for running clj-ebpf-lb tests on an ARM64 Linux virtual machine using QEMU system emulation.
 
 ## Overview
 
@@ -74,7 +74,7 @@ ssh -p 2222 ubuntu@localhost
 
 Run tests manually:
 ```bash
-cd /home/ubuntu/clj-ebpf-reverse-proxy
+cd /home/ubuntu/clj-ebpf-lb
 sudo clojure -M:test
 ```
 

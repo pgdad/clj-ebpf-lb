@@ -1,4 +1,4 @@
-(ns reverse-proxy.util
+(ns lb.util
   "Utility functions for IP address conversion, CIDR parsing, and binary encoding."
   (:require [clojure.string :as str])
   (:import [java.nio ByteBuffer ByteOrder]

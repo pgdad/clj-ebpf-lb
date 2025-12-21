@@ -1,7 +1,7 @@
-(ns reverse-proxy.util-test
+(ns lb.util-test
   "Tests for utility functions."
   (:require [clojure.test :refer [deftest testing is are]]
-            [reverse-proxy.util :as util]))
+            [lb.util :as util]))
 
 ;;; =============================================================================
 ;;; IP Address Conversion Tests

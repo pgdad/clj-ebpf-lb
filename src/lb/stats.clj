@@ -1,9 +1,9 @@
-(ns reverse-proxy.stats
-  "Statistics streaming and aggregation for the reverse proxy.
+(ns lb.stats
+  "Statistics streaming and aggregation for the load balancer.
    Consumes events from the eBPF ring buffer and provides real-time stats."
   (:require [clj-ebpf.core :as bpf]
-            [reverse-proxy.util :as util]
-            [reverse-proxy.maps :as maps]
+            [lb.util :as util]
+            [lb.maps :as maps]
             [clojure.tools.logging :as log]
             [clojure.core.async :as async :refer [go go-loop <! >! >!! <!! chan
                                                   sliding-buffer close! timeout

@@ -1,8 +1,8 @@
-(ns reverse-proxy.maps
-  "eBPF map management for the reverse proxy.
+(ns lb.maps
+  "eBPF map management for the load balancer.
    Provides functions to create, operate on, and close all required maps."
   (:require [clj-ebpf.core :as bpf]
-            [reverse-proxy.util :as util]
+            [lb.util :as util]
             [clojure.tools.logging :as log]))
 
 ;;; =============================================================================

@@ -1,6 +1,6 @@
 # Examples
 
-This directory contains example configurations and usage patterns for the clj-ebpf-reverse-proxy.
+This directory contains example configurations and usage patterns for clj-ebpf-lb.
 
 ## Quick Reference
 
@@ -36,11 +36,11 @@ The simplest configuration: forward all traffic on port 80 to a single backend.
 # Terminal 1: Start a test backend server
 python3 -m http.server 8080
 
-# Terminal 2: Run the proxy
-cd /path/to/clj-ebpf-reverse-proxy
+# Terminal 2: Run the load balancer
+cd /path/to/clj-ebpf-lb
 sudo clojure -M:run -c examples/simple-proxy.edn
 
-# Terminal 3: Test the proxy
+# Terminal 3: Test the load balancer
 curl http://localhost:80
 ```
 
@@ -143,7 +143,7 @@ sudo clojure -M:dev
 ```
 
 The example demonstrates:
-- Initializing the proxy programmatically
+- Initializing the load balancer programmatically
 - Adding/removing proxies at runtime
 - Adding/removing source routes
 - Querying connections and statistics
@@ -260,8 +260,8 @@ ip link show eth0
 
 ```clojure
 ;; Switch between backends by updating the default target
-(proxy/remove-proxy! "web")
-(proxy/add-proxy!
+(lb/remove-proxy! "web")
+(lb/add-proxy!
   {:name "web"
    :listen {:interfaces ["eth0"] :port 80}
    :default-target {:ip "10.0.0.2" :port 8080}})  ; Green backend
@@ -271,7 +271,7 @@ ip link show eth0
 
 ```clojure
 ;; Route specific IPs to canary backend
-(proxy/add-source-route! "web" "192.168.1.0/24"
+(lb/add-source-route! "web" "192.168.1.0/24"
                          {:ip "10.0.0.3" :port 8080})  ; Canary backend
 ```
 
@@ -279,8 +279,8 @@ ip link show eth0
 
 ```clojure
 ;; Redirect all traffic to maintenance page server
-(proxy/remove-proxy! "web")
-(proxy/add-proxy!
+(lb/remove-proxy! "web")
+(lb/add-proxy!
   {:name "web"
    :listen {:interfaces ["eth0"] :port 80}
    :default-target {:ip "10.0.0.99" :port 8080}})  ; Maintenance server
@@ -289,5 +289,5 @@ ip link show eth0
 ## Next Steps
 
 - Read the main [README.md](../README.md) for complete documentation
-- Explore the [source code](../src/reverse_proxy/) for implementation details
+- Explore the [source code](../src/lb/) for implementation details
 - Check out [clj-ebpf](https://github.com/pgdad/clj-ebpf) for the underlying eBPF library

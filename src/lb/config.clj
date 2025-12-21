@@ -1,10 +1,10 @@
-(ns reverse-proxy.config
-  "Configuration management for the reverse proxy.
+(ns lb.config
+  "Configuration management for the load balancer.
    Handles configuration data structures, validation, and persistence."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.spec.alpha :as s]
-            [reverse-proxy.util :as util]
+            [lb.util :as util]
             [clojure.tools.logging :as log]))
 
 ;;; =============================================================================
@@ -534,7 +534,7 @@
 (defn format-config
   "Format full configuration for display."
   [^Config config]
-  (str "=== Reverse Proxy Configuration ===\n\n"
+  (str "=== Load Balancer Configuration ===\n\n"
        (clojure.string/join "\n\n" (map format-proxy (:proxies config)))
        "\n\n=== Settings ===\n"
        "  Stats enabled: " (get-in config [:settings :stats-enabled]) "\n"

@@ -1,8 +1,8 @@
-(ns reverse-proxy.config-test
+(ns lb.config-test
   "Tests for configuration management."
   (:require [clojure.test :refer [deftest testing is are]]
-            [reverse-proxy.config :as config]
-            [reverse-proxy.util :as util]))
+            [lb.config :as config]
+            [lb.util :as util]))
 
 ;;; =============================================================================
 ;;; Configuration Parsing Tests

@@ -1,12 +1,12 @@
-(ns reverse-proxy.health-test
+(ns lb.health-test
   "Comprehensive tests for the health checking system."
   (:require [clojure.test :refer [deftest testing is are use-fixtures]]
-            [reverse-proxy.health :as health]
-            [reverse-proxy.health.checker :as checker]
-            [reverse-proxy.health.weights :as weights]
-            [reverse-proxy.health.manager :as manager]
-            [reverse-proxy.config :as config]
-            [reverse-proxy.util :as util])
+            [lb.health :as health]
+            [lb.health.checker :as checker]
+            [lb.health.weights :as weights]
+            [lb.health.manager :as manager]
+            [lb.config :as config]
+            [lb.util :as util])
   (:import [java.net ServerSocket InetSocketAddress]
            [java.io File FileInputStream]
            [java.security KeyStore]

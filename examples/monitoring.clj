@@ -6,14 +6,14 @@
 ;;   (load-file "examples/monitoring.clj")
 ;;
 ;; Prerequisites:
-;;   - A running proxy with stats-enabled: true
-;;   - Traffic flowing through the proxy
+;;   - A running load balancer with stats-enabled: true
+;;   - Traffic flowing through the load balancer
 
 (ns examples.monitoring
-  (:require [reverse-proxy.core :as proxy]
-            [reverse-proxy.config :as config]
-            [reverse-proxy.stats :as stats]
-            [reverse-proxy.conntrack :as conntrack]
+  (:require [lb.core :as lb]
+            [lb.config :as config]
+            [lb.stats :as stats]
+            [lb.conntrack :as conntrack]
             [clojure.core.async :as async :refer [<! <!! >!! go-loop]]
             [clojure.pprint :refer [pprint]]))
 
@@ -22,7 +22,7 @@
 ;; =============================================================================
 
 (comment
-  ;; First, ensure the proxy is running with stats enabled
+  ;; First, ensure the load balancer is running with stats enabled
   (def cfg (config/make-simple-config
              {:interface "eth0"
               :port 8888
@@ -30,14 +30,14 @@
               :target-port 8080
               :stats-enabled true}))  ; Important!
 
-  (proxy/init! cfg)
+  (lb/init! cfg)
 
   ;; Verify stats are enabled
-  (proxy/stats-enabled?)
+  (lb/stats-enabled?)
   ;; => true
 
   ;; Get aggregate connection statistics
-  (pprint (proxy/get-connection-stats))
+  (pprint (lb/get-connection-stats))
   ;; => {:total-connections 10
   ;;     :total-packets-forward 1234
   ;;     :total-bytes-forward 567890
@@ -51,10 +51,10 @@
 
 (comment
   ;; Start the stats event stream
-  (proxy/start-stats-stream!)
+  (lb/start-stats-stream!)
 
   ;; Subscribe to receive events
-  (def event-channel (proxy/subscribe-to-stats))
+  (def event-channel (lb/subscribe-to-stats))
 
   ;; Read events as they come in
   (go-loop []
@@ -63,7 +63,7 @@
       (recur)))
 
   ;; Generate some traffic, then stop
-  (proxy/stop-stats-stream!))
+  (lb/stop-stats-stream!))
 
 ;; =============================================================================
 ;; 3. Connection Statistics by Source/Target
@@ -72,7 +72,7 @@
 (comment
   ;; Get statistics grouped by source IP
   (pprint (conntrack/stats-by-source
-            (get-in (proxy/get-state) [:maps :conntrack-map])))
+            (get-in (lb/get-state) [:maps :conntrack-map])))
   ;; => ({:source-ip "192.168.1.100"
   ;;      :connection-count 5
   ;;      :packets-forward 500
@@ -83,7 +83,7 @@
 
   ;; Get statistics grouped by target (backend)
   (pprint (conntrack/stats-by-target
-            (get-in (proxy/get-state) [:maps :conntrack-map])))
+            (get-in (lb/get-state) [:maps :conntrack-map])))
   ;; => ({:target-ip "10.0.0.1"
   ;;      :connection-count 8
   ;;      :packets-forward 800
@@ -93,7 +93,7 @@
 
   ;; Get statistics by protocol
   (pprint (conntrack/stats-by-protocol
-            (get-in (proxy/get-state) [:maps :conntrack-map])))
+            (get-in (lb/get-state) [:maps :conntrack-map])))
   ;; => ({:protocol :tcp, :connection-count 15, ...}
   ;;     {:protocol :udp, :connection-count 3, ...})
   )
@@ -106,9 +106,9 @@
   "Start a rate monitor that prints stats every second."
   []
   (println "Starting rate monitor...")
-  (proxy/start-stats-stream!)
+  (lb/start-stats-stream!)
   (let [rate-calc (stats/create-rate-calculator :window-ms 1000)
-        event-ch (proxy/subscribe-to-stats)
+        event-ch (lb/subscribe-to-stats)
         running (atom true)]
 
     ;; Forward events to rate calculator
@@ -134,7 +134,7 @@
     {:stop-fn (fn []
                 (reset! running false)
                 (stats/stop-rate-calculator rate-calc)
-                (proxy/stop-stats-stream!)
+                (lb/stop-stats-stream!)
                 (println "Rate monitor stopped."))}))
 
 (comment
@@ -155,9 +155,9 @@
   "Start aggregating statistics for analysis."
   []
   (println "Starting stats aggregator...")
-  (proxy/start-stats-stream!)
+  (lb/start-stats-stream!)
   (let [aggregator (stats/create-stats-aggregator)
-        event-ch (proxy/subscribe-to-stats)
+        event-ch (lb/subscribe-to-stats)
         running (atom true)]
 
     ;; Forward events to aggregator
@@ -171,7 +171,7 @@
      :stop-fn (fn []
                 (reset! running false)
                 (stats/stop-stats-aggregator aggregator)
-                (proxy/stop-stats-stream!)
+                (lb/stop-stats-stream!)
                 (println "Aggregator stopped."))}))
 
 (comment
@@ -212,23 +212,23 @@
 (defn process-with-handlers
   "Process events with custom handlers."
   []
-  (proxy/start-stats-stream!)
-  (let [event-ch (proxy/subscribe-to-stats)]
+  (lb/start-stats-stream!)
+  (let [event-ch (lb/subscribe-to-stats)]
     (stats/process-events-with-handlers event-ch
       {:on-new-conn
        (fn [event]
          (println "NEW CONNECTION:"
                   (format "%s:%d -> %s:%d"
-                          (reverse-proxy.util/u32->ip-string (:src-ip event))
+                          (lb.util/u32->ip-string (:src-ip event))
                           (:src-port event)
-                          (reverse-proxy.util/u32->ip-string (:target-ip event))
+                          (lb.util/u32->ip-string (:target-ip event))
                           (:target-port event))))
 
        :on-closed
        (fn [event]
          (println "CONNECTION CLOSED:"
                   (format "%s:%d (packets: %d/%d)"
-                          (reverse-proxy.util/u32->ip-string (:src-ip event))
+                          (lb.util/u32->ip-string (:src-ip event))
                           (:src-port event)
                           (:packets-fwd event)
                           (:packets-rev event))))
@@ -245,7 +245,7 @@
   ;; Generate traffic and watch the output
 
   ;; Stop
-  (proxy/stop-stats-stream!))
+  (lb/stop-stats-stream!))
 
 ;; =============================================================================
 ;; 7. Dashboard-Style Monitor
@@ -259,15 +259,15 @@
     (future
       (while @running
         (print "\033[2J\033[H")  ; Clear screen
-        (println "=== Reverse Proxy Dashboard ===")
+        (println "=== Load Balancer Dashboard ===")
         (println)
-        (proxy/print-status)
+        (lb/print-status)
         (println)
         (println "--- Active Connections ---")
-        (proxy/print-connections)
+        (lb/print-connections)
         (println)
         (println "--- Connection Stats ---")
-        (pprint (proxy/get-connection-stats))
+        (pprint (lb/get-connection-stats))
         (Thread/sleep 2000)))
     {:stop-fn #(reset! running false)}))
 

@@ -1,18 +1,18 @@
-(ns reverse-proxy.core
-  "Core API for the eBPF reverse proxy.
+(ns lb.core
+  "Core API for the eBPF load balancer.
    Provides high-level functions for initialization, configuration, and management."
   (:require [clj-ebpf.core :as bpf]
-            [reverse-proxy.config :as config]
-            [reverse-proxy.maps :as maps]
-            [reverse-proxy.programs.xdp-ingress :as xdp]
-            [reverse-proxy.programs.tc-egress :as tc]
-            [reverse-proxy.conntrack :as conntrack]
-            [reverse-proxy.stats :as stats]
-            [reverse-proxy.health :as health]
-            [reverse-proxy.util :as util]
+            [lb.config :as config]
+            [lb.maps :as maps]
+            [lb.programs.xdp-ingress :as xdp]
+            [lb.programs.tc-egress :as tc]
+            [lb.conntrack :as conntrack]
+            [lb.stats :as stats]
+            [lb.health :as health]
+            [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
-  (:import [reverse_proxy.config TargetGroup])
+  (:import [lb.config TargetGroup])
   (:gen-class))
 
 ;;; =============================================================================
@@ -68,7 +68,7 @@
   (when (running?)
     (throw (ex-info "Proxy is already running" {})))
 
-  (log/info "Initializing eBPF reverse proxy")
+  (log/info "Initializing eBPF load balancer")
 
   ;; Verify BPF availability
   (bpf/init!)
@@ -117,7 +117,7 @@
               ;; Register health checks if enabled
               (register-health-checks! ebpf-maps config)
 
-              (log/info "Reverse proxy initialized successfully")
+              (log/info "Load balancer initialized successfully")
               state))))
 
       (catch Exception e
@@ -129,7 +129,7 @@
   "Shutdown the reverse proxy and release all resources."
   []
   (when-let [state @proxy-state]
-    (log/info "Shutting down reverse proxy")
+    (log/info "Shutting down load balancer")
 
     ;; Stop health checking
     (unregister-health-checks! (:config state))
@@ -158,7 +158,7 @@
     ;; Clear state
     (set-state! nil)
 
-    (log/info "Reverse proxy shutdown complete")))
+    (log/info "Load balancer shutdown complete")))
 
 ;;; =============================================================================
 ;;; Configuration Application
@@ -466,10 +466,10 @@
     {:running false}))
 
 (defn print-status
-  "Print current proxy status."
+  "Print current load balancer status."
   []
   (let [status (get-status)]
-    (println "=== Reverse Proxy Status ===")
+    (println "=== Load Balancer Status ===")
     (println (format "Running:             %s" (:running status)))
     (when (:running status)
       (println (format "Attached interfaces: %s" (clojure.string/join ", " (:attached-interfaces status))))
@@ -581,16 +581,16 @@
    ["-h" "--help" "Show help"]])
 
 (defn usage [options-summary]
-  (->> ["eBPF Reverse Proxy"
+  (->> ["eBPF Load Balancer"
         ""
-        "Usage: reverse-proxy [options]"
+        "Usage: clj-ebpf-lb [options]"
         ""
         "Options:"
         options-summary
         ""
         "Examples:"
-        "  reverse-proxy -c proxy.edn"
-        "  reverse-proxy -i eth0 -p 80 -t 10.0.0.1:8080"
+        "  clj-ebpf-lb -c lb.edn"
+        "  clj-ebpf-lb -i eth0 -p 80 -t 10.0.0.1:8080"
         ""]
        (clojure.string/join \newline)))
 
@@ -638,7 +638,7 @@
           (init! config)
 
           ;; Wait for shutdown signal
-          (println "Reverse proxy running. Press Ctrl+C to stop.")
+          (println "Load balancer running. Press Ctrl+C to stop.")
           (.addShutdownHook (Runtime/getRuntime)
             (Thread. #(do
                         (println "\nShutting down...")
@@ -648,6 +648,6 @@
           @(promise))
 
         (catch Exception e
-          (log/error e "Failed to start reverse proxy")
+          (log/error e "Failed to start load balancer")
           (println "Error:" (.getMessage e))
           (System/exit 1))))))

@@ -1,6 +1,6 @@
-;; Example configuration for the eBPF reverse proxy
+;; Example configuration for the eBPF load balancer
 ;;
-;; This file defines the proxy configuration including:
+;; This file defines the load balancer configuration including:
 ;; - Listen interfaces and ports
 ;; - Default backend targets
 ;; - Source-based routing rules

@@ -1,11 +1,11 @@
-(ns reverse-proxy.health.manager
+(ns lb.health.manager
   "Health check orchestration using virtual threads.
    Manages health state for all targets and triggers weight updates."
   (:require [clojure.tools.logging :as log]
-            [reverse-proxy.health.checker :as checker]
-            [reverse-proxy.health.weights :as weights]
-            [reverse-proxy.util :as util]
-            [reverse-proxy.config :as config])
+            [lb.health.checker :as checker]
+            [lb.health.weights :as weights]
+            [lb.util :as util]
+            [lb.config :as config])
   (:import [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
            [java.util.concurrent.locks ReentrantLock]))
 

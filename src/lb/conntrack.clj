@@ -1,8 +1,8 @@
-(ns reverse-proxy.conntrack
-  "Connection tracking management for the reverse proxy.
+(ns lb.conntrack
+  "Connection tracking management for the load balancer.
    Provides utilities for monitoring, cleaning, and querying connection state."
-  (:require [reverse-proxy.maps :as maps]
-            [reverse-proxy.util :as util]
+  (:require [lb.maps :as maps]
+            [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.core.async :as async :refer [go-loop <! >! chan timeout close!]]))
 

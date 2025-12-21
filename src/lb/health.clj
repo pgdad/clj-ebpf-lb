@@ -1,11 +1,11 @@
-(ns reverse-proxy.health
+(ns lb.health
   "Public API for health checking system.
    Provides a simple interface for managing health-aware load balancing."
-  (:require [reverse-proxy.health.manager :as manager]
-            [reverse-proxy.health.checker :as checker]
-            [reverse-proxy.health.weights :as weights]
-            [reverse-proxy.config :as config]
-            [reverse-proxy.util :as util]
+  (:require [lb.health.manager :as manager]
+            [lb.health.checker :as checker]
+            [lb.health.weights :as weights]
+            [lb.config :as config]
+            [lb.util :as util]
             [clojure.tools.logging :as log]))
 
 ;;; =============================================================================

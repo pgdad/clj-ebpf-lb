@@ -1,12 +1,12 @@
-(ns reverse-proxy.nat-e2e-test
+(ns lb.nat-e2e-test
   "End-to-end tests for the NAT path.
    Tests XDP DNAT and TC SNAT programs with map operations."
   (:require [clojure.test :refer :all]
-            [reverse-proxy.maps :as maps]
-            [reverse-proxy.util :as util]
-            [reverse-proxy.conntrack :as conntrack]
-            [reverse-proxy.programs.xdp-ingress :as xdp]
-            [reverse-proxy.programs.tc-egress :as tc]
+            [lb.maps :as maps]
+            [lb.util :as util]
+            [lb.conntrack :as conntrack]
+            [lb.programs.xdp-ingress :as xdp]
+            [lb.programs.tc-egress :as tc]
             [clj-ebpf.core :as bpf]))
 
 ;;; =============================================================================
@@ -384,4 +384,4 @@
 ;;; =============================================================================
 
 (defn run-all-nat-tests []
-  (clojure.test/run-tests 'reverse-proxy.nat-e2e-test))
+  (clojure.test/run-tests 'lb.nat-e2e-test))

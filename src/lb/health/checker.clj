@@ -1,8 +1,8 @@
-(ns reverse-proxy.health.checker
+(ns lb.health.checker
   "Health check implementations for TCP and HTTP protocols.
    Uses virtual threads for efficient concurrent checking."
   (:require [clojure.tools.logging :as log]
-            [reverse-proxy.util :as util])
+            [lb.util :as util])
   (:import [java.net Socket InetSocketAddress]
            [java.net.http HttpClient HttpClient$Redirect HttpRequest HttpResponse$BodyHandlers]
            [java.time Duration]

@@ -1,5 +1,5 @@
-(ns reverse-proxy.programs.xdp-ingress
-  "XDP ingress program for the reverse proxy.
+(ns lb.programs.xdp-ingress
+  "XDP ingress program for the load balancer.
    Handles incoming packets: parses headers, looks up routing, performs DNAT."
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
@@ -11,7 +11,7 @@
             [clj-ebpf.net.udp :as udp]
             [clj-ebpf.net.checksum :as csum]
             [clj-ebpf.net.nat :as nat]
-            [reverse-proxy.programs.common :as common]
+            [lb.programs.common :as common]
             [clojure.tools.logging :as log]))
 
 ;;; =============================================================================

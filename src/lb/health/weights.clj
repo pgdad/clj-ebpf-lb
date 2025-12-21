@@ -1,9 +1,9 @@
-(ns reverse-proxy.health.weights
+(ns lb.health.weights
   "Weight redistribution logic for health-aware load balancing.
    Computes effective weights based on target health status."
   (:require [clojure.tools.logging :as log]
-            [reverse-proxy.util :as util]
-            [reverse-proxy.config :as config]))
+            [lb.util :as util]
+            [lb.config :as config]))
 
 ;;; =============================================================================
 ;;; Weight Calculation

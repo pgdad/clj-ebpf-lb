@@ -1,5 +1,5 @@
-(ns reverse-proxy.programs.tc-egress
-  "TC egress program for the reverse proxy.
+(ns lb.programs.tc-egress
+  "TC egress program for the load balancer.
    Handles reply packets from backends: performs SNAT to restore original destination."
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
@@ -11,7 +11,7 @@
             [clj-ebpf.net.udp :as udp]
             [clj-ebpf.net.checksum :as csum]
             [clj-ebpf.net.nat :as nat]
-            [reverse-proxy.programs.common :as common]
+            [lb.programs.common :as common]
             [clojure.tools.logging :as log]))
 
 ;;; =============================================================================

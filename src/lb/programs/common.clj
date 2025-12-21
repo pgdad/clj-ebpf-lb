@@ -1,4 +1,4 @@
-(ns reverse-proxy.programs.common
+(ns lb.programs.common
   "Common eBPF program fragments and DSL utilities shared between XDP and TC programs."
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]))

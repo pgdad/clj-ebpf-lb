@@ -1,10 +1,10 @@
-(ns reverse-proxy.xdp-load-test
+(ns lb.xdp-load-test
   "Test loading and running XDP program on a veth interface."
   (:require [clojure.test :refer [deftest testing is]]
             [clj-ebpf.core :as bpf]
-            [reverse-proxy.maps :as maps]
-            [reverse-proxy.programs.xdp-ingress :as xdp]
-            [reverse-proxy.util :as util]
+            [lb.maps :as maps]
+            [lb.programs.xdp-ingress :as xdp]
+            [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.java.shell :refer [sh]]))
 
@@ -228,7 +228,7 @@
 (defn run-xdp-load-tests
   "Run all XDP load tests."
   []
-  (clojure.test/run-tests 'reverse-proxy.xdp-load-test))
+  (clojure.test/run-tests 'lb.xdp-load-test))
 
 (defn manual-test
   "Manual interactive test - keeps XDP attached for inspection.

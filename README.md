@@ -1,6 +1,6 @@
-# clj-ebpf-reverse-proxy
+# clj-ebpf-lb
 
-A high-performance eBPF-based reverse proxy written in Clojure. Uses XDP (eXpress Data Path) for ingress DNAT and TC (Traffic Control) for egress SNAT, providing kernel-level packet processing for efficient Layer 4 load balancing.
+A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP (eXpress Data Path) for ingress DNAT and TC (Traffic Control) for egress SNAT, providing kernel-level packet processing for efficient traffic distribution. Can also be used as a simple reverse proxy.
 
 ## Features
 
@@ -49,8 +49,8 @@ A high-performance eBPF-based reverse proxy written in Clojure. Uses XDP (eXpres
 
 3. **Clone the repository**:
    ```bash
-   git clone https://github.com/pgdad/clj-ebpf-reverse-proxy.git
-   cd clj-ebpf-reverse-proxy
+   git clone https://github.com/pgdad/clj-ebpf-lb.git
+   cd clj-ebpf-lb
    ```
 
 ## Quick Start
@@ -68,15 +68,15 @@ A high-performance eBPF-based reverse proxy written in Clojure. Uses XDP (eXpres
      :connection-timeout-sec 300}}
    ```
 
-2. **Run the proxy**:
+2. **Run the load balancer**:
    ```bash
-   sudo clojure -M:run -c proxy.edn
+   sudo clojure -M:run -c lb.edn
    ```
 
 ### Command Line Options
 
 ```
-Usage: reverse-proxy [options]
+Usage: clj-ebpf-lb [options]
 
 Options:
   -c, --config FILE       Configuration file path (default: config.edn)
@@ -88,9 +88,9 @@ Options:
   -h, --help              Show help
 
 Examples:
-  reverse-proxy -c proxy.edn
-  reverse-proxy -i eth0 -p 80 -t 10.0.0.1:8080
-  reverse-proxy -i eth0 -i eth1 -p 443 -t 10.0.0.2:8443 --stats
+  clj-ebpf-lb -c lb.edn
+  clj-ebpf-lb -i eth0 -p 80 -t 10.0.0.1:8080
+  clj-ebpf-lb -i eth0 -i eth1 -p 443 -t 10.0.0.2:8443 --stats
 ```
 
 ## Configuration
@@ -258,11 +258,11 @@ When a backend recovers, traffic is gradually restored to prevent overwhelming i
 
 ## Programmatic API
 
-Use the proxy as a library in your Clojure application:
+Use the load balancer as a library in your Clojure application:
 
 ```clojure
-(require '[reverse-proxy.core :as proxy]
-         '[reverse-proxy.config :as config])
+(require '[lb.core :as lb]
+         '[lb.config :as config])
 
 ;; Create configuration
 (def cfg (config/make-simple-config
@@ -272,63 +272,63 @@ Use the proxy as a library in your Clojure application:
             :target-port 8080
             :stats-enabled true}))
 
-;; Initialize the proxy
-(proxy/init! cfg)
+;; Initialize the load balancer
+(lb/init! cfg)
 
 ;; Check status
-(proxy/get-status)
+(lb/get-status)
 ;; => {:running true, :attached-interfaces ["eth0"], ...}
 
 ;; Add a source route at runtime (single target)
-(proxy/add-source-route! "web" "192.168.1.0/24"
+(lb/add-source-route! "web" "192.168.1.0/24"
                          {:ip "10.0.0.2" :port 8080})
 
 ;; Add a weighted source route at runtime
-(proxy/add-source-route! "web" "10.10.0.0/16"
+(lb/add-source-route! "web" "10.10.0.0/16"
                          [{:ip "10.0.0.3" :port 8080 :weight 70}
                           {:ip "10.0.0.4" :port 8080 :weight 30}])
 
 ;; Get active connections
-(proxy/get-connections)
+(lb/get-connections)
 
 ;; Print connection statistics
-(proxy/print-connections)
+(lb/print-connections)
 
 ;; Shutdown
-(proxy/shutdown!)
+(lb/shutdown!)
 ```
 
 ### Runtime Configuration
 
 ```clojure
 ;; Add a new proxy at runtime
-(proxy/add-proxy!
+(lb/add-proxy!
   {:name "api"
    :listen {:interfaces ["eth0"] :port 8080}
    :default-target {:ip "10.0.1.1" :port 3000}})
 
 ;; Remove a proxy
-(proxy/remove-proxy! "api")
+(lb/remove-proxy! "api")
 
 ;; Add/remove source routes
-(proxy/add-source-route! "web" "10.20.0.0/16" {:ip "10.0.0.5" :port 8080})
-(proxy/remove-source-route! "web" "10.20.0.0/16")
+(lb/add-source-route! "web" "10.20.0.0/16" {:ip "10.0.0.5" :port 8080})
+(lb/remove-source-route! "web" "10.20.0.0/16")
 
 ;; Attach/detach interfaces
-(proxy/attach-interfaces! ["eth1" "eth2"])
-(proxy/detach-interfaces! ["eth2"])
+(lb/attach-interfaces! ["eth1" "eth2"])
+(lb/detach-interfaces! ["eth2"])
 ```
 
 ### Statistics and Monitoring
 
 ```clojure
 ;; Enable/disable stats
-(proxy/enable-stats!)
-(proxy/disable-stats!)
+(lb/enable-stats!)
+(lb/disable-stats!)
 
 ;; Get connection statistics
-(proxy/get-connection-count)
-(proxy/get-connection-stats)
+(lb/get-connection-count)
+(lb/get-connection-stats)
 ;; => {:total-connections 42
 ;;     :total-packets-forward 12345
 ;;     :total-bytes-forward 987654
@@ -336,17 +336,17 @@ Use the proxy as a library in your Clojure application:
 ;;     :total-bytes-reverse 876543}
 
 ;; Start streaming statistics
-(proxy/start-stats-stream!)
-(let [ch (proxy/subscribe-to-stats)]
+(lb/start-stats-stream!)
+(let [ch (lb/subscribe-to-stats)]
   ;; Read events from channel
   (async/<! ch))
-(proxy/stop-stats-stream!)
+(lb/stop-stats-stream!)
 ```
 
 ### Health Checking API
 
 ```clojure
-(require '[reverse-proxy.health :as health])
+(require '[lb.health :as health])
 
 ;; Start/stop health checking system
 (health/start!)
@@ -487,7 +487,7 @@ See `qemu-arm64/README.md` for detailed ARM64 testing documentation.
 clojure -X:uberjar
 
 # Run the uberjar
-sudo java -jar target/reverse-proxy.jar -c proxy.edn
+sudo java -jar target/clj-ebpf-lb.jar -c lb.edn
 ```
 
 ## Troubleshooting
@@ -505,8 +505,8 @@ sudo java -jar target/reverse-proxy.jar -c proxy.edn
 
 **"Connection not being NAT'd"**
 - Verify listen port is configured: check configuration file
-- Ensure interface is attached: `(proxy/list-attached-interfaces)`
-- Check conntrack entries: `(proxy/get-connections)`
+- Ensure interface is attached: `(lb/list-attached-interfaces)`
+- Check conntrack entries: `(lb/get-connections)`
 
 ### Debugging
 
@@ -536,3 +536,7 @@ Copyright (c) 2025. All rights reserved.
 - [clj-ebpf](https://github.com/pgdad/clj-ebpf) - The underlying eBPF library for Clojure
 - [XDP Tutorial](https://github.com/xdp-project/xdp-tutorial) - Learn more about XDP programming
 - [TC BPF](https://docs.cilium.io/en/stable/bpf/) - Traffic Control with BPF
+
+---
+
+**Note**: This project was previously named `clj-ebpf-reverse-proxy`. The core functionality remains the same, but the name was changed to better reflect the weighted load balancing capabilities.
