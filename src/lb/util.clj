@@ -252,6 +252,9 @@
 (def ^:const WEIGHTED-ROUTE-MAX-SIZE
   (+ WEIGHTED-ROUTE-HEADER-SIZE (* WEIGHTED-ROUTE-MAX-TARGETS WEIGHTED-ROUTE-TARGET-SIZE)))
 
+;; Route flags (stored in header bytes 4-5)
+(def ^:const FLAG-SESSION-PERSISTENCE 0x0001)
+
 (defn encode-weighted-route-value
   "Encode weighted route value for BPF map.
    target-group is a TargetGroup record with :targets and :cumulative-weights.

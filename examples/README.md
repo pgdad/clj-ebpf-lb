@@ -19,6 +19,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [prometheus_metrics.clj](#prometheus-metrics) | Prometheus metrics export | Intermediate |
 | [circuit_breaker.clj](#circuit-breaker) | Automatic failure detection and recovery | Advanced |
 | [least_connections.clj](#least-connections) | Dynamic weight adjustment based on connections | Intermediate |
+| [session_persistence.clj](#session-persistence) | Sticky sessions based on source IP hash | Intermediate |
 
 ## Prerequisites
 
@@ -526,6 +527,73 @@ Effective weights: [82, 18]
 - Simple HTTP APIs with short requests
 - Stateless microservices
 - When you need explicit traffic ratios
+
+---
+
+### Session Persistence
+
+Sticky sessions based on source IP hashing to route clients consistently to the same backend.
+
+**File: `session_persistence.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'session-persistence) (session-persistence/-main)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'session-persistence)
+(session-persistence/-main)
+```
+
+The example demonstrates:
+- Enabling sticky sessions with `:session-persistence true`
+- How source IP hashing ensures consistent backend selection
+- Per-route session persistence configuration
+- Use cases and best practices
+
+**Configuration**:
+```clojure
+{:proxies
+ [{:name "sticky-api"
+   :listen {:interfaces ["eth0"] :port 8080}
+   :session-persistence true  ; Enable sticky sessions
+   :default-target
+   [{:ip "10.0.0.1" :port 8080 :weight 50}
+    {:ip "10.0.0.2" :port 8080 :weight 50}]}]}
+```
+
+**Per-route configuration**:
+```clojure
+{:source-routes
+ [{:source "10.0.0.0/8"
+   :target {:ip "10.0.0.1" :port 8080}
+   :session-persistence true}]}
+```
+
+**Hash algorithm**:
+```
+selection_value = (source_ip * FNV_PRIME) % 100
+```
+
+Same source IP always produces the same hash, selecting the same backend (unless weights change or backend becomes unhealthy).
+
+**When to use session persistence**:
+- Shopping cart applications
+- User login sessions
+- WebSocket connections
+- Gaming servers with player state
+- File upload/download resumption
+
+**When NOT to use**:
+- Stateless microservices
+- Short-lived requests
+- When backends have unequal capacity
+- During canary deployments
 
 ---
 

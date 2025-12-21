@@ -225,13 +225,17 @@
   "Add a source IP/CIDR route with weighted targets to the config map.
    source: {:ip <u32> :prefix-len <int>}
    target-group: TargetGroup record with :targets and :cumulative-weights
-   flags: optional flags (default 1 = enabled)"
-  [config-map {:keys [ip prefix-len]} target-group & {:keys [flags] :or {flags 1}}]
-  (let [key-bytes (util/encode-lpm-key prefix-len ip)
-        value-bytes (util/encode-weighted-route-value target-group flags)
+   flags: optional flags (default 1 = enabled)
+   session-persistence: if true, enables sticky sessions based on source IP hash"
+  [config-map {:keys [ip prefix-len]} target-group & {:keys [flags session-persistence] :or {flags 1}}]
+  (let [effective-flags (cond-> flags
+                          session-persistence (bit-or util/FLAG-SESSION-PERSISTENCE))
+        key-bytes (util/encode-lpm-key prefix-len ip)
+        value-bytes (util/encode-weighted-route-value target-group effective-flags)
         targets (:targets target-group)]
     (log/debug "Adding weighted source route:" (util/u32->ip-string ip) "/" prefix-len
-               "->" (count targets) "targets")
+               "->" (count targets) "targets"
+               (when session-persistence "(session-persistence)"))
     (bpf/map-update config-map key-bytes value-bytes)))
 
 (defn remove-source-route
@@ -284,13 +288,17 @@
    ifindex: network interface index
    listen-port: listen port number
    target-group: TargetGroup record with :targets and :cumulative-weights
-   flags: bit flags (bit 0 = stats enabled)"
-  [listen-map ifindex listen-port target-group & {:keys [flags] :or {flags 0}}]
-  (let [key-bytes (util/encode-listen-key ifindex listen-port)
-        value-bytes (util/encode-weighted-route-value target-group flags)
+   flags: bit flags (bit 0 = stats enabled)
+   session-persistence: if true, enables sticky sessions based on source IP hash"
+  [listen-map ifindex listen-port target-group & {:keys [flags session-persistence] :or {flags 0}}]
+  (let [effective-flags (cond-> flags
+                          session-persistence (bit-or util/FLAG-SESSION-PERSISTENCE))
+        key-bytes (util/encode-listen-key ifindex listen-port)
+        value-bytes (util/encode-weighted-route-value target-group effective-flags)
         targets (:targets target-group)]
     (log/debug "Adding weighted listen port: ifindex=" ifindex "port=" listen-port
-               "->" (count targets) "targets")
+               "->" (count targets) "targets"
+               (when session-persistence "(session-persistence)"))
     (bpf/map-update listen-map key-bytes value-bytes)))
 
 (defn remove-listen-port
@@ -325,15 +333,19 @@
   "Add an SNI hostname route with weighted targets to the SNI map.
    hostname: TLS SNI hostname (will be lowercased)
    target-group: TargetGroup record with :targets and :cumulative-weights
-   flags: optional flags (default 1 = enabled)"
-  [sni-map hostname target-group & {:keys [flags] :or {flags 1}}]
-  (let [normalized-hostname (clojure.string/lower-case hostname)
+   flags: optional flags (default 1 = enabled)
+   session-persistence: if true, enables sticky sessions based on source IP hash"
+  [sni-map hostname target-group & {:keys [flags session-persistence] :or {flags 1}}]
+  (let [effective-flags (cond-> flags
+                          session-persistence (bit-or util/FLAG-SESSION-PERSISTENCE))
+        normalized-hostname (clojure.string/lower-case hostname)
         hostname-hash (util/hostname->hash normalized-hostname)
         key-bytes (util/encode-sni-key hostname-hash)
-        value-bytes (util/encode-weighted-route-value target-group flags)
+        value-bytes (util/encode-weighted-route-value target-group effective-flags)
         targets (:targets target-group)]
     (log/debug "Adding SNI route:" normalized-hostname
-               "(hash:" hostname-hash ")->" (count targets) "targets")
+               "(hash:" hostname-hash ")->" (count targets) "targets"
+               (when session-persistence "(session-persistence)"))
     (bpf/map-update sni-map key-bytes value-bytes)))
 
 (defn remove-sni-route

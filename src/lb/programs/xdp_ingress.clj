@@ -683,13 +683,30 @@
       ;; If target_count == 1, skip weighted selection (use first target directly)
       [(asm/jmp-imm :jeq :r0 1 :single_target)]
 
-      ;; Multiple targets: need weighted random selection
-      ;; Call bpf_get_prandom_u32() -> r0
-      [(dsl/call common/BPF-FUNC-get-prandom-u32)]
+      ;; Multiple targets: weighted selection based on flags
+      ;; Check flags for session persistence (offset 4 in header, 2 bytes native order)
+      ;; r9 = map value pointer
+      [(dsl/ldx :h :r6 :r9 4)]          ; r6 = flags
 
+      ;; If session-persistence flag (bit 0) set, use source IP hash; else use random
+      [(asm/jmp-imm :jset :r6 1 :use_ip_hash)]  ; if flags & 0x01 goto use_ip_hash
+
+      ;; Default: use random selection
+      [(dsl/call common/BPF-FUNC-get-prandom-u32)]
+      [(asm/jmp :have_selection_value)]
+
+      ;; Session persistence: hash source IP for deterministic selection
+      [(asm/label :use_ip_hash)]
+      [(dsl/ldx :w :r0 :r10 -40)]       ; r0 = source_ip (at stack[-40])
+      ;; FNV-like hash: multiply by prime for distribution
+      ;; Using 2654435761 (0x9E3779B1) - golden ratio prime
+      [(dsl/lddw :r1 2654435761)]       ; r1 = FNV prime
+      [(dsl/mul-reg :r0 :r1)]           ; r0 = ip * prime
+
+      [(asm/label :have_selection_value)]
       ;; r0 = r0 % 100 (value 0-99)
       [(dsl/mod :r0 100)
-       (dsl/stx :w :r10 :r0 -64)]       ; store random at stack[-64]
+       (dsl/stx :w :r10 :r0 -64)]       ; store selection value at stack[-64]
 
       ;; Loop through targets comparing random with cumulative weights
       ;; Target entries start at offset 8 in the map value

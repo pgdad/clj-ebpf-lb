@@ -65,10 +65,13 @@
 ;; Listen specification
 (s/def ::listen (s/keys :req-un [::interfaces ::port]))
 
+;; Session persistence (sticky sessions based on source IP hash)
+(s/def ::session-persistence boolean?)
+
 ;; Source route - supports either :target (single) or :targets (weighted array)
 (s/def ::source-route
   (s/and (s/keys :req-un [::source]
-                 :opt-un [::target ::targets])
+                 :opt-un [::target ::targets ::session-persistence])
          ;; Must have exactly one of :target or :targets
          #(or (and (contains? % :target) (not (contains? % :targets)))
               (and (contains? % :targets) (not (contains? % :target))))))
@@ -80,7 +83,7 @@
                              #(<= (count %) 253)))  ; Max DNS name length
 (s/def ::sni-route
   (s/and (s/keys :req-un [::sni-hostname]
-                 :opt-un [::target ::targets])
+                 :opt-un [::target ::targets ::session-persistence])
          ;; Must have exactly one of :target or :targets
          #(or (and (contains? % :target) (not (contains? % :targets)))
               (and (contains? % :targets) (not (contains? % :target))))))
@@ -92,7 +95,7 @@
 (s/def ::default-target (s/or :single ::target :weighted ::targets))
 (s/def ::proxy-config
   (s/keys :req-un [::name ::listen ::default-target]
-          :opt-un [::source-routes ::sni-routes]))
+          :opt-un [::source-routes ::sni-routes ::session-persistence ::health-check]))
 
 ;; Global settings
 (s/def ::stats-enabled boolean?)
@@ -247,19 +250,22 @@
    :update-interval-ms 1000})
 
 ;; Source route now holds a TargetGroup instead of single Target
-(defrecord SourceRoute [source prefix-len target-group])
+;; session-persistence: optional boolean for sticky sessions
+(defrecord SourceRoute [source prefix-len target-group session-persistence])
 
 ;; SNI route - routes TLS traffic based on SNI hostname
 ;; hostname: the TLS SNI hostname to match (exact match, lowercase)
 ;; hostname-hash: FNV-1a 64-bit hash of lowercase hostname for fast lookup
 ;; target-group: TargetGroup with weighted targets
-(defrecord SNIRoute [hostname hostname-hash target-group])
+;; session-persistence: optional boolean for sticky sessions
+(defrecord SNIRoute [hostname hostname-hash target-group session-persistence])
 
 (defrecord Listen [interfaces port])
 
 ;; ProxyConfig now holds TargetGroup for default-target
 ;; sni-routes: optional vector of SNIRoute for TLS SNI-based routing
-(defrecord ProxyConfig [name listen default-target source-routes sni-routes])
+;; session-persistence: optional boolean for sticky sessions on default-target
+(defrecord ProxyConfig [name listen default-target source-routes sni-routes session-persistence])
 
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
                      health-check-enabled health-check-defaults
@@ -427,23 +433,23 @@
 (defn parse-source-route
   "Parse a source route, resolving hostname if necessary.
    Supports both :target (single) and :targets (weighted array) formats."
-  [{:keys [source target targets]} proxy-name]
+  [{:keys [source target targets session-persistence]} proxy-name]
   (let [{:keys [ip prefix-len]} (util/resolve-to-ip source)]
     (when (nil? ip)
       (throw (ex-info "Failed to resolve source" {:source source})))
     (let [target-spec (or targets target)
           context (format "proxy '%s' source-route %s" proxy-name source)]
-      (->SourceRoute ip prefix-len (parse-target-group target-spec context)))))
+      (->SourceRoute ip prefix-len (parse-target-group target-spec context) session-persistence))))
 
 (defn parse-sni-route
   "Parse an SNI route for TLS SNI-based routing.
    Supports both :target (single) and :targets (weighted array) formats."
-  [{:keys [sni-hostname target targets]} proxy-name]
+  [{:keys [sni-hostname target targets session-persistence]} proxy-name]
   (let [hostname (clojure.string/lower-case sni-hostname)
         hostname-hash (util/hostname->hash hostname)
         target-spec (or targets target)
         context (format "proxy '%s' sni-route %s" proxy-name sni-hostname)]
-    (->SNIRoute hostname hostname-hash (parse-target-group target-spec context))))
+    (->SNIRoute hostname hostname-hash (parse-target-group target-spec context) session-persistence)))
 
 (defn parse-listen
   "Parse listen configuration."
@@ -452,14 +458,15 @@
 
 (defn parse-proxy-config
   "Parse a single proxy configuration."
-  [{:keys [name listen default-target source-routes sni-routes]}]
+  [{:keys [name listen default-target source-routes sni-routes session-persistence]}]
   (let [default-context (format "proxy '%s' default-target" name)]
     (->ProxyConfig
       name
       (parse-listen listen)
       (parse-target-group default-target default-context)
       (mapv #(parse-source-route % name) (or source-routes []))
-      (mapv #(parse-sni-route % name) (or sni-routes [])))))
+      (mapv #(parse-sni-route % name) (or sni-routes []))
+      session-persistence)))
 
 (defn parse-settings
   "Parse settings with defaults."
@@ -662,8 +669,9 @@
        name
        (->Listen [interface] port)
        (make-single-target-group target-ip target-port)
-       []   ; source-routes
-       [])] ; sni-routes
+       []     ; source-routes
+       []     ; sni-routes
+       false)] ; session-persistence
     (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config
                 30000 1000 (parse-load-balancing-config nil))))
 

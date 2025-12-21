@@ -270,7 +270,7 @@
 
     ;; Apply proxy configurations
     (doseq [proxy-cfg (:proxies config)]
-      (let [{:keys [listen default-target source-routes sni-routes]} proxy-cfg
+      (let [{:keys [listen default-target source-routes sni-routes session-persistence]} proxy-cfg
             {:keys [interfaces port]} listen]
 
         ;; Add listen port for each interface
@@ -279,7 +279,8 @@
           (when-let [ifindex (util/get-interface-index iface)]
             (maps/add-listen-port-weighted listen-map ifindex port
               default-target
-              :flags (if (:stats-enabled (:settings config)) 1 0))))
+              :flags (if (:stats-enabled (:settings config)) 1 0)
+              :session-persistence session-persistence)))
 
         ;; Add source routes
         ;; Each route now has :target-group instead of :target
@@ -287,13 +288,15 @@
           (maps/add-source-route-weighted config-map
             {:ip (:source route)
              :prefix-len (:prefix-len route)}
-            (:target-group route)))
+            (:target-group route)
+            :session-persistence (:session-persistence route)))
 
         ;; Add SNI routes for TLS hostname-based routing
         (doseq [sni-route sni-routes]
           (maps/add-sni-route sni-map
             (:hostname sni-route)
-            (:target-group sni-route)))))))
+            (:target-group sni-route)
+            :session-persistence (:session-persistence sni-route)))))))
 
 ;;; =============================================================================
 ;;; Interface Attachment
@@ -360,22 +363,31 @@
           new-config (config/add-proxy (:config state) parsed)]
 
       ;; Update maps
-      (let [{:keys [listen-map config-map]} (:maps state)
-            {:keys [listen default-target source-routes]} parsed
+      (let [{:keys [listen-map config-map sni-map]} (:maps state)
+            {:keys [listen default-target source-routes sni-routes session-persistence]} parsed
             {:keys [interfaces port]} listen]
 
         ;; Add listen port entries with weighted targets
         (doseq [iface interfaces]
           (when-let [ifindex (util/get-interface-index iface)]
             (maps/add-listen-port-weighted listen-map ifindex port
-              default-target)))
+              default-target
+              :session-persistence session-persistence)))
 
         ;; Add source routes with weighted targets
         (doseq [route source-routes]
           (maps/add-source-route-weighted config-map
             {:ip (:source route)
              :prefix-len (:prefix-len route)}
-            (:target-group route)))
+            (:target-group route)
+            :session-persistence (:session-persistence route)))
+
+        ;; Add SNI routes with weighted targets
+        (doseq [sni-route sni-routes]
+          (maps/add-sni-route sni-map
+            (:hostname sni-route)
+            (:target-group sni-route)
+            :session-persistence (:session-persistence sni-route)))
 
         ;; Attach to new interfaces
         (attach-interfaces! interfaces))
@@ -672,7 +684,7 @@
   "Create a callback function for weight updates.
    Updates BPF maps when target weights change due to health status."
   [listen-map proxy-cfg]
-  (let [{:keys [listen]} proxy-cfg
+  (let [{:keys [listen session-persistence]} proxy-cfg
         {:keys [interfaces port]} listen]
     (fn [new-target-group]
       (log/info "Updating weights for proxy" (:name proxy-cfg)
@@ -682,7 +694,8 @@
         (when-let [ifindex (util/get-interface-index iface)]
           (maps/add-listen-port-weighted listen-map ifindex port
             new-target-group
-            :flags 0))))))
+            :flags 0
+            :session-persistence session-persistence))))))
 
 (defn- create-drain-update-fn
   "Create a callback function for drain weight updates.
@@ -692,7 +705,7 @@
     (fn [proxy-name new-target-group]
       (with-lb-state [state]
         (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
-          (let [{:keys [listen]} proxy-cfg
+          (let [{:keys [listen session-persistence]} proxy-cfg
                 {:keys [interfaces port]} listen]
             (log/info "Updating drain weights for proxy" proxy-name
                       "new cumulative weights:" (:cumulative-weights new-target-group))
@@ -701,7 +714,8 @@
               (when-let [ifindex (util/get-interface-index iface)]
                 (maps/add-listen-port-weighted listen-map ifindex port
                   new-target-group
-                  :flags 0)))))))))
+                  :flags 0
+                  :session-persistence session-persistence)))))))))
 
 (defn- register-health-checks!
   "Register all proxies for health checking."
@@ -759,7 +773,7 @@
   "Create a callback function for DNS resolution updates.
    Updates BPF maps when resolved IPs change."
   [listen-map proxy-cfg]
-  (let [{:keys [listen]} proxy-cfg
+  (let [{:keys [listen session-persistence]} proxy-cfg
         {:keys [interfaces port]} listen]
     (fn [hostname new-target-group]
       (log/info "DNS resolution changed for proxy" (:name proxy-cfg)
@@ -770,7 +784,8 @@
         (when-let [ifindex (util/get-interface-index iface)]
           (maps/add-listen-port-weighted listen-map ifindex port
             new-target-group
-            :flags 0))))))
+            :flags 0
+            :session-persistence session-persistence))))))
 
 (defn- register-dns-targets!
   "Register all DNS-backed targets for periodic resolution."
@@ -959,7 +974,7 @@
     (fn [proxy-name]
       (with-lb-state [state]
         (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
-          (let [{:keys [listen default-target]} proxy-cfg
+          (let [{:keys [listen default-target session-persistence]} proxy-cfg
                 {:keys [interfaces port]} listen
                 targets (:targets default-target)
                 original-weights (mapv :weight targets)
@@ -995,7 +1010,8 @@
               (when-let [ifindex (util/get-interface-index iface)]
                 (maps/add-listen-port-weighted listen-map ifindex port
                   new-target-group
-                  :flags 0)))))))))
+                  :flags 0
+                  :session-persistence session-persistence)))))))))
 
 (defn- register-circuit-breakers!
   "Register all proxies for circuit breaker tracking."

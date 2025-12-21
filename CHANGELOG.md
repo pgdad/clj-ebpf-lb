@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Session persistence (sticky sessions) based on source IP hashing
+  - Routes same client IP consistently to same backend server
+  - Deterministic hash: `(source_ip * FNV_PRIME) % 100`
+  - XDP-level implementation for zero-overhead persistence
+  - Per-proxy configuration: `{:session-persistence true}`
+  - Per-route configuration for source-routes and SNI routes
+  - Respects weighted distribution across backends
+  - Integrates with health checks (unhealthy backends excluded)
+  - Flag-based activation using route value flags field
+  - New constant: `util/FLAG-SESSION-PERSISTENCE` (0x0001)
+  - Comprehensive examples in `examples/session_persistence.clj`
+
 ## [0.6.0] - 2025-12-21
 
 ### Added
