@@ -11,6 +11,7 @@
             [lb.health :as health]
             [lb.drain :as drain]
             [lb.rate-limit :as rate-limit]
+            [lb.reload :as reload]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -147,6 +148,9 @@
               (when-let [settings (:settings config)]
                 (rate-limit/configure-from-settings! settings))
 
+              ;; Register reload functions for hot reload support
+              (register-reload-functions!)
+
               (log/info "Load balancer initialized successfully")
               state))))
 
@@ -160,6 +164,9 @@
   []
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
+
+    ;; Disable hot reload first
+    (reload/disable-hot-reload!)
 
     ;; Shutdown rate limiting
     (rate-limit/shutdown!)
@@ -829,6 +836,78 @@
   "Print current rate limit status."
   []
   (rate-limit/print-rate-limit-status))
+
+;;; =============================================================================
+;;; Hot Reload
+;;; =============================================================================
+
+(defn- register-reload-functions!
+  "Register functions with the reload module for applying config changes.
+   Called during initialization."
+  []
+  (reload/register-apply-fns!
+    {:get-state get-state
+     :add-proxy! add-proxy!
+     :remove-proxy! remove-proxy!
+     :add-source-route! (fn [proxy-name source prefix-len target-group]
+                          ;; Adapter for add-source-route! that takes pre-parsed args
+                          (let [source-str (util/cidr->string {:ip source :prefix-len prefix-len})]
+                            (add-source-route! proxy-name {:source source-str
+                                                           :target (config/target-group->map target-group)})))
+     :remove-source-route! (fn [proxy-name source prefix-len]
+                             (remove-source-route! proxy-name source prefix-len))
+     :add-sni-route! (fn [proxy-name route]
+                       (add-sni-route! proxy-name (config/sni-route->map route)))
+     :remove-sni-route! remove-sni-route!
+     :enable-stats! enable-stats!
+     :disable-stats! disable-stats!
+     :update-proxy-state! (fn [f & args]
+                            (apply swap! proxy-state f args))}))
+
+(defn reload-config!
+  "Reload configuration from file or provided source.
+
+   Without arguments, reloads from the last known config path (if hot reload is enabled).
+   With a path argument, loads and applies that configuration file.
+
+   Returns {:success? bool :changes {...} :error ...}"
+  ([] (reload/reload-config!))
+  ([config-path] (reload/reload-config! config-path)))
+
+(defn reload-config-from-map!
+  "Reload configuration from an in-memory config map.
+   Useful for programmatic config changes.
+
+   Returns {:success? bool :changes {...} :error ...}"
+  [config-map]
+  (reload/reload-config-from-map! config-map))
+
+(defn enable-hot-reload!
+  "Enable hot configuration reload for the specified config file.
+
+   Options:
+     :watch-file? - Enable file watching (default true)
+     :sighup? - Enable SIGHUP handling (default true)
+     :debounce-ms - File change debounce period (default 500ms)
+
+   Returns true if enabled successfully."
+  [config-path & opts]
+  (apply reload/enable-hot-reload! config-path opts))
+
+(defn disable-hot-reload!
+  "Disable hot configuration reload."
+  []
+  (reload/disable-hot-reload!))
+
+(defn hot-reload-enabled?
+  "Check if hot reload is currently enabled."
+  []
+  (reload/hot-reload-enabled?))
+
+(defn get-reload-state
+  "Get current reload state for debugging."
+  []
+  (reload/get-reload-state))
 
 ;;; =============================================================================
 ;;; CLI

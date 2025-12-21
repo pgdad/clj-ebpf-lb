@@ -667,3 +667,185 @@
        "  Stats enabled: " (get-in config [:settings :stats-enabled]) "\n"
        "  Connection timeout: " (get-in config [:settings :connection-timeout-sec]) " sec\n"
        "  Max connections: " (get-in config [:settings :max-connections])))
+
+;;; =============================================================================
+;;; Configuration Diffing for Hot Reload
+;;; =============================================================================
+
+;; Diff result for changes within a single proxy
+(defrecord ProxyDiff
+  [proxy-name           ; Name of the proxy
+   listen-changed?      ; If true, full proxy reload needed (remove + add)
+   default-target-diff  ; {:old TargetGroup :new TargetGroup} or nil
+   added-source-routes  ; Vector of SourceRoute to add
+   removed-source-routes ; Vector of {:source :prefix-len} to remove
+   added-sni-routes     ; Vector of SNIRoute to add
+   removed-sni-routes]) ; Vector of hostnames to remove
+
+;; Full diff result between two Config records
+(defrecord ConfigDiff
+  [settings-changes     ; Map of {:field {:old v1 :new v2}}
+   added-proxies        ; Vector of ProxyConfig to add
+   removed-proxies      ; Vector of proxy names to remove
+   modified-proxies])   ; Vector of ProxyDiff for changed proxies
+
+(defn diff-settings
+  "Compare two Settings records.
+   Returns map of {:field {:old v1 :new v2}} for changed fields, or empty map if identical."
+  [^Settings old-settings ^Settings new-settings]
+  (let [fields [:stats-enabled :connection-timeout-sec :max-connections
+                :health-check-enabled :health-check-defaults
+                :default-drain-timeout-ms :drain-check-interval-ms]]
+    (reduce (fn [acc field]
+              (let [old-val (get old-settings field)
+                    new-val (get new-settings field)]
+                (if (= old-val new-val)
+                  acc
+                  (assoc acc field {:old old-val :new new-val}))))
+            {}
+            fields)))
+
+(defn diff-target-group
+  "Compare two TargetGroup records.
+   Returns nil if identical, {:old :new} if different."
+  [^TargetGroup old-tg ^TargetGroup new-tg]
+  (let [old-targets (:targets old-tg)
+        new-targets (:targets new-tg)]
+    ;; Compare by IP, port, and weight of each target
+    (when-not (and (= (count old-targets) (count new-targets))
+                   (every? true?
+                           (map (fn [old new]
+                                  (and (= (:ip old) (:ip new))
+                                       (= (:port old) (:port new))
+                                       (= (:weight old) (:weight new))))
+                                old-targets new-targets)))
+      {:old old-tg :new new-tg})))
+
+(defn diff-listen
+  "Compare two Listen records.
+   Returns true if different."
+  [^Listen old-listen ^Listen new-listen]
+  (or (not= (set (:interfaces old-listen)) (set (:interfaces new-listen)))
+      (not= (:port old-listen) (:port new-listen))))
+
+(defn- source-route-key
+  "Create a key for comparing source routes (source IP + prefix length)."
+  [^SourceRoute route]
+  [(:source route) (:prefix-len route)])
+
+(defn diff-source-routes
+  "Compare source route vectors.
+   Returns {:added [SourceRoute] :removed [{:source :prefix-len}]}."
+  [old-routes new-routes]
+  (let [old-keys (set (map source-route-key old-routes))
+        new-keys (set (map source-route-key new-routes))
+        old-by-key (into {} (map (juxt source-route-key identity) old-routes))
+        new-by-key (into {} (map (juxt source-route-key identity) new-routes))
+        added-keys (clojure.set/difference new-keys old-keys)
+        removed-keys (clojure.set/difference old-keys new-keys)
+        ;; Also check for modified routes (same key, different target)
+        common-keys (clojure.set/intersection old-keys new-keys)
+        modified-keys (filter (fn [k]
+                                (some? (diff-target-group
+                                         (:target-group (old-by-key k))
+                                         (:target-group (new-by-key k)))))
+                              common-keys)]
+    {:added (vec (concat
+                   (map new-by-key added-keys)
+                   (map new-by-key modified-keys)))
+     :removed (vec (concat
+                     (map (fn [[src plen]] {:source src :prefix-len plen}) removed-keys)
+                     (map (fn [[src plen]] {:source src :prefix-len plen}) modified-keys)))}))
+
+(defn diff-sni-routes
+  "Compare SNI route vectors.
+   Returns {:added [SNIRoute] :removed [hostname]}."
+  [old-routes new-routes]
+  (let [old-hostnames (set (map :hostname old-routes))
+        new-hostnames (set (map :hostname new-routes))
+        old-by-hostname (into {} (map (juxt :hostname identity) old-routes))
+        new-by-hostname (into {} (map (juxt :hostname identity) new-routes))
+        added-hostnames (clojure.set/difference new-hostnames old-hostnames)
+        removed-hostnames (clojure.set/difference old-hostnames new-hostnames)
+        ;; Also check for modified routes (same hostname, different target)
+        common-hostnames (clojure.set/intersection old-hostnames new-hostnames)
+        modified-hostnames (filter (fn [h]
+                                     (some? (diff-target-group
+                                              (:target-group (old-by-hostname h))
+                                              (:target-group (new-by-hostname h)))))
+                                   common-hostnames)]
+    {:added (vec (concat
+                   (map new-by-hostname added-hostnames)
+                   (map new-by-hostname modified-hostnames)))
+     :removed (vec (concat removed-hostnames modified-hostnames))}))
+
+(defn diff-proxy
+  "Compare two ProxyConfig records with the same name.
+   Returns ProxyDiff record describing changes."
+  [^ProxyConfig old-proxy ^ProxyConfig new-proxy]
+  (let [listen-changed? (diff-listen (:listen old-proxy) (:listen new-proxy))
+        default-target-diff (diff-target-group (:default-target old-proxy)
+                                                (:default-target new-proxy))
+        source-route-diff (diff-source-routes (:source-routes old-proxy)
+                                               (:source-routes new-proxy))
+        sni-route-diff (diff-sni-routes (:sni-routes old-proxy)
+                                         (:sni-routes new-proxy))]
+    (->ProxyDiff
+      (:name old-proxy)
+      listen-changed?
+      default-target-diff
+      (:added source-route-diff)
+      (:removed source-route-diff)
+      (:added sni-route-diff)
+      (:removed sni-route-diff))))
+
+(defn proxy-diff-empty?
+  "Check if a ProxyDiff represents no changes."
+  [^ProxyDiff diff]
+  (and (not (:listen-changed? diff))
+       (nil? (:default-target-diff diff))
+       (empty? (:added-source-routes diff))
+       (empty? (:removed-source-routes diff))
+       (empty? (:added-sni-routes diff))
+       (empty? (:removed-sni-routes diff))))
+
+(defn diff-configs
+  "Compare two Config records.
+   Returns ConfigDiff record describing all changes."
+  [^Config old-config ^Config new-config]
+  (let [settings-changes (diff-settings (:settings old-config) (:settings new-config))
+        old-proxy-names (set (map :name (:proxies old-config)))
+        new-proxy-names (set (map :name (:proxies new-config)))
+        old-proxies-by-name (into {} (map (juxt :name identity) (:proxies old-config)))
+        new-proxies-by-name (into {} (map (juxt :name identity) (:proxies new-config)))
+        added-names (clojure.set/difference new-proxy-names old-proxy-names)
+        removed-names (clojure.set/difference old-proxy-names new-proxy-names)
+        common-names (clojure.set/intersection old-proxy-names new-proxy-names)
+        ;; Check for modified proxies
+        proxy-diffs (keep (fn [name]
+                            (let [diff (diff-proxy (old-proxies-by-name name)
+                                                   (new-proxies-by-name name))]
+                              (when-not (proxy-diff-empty? diff)
+                                diff)))
+                          common-names)]
+    (->ConfigDiff
+      settings-changes
+      (vec (map new-proxies-by-name added-names))
+      (vec removed-names)
+      (vec proxy-diffs))))
+
+(defn config-diff-empty?
+  "Check if a ConfigDiff represents no changes."
+  [^ConfigDiff diff]
+  (and (empty? (:settings-changes diff))
+       (empty? (:added-proxies diff))
+       (empty? (:removed-proxies diff))
+       (empty? (:modified-proxies diff))))
+
+(defn summarize-diff
+  "Create a human-readable summary of a ConfigDiff."
+  [^ConfigDiff diff]
+  {:settings-changed (count (:settings-changes diff))
+   :proxies-added (count (:added-proxies diff))
+   :proxies-removed (count (:removed-proxies diff))
+   :proxies-modified (count (:modified-proxies diff))})

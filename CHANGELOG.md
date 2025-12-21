@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Hot reload configuration without restart
+  - File watching with inotify-based detection (Java NIO WatchService)
+  - SIGHUP signal handling for manual reload trigger
+  - Configuration diffing with incremental apply
+  - Validation before apply with rollback on failure
+  - Runtime API: `reload-config!`, `reload-config-from-map!`
+  - Enable/disable: `enable-hot-reload!`, `disable-hot-reload!`
+  - Status: `hot-reload-enabled?`, `get-reload-state`
+  - New config diffing functions in `lb.config`
 - Rate limiting with token bucket algorithm
   - Per-source IP rate limiting to prevent client abuse
   - Per-backend rate limiting to protect backend capacity
