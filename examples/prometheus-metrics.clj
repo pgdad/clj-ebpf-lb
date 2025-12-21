@@ -402,5 +402,11 @@
   ;; 4. Stop server: (metrics/stop!)
   )
 
-(println "Prometheus metrics example loaded. See comments for usage patterns.")
-(println "Run (run-demo) for a complete demonstration.")
+(println "Prometheus metrics example loaded.")
+(println "")
+(println "To run the demo:")
+(println "  (examples.prometheus-metrics/run-demo)")
+(println "")
+(println "Or switch namespace first:")
+(println "  (in-ns 'examples.prometheus-metrics)")
+(println "  (run-demo)")
