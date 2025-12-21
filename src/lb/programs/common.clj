@@ -22,17 +22,29 @@
 ;; Ethernet constants
 (def ETH-P-IP 0x0800)
 (def ETH-P-IPV6 0x86DD)
+(def ETH-P-IP-BE 0x0008)            ; IPv4 in big-endian (network byte order)
+(def ETH-P-IPV6-BE 0xDD86)          ; IPv6 in big-endian (network byte order)
 (def ETH-HLEN 14)
 
 ;; IP protocol numbers
 (def IPPROTO-ICMP 1)
 (def IPPROTO-TCP 6)
 (def IPPROTO-UDP 17)
+(def IPPROTO-ICMPV6 58)             ; ICMPv6 protocol number
 
-;; Header sizes
+;; Header sizes - IPv4
 (def IP-HLEN-MIN 20)
 (def TCP-HLEN-MIN 20)
 (def UDP-HLEN 8)
+
+;; Header sizes - IPv6
+(def IPV6-HLEN 40)                  ; Fixed IPv6 header size (no options in base header)
+
+;; IPv6 header field offsets (from start of IPv6 header)
+(def IPV6-OFF-NEXT-HEADER 6)        ; Next Header (protocol) at offset 6
+(def IPV6-OFF-HOP-LIMIT 7)          ; Hop Limit at offset 7
+(def IPV6-OFF-SRC 8)                ; Source address at offset 8 (16 bytes)
+(def IPV6-OFF-DST 24)               ; Destination address at offset 24 (16 bytes)
 
 ;; TLS constants for SNI parsing
 (def TLS-CONTENT-TYPE-HANDSHAKE 0x16)
@@ -283,6 +295,89 @@
    ;; Load dst port (offset 2) - network byte order
    (ldx-h :r9 :r8 2)
    (stx-h :r10 :r9 -24)])
+
+;;; =============================================================================
+;;; IPv6 Packet Parsing Fragments
+;;; =============================================================================
+
+(defn build-parse-ipv6
+  "Parse IPv6 header, extract next header (protocol) and addresses.
+
+   IPv6 has a fixed 40-byte header (no options in base header).
+
+   Assumes: r6 = data, r7 = data_end, Ethernet header already validated
+   Stores on stack (unified format with 16-byte addresses):
+     stack[-4]   = next header (protocol, 1 byte as word)
+     stack[-20]  = src IP (16 bytes, at stack[-20..-5])
+     stack[-36]  = dst IP (16 bytes, at stack[-36..-21])
+     stack[-40]  = header length (always 40 for base IPv6)
+   Uses: r8, r9 as scratch"
+  [pass-offset]
+  (let [ipv6-off ETH-HLEN]
+    (concat
+      ;; Bounds check for IPv6 header (fixed 40 bytes)
+      (build-bounds-check ipv6-off IPV6-HLEN pass-offset)
+
+      ;; Store IPv6 header length (always 40)
+      [(mov-imm :r8 IPV6-HLEN)
+       (stx-w :r10 :r8 -40)]
+
+      ;; Load next header (protocol) at offset 6
+      [(ldx-b :r8 :r6 (+ ipv6-off IPV6-OFF-NEXT-HEADER))
+       (stx-w :r10 :r8 -4)]
+
+      ;; Load source IP (16 bytes at offset 8)
+      ;; We load 4 32-bit words
+      [(ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-SRC))
+       (stx-w :r10 :r8 -20)
+       (ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-SRC 4))
+       (stx-w :r10 :r8 -16)
+       (ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-SRC 8))
+       (stx-w :r10 :r8 -12)
+       (ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-SRC 12))
+       (stx-w :r10 :r8 -8)]
+
+      ;; Load destination IP (16 bytes at offset 24)
+      [(ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-DST))
+       (stx-w :r10 :r8 -36)
+       (ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-DST 4))
+       (stx-w :r10 :r8 -32)
+       (ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-DST 8))
+       (stx-w :r10 :r8 -28)
+       (ldx-w :r8 :r6 (+ ipv6-off IPV6-OFF-DST 12))
+       (stx-w :r10 :r8 -24)])))
+
+(defn build-parse-l4-ipv6
+  "Parse TCP/UDP header to extract ports for IPv6.
+
+   IPv6 has fixed 40-byte header, so L4 is always at ETH_HLEN + 40.
+
+   Assumes: r6 = data, r7 = data_end, IPv6 header validated
+   Stores on stack:
+     stack[-44] = src port
+     stack[-48] = dst port
+   Uses: r8, r9"
+  [pass-offset]
+  (let [l4-off (+ ETH-HLEN IPV6-HLEN)]
+    [(mov-imm :r8 l4-off)
+     (mov-reg :r9 :r8)            ;; save L4 offset in r9
+
+     ;; Bounds check for L4 ports (need at least 4 bytes)
+     (mov-reg :r8 :r6)
+     (add-imm :r8 (+ l4-off 4))
+     (dsl/jmp-reg :jgt :r8 :r7 pass-offset)
+
+     ;; Calculate L4 header address: data + L4_offset
+     (mov-reg :r8 :r6)
+     (add-reg :r8 :r9)
+
+     ;; Load src port (offset 0) - network byte order
+     (ldx-h :r9 :r8 0)
+     (stx-h :r10 :r9 -44)
+
+     ;; Load dst port (offset 2) - network byte order
+     (ldx-h :r9 :r8 2)
+     (stx-h :r10 :r9 -48)]))
 
 ;;; =============================================================================
 ;;; Map Lookup Helpers
