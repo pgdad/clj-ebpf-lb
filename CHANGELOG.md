@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- DNS-based backend resolution for dynamic environments
+  - Use `:host` instead of `:ip` for DNS-backed targets
+  - Periodic re-resolution with configurable intervals (`:dns-refresh-seconds`)
+  - Multiple A record expansion to weighted targets (weight distributed equally)
+  - Graceful failure handling with last-known-good IP fallback
+  - Background daemon with jitter to avoid thundering herd
+  - Health check integration for resolved IPs
+  - Event subscription system for DNS resolution changes
+  - Mixed static IP and DNS target support in same target group
+  - Runtime API: `get-dns-status`, `get-all-dns-status`, `force-dns-resolve!`
+  - New modules: `lb.dns`, `lb.dns.resolver`, `lb.dns.manager`
+  - Configuration examples:
+    - Basic: `{:host "backend.local" :port 8080}`
+    - With refresh: `{:host "backend.local" :port 8080 :dns-refresh-seconds 60}`
+    - Mixed: `[{:ip "10.0.0.1" :port 8080 :weight 50} {:host "dynamic.svc" :port 8080 :weight 50}]`
 - Hot reload configuration without restart
   - File watching with inotify-based detection (Java NIO WatchService)
   - SIGHUP signal handling for manual reload trigger

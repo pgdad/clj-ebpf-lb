@@ -98,6 +98,26 @@
     (catch UnknownHostException _
       nil)))
 
+(defn resolve-hostname-all
+  "Resolve hostname to ALL A records (not just first).
+   Returns vector of u32 IPs, or nil if resolution fails.
+
+   This is useful for DNS-based load balancing where a hostname
+   may resolve to multiple backend IPs."
+  [hostname]
+  (try
+    (let [addresses (InetAddress/getAllByName hostname)]
+      (mapv (fn [^InetAddress addr]
+              (bytes->ip (.getAddress addr)))
+            addresses))
+    (catch UnknownHostException _
+      nil)))
+
+(defn is-ip-string?
+  "Check if a string looks like an IPv4 address."
+  [s]
+  (boolean (and (string? s) (re-matches #"\d+\.\d+\.\d+\.\d+" s))))
+
 (defn resolve-to-ip
   "Resolve a source specification to IP.
    Accepts: IP string, CIDR string, or hostname.

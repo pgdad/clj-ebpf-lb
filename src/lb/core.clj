@@ -12,10 +12,11 @@
             [lb.drain :as drain]
             [lb.rate-limit :as rate-limit]
             [lb.reload :as reload]
+            [lb.dns :as dns]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
-  (:import [lb.config TargetGroup])
+  (:import [lb.config TargetGroup DNSTargetGroup])
   (:gen-class))
 
 ;;; =============================================================================
@@ -23,7 +24,8 @@
 ;;; =============================================================================
 
 (declare apply-config! attach-interfaces! detach-interfaces!
-         register-health-checks! unregister-health-checks!)
+         register-health-checks! unregister-health-checks!
+         register-dns-targets! unregister-dns-targets!)
 
 ;;; =============================================================================
 ;;; Proxy State
@@ -148,6 +150,10 @@
               (when-let [settings (:settings config)]
                 (rate-limit/configure-from-settings! settings))
 
+              ;; Start DNS resolution daemon and register DNS-backed targets
+              (dns/start!)
+              (register-dns-targets! ebpf-maps config)
+
               ;; Register reload functions for hot reload support
               (register-reload-functions!)
 
@@ -167,6 +173,10 @@
 
     ;; Disable hot reload first
     (reload/disable-hot-reload!)
+
+    ;; Stop DNS resolution daemon
+    (unregister-dns-targets! (:config state))
+    (dns/stop!)
 
     ;; Shutdown rate limiting
     (rate-limit/shutdown!)
@@ -703,6 +713,69 @@
   []
   (with-lb-state [state]
     (get-in state [:config :settings :health-check-enabled])))
+
+;;; =============================================================================
+;;; DNS Resolution
+;;; =============================================================================
+
+(defn- create-dns-update-fn
+  "Create a callback function for DNS resolution updates.
+   Updates BPF maps when resolved IPs change."
+  [listen-map proxy-cfg]
+  (let [{:keys [listen]} proxy-cfg
+        {:keys [interfaces port]} listen]
+    (fn [hostname new-target-group]
+      (log/info "DNS resolution changed for proxy" (:name proxy-cfg)
+                "hostname:" hostname
+                "new targets:" (count (:targets new-target-group)))
+      ;; Update listen map entries for all interfaces
+      (doseq [iface interfaces]
+        (when-let [ifindex (util/get-interface-index iface)]
+          (maps/add-listen-port-weighted listen-map ifindex port
+            new-target-group
+            :flags 0))))))
+
+(defn- register-dns-targets!
+  "Register all DNS-backed targets for periodic resolution."
+  [ebpf-maps config]
+  (let [listen-map (:listen-map ebpf-maps)]
+    (doseq [proxy-cfg (:proxies config)]
+      (let [default-target (:default-target proxy-cfg)]
+        ;; Check if default-target uses DNS
+        (when (config/dns-target-group? default-target)
+          (log/info "Registering DNS targets for proxy" (:name proxy-cfg))
+          (let [dns-targets (:dns-targets default-target)
+                update-fn (create-dns-update-fn listen-map proxy-cfg)]
+            (doseq [dns-target dns-targets]
+              (dns/register-target!
+                (:name proxy-cfg)
+                (:host dns-target)
+                {:port (:port dns-target)
+                 :weight (:weight dns-target)
+                 :dns-refresh-seconds (:dns-refresh-seconds dns-target)
+                 :health-check (:health-check dns-target)}
+                update-fn))))))))
+
+(defn- unregister-dns-targets!
+  "Unregister all DNS targets and stop resolution."
+  [config]
+  (doseq [proxy-cfg (:proxies config)]
+    (dns/unregister-proxy! (:name proxy-cfg))))
+
+(defn get-dns-status
+  "Get DNS resolution status for a specific proxy."
+  [proxy-name]
+  (dns/get-status proxy-name))
+
+(defn get-all-dns-status
+  "Get DNS resolution status for all proxies."
+  []
+  (dns/get-all-status))
+
+(defn force-dns-resolve!
+  "Force immediate DNS re-resolution for a hostname."
+  [proxy-name hostname]
+  (dns/force-resolve! proxy-name hostname))
 
 ;;; =============================================================================
 ;;; Connection Draining

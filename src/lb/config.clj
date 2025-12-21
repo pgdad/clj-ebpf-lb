@@ -46,8 +46,16 @@
 (s/def ::ip ::ip-string)
 (s/def ::target (s/keys :req-un [::ip ::port] :opt-un [::weight ::health-check]))
 
+;; DNS-backed target specification (uses hostname instead of IP)
+(s/def ::host ::hostname)
+(s/def ::dns-refresh-seconds (s/and int? #(>= % 1) #(<= % 3600)))
+(s/def ::dns-target (s/keys :req-un [::host ::port]
+                            :opt-un [::weight ::health-check ::dns-refresh-seconds]))
+
 ;; Weighted targets array (for load balancing across multiple backends)
-(s/def ::targets (s/coll-of ::target :min-count 1 :max-count 8))
+;; Can contain either IP-based or DNS-based targets
+(s/def ::targets (s/coll-of (s/or :ip-target ::target :dns-target ::dns-target)
+                            :min-count 1 :max-count 8))
 
 ;; Interface name
 (s/def ::interface (s/and string? #(re-matches #"[a-zA-Z0-9\-_]+" %)))
@@ -157,10 +165,24 @@
 ;; Weighted target extends Target with weight (1-100 percentage) and optional health check
 (defrecord WeightedTarget [ip port weight health-check])
 
+;; DNS-backed weighted target - resolved to IPs at runtime
+;; host: hostname to resolve
+;; port: target port
+;; weight: weight for this target (1-100)
+;; dns-refresh-seconds: how often to re-resolve DNS
+;; health-check: optional health check config
+(defrecord DNSWeightedTarget [host port weight dns-refresh-seconds health-check])
+
 ;; Group of weighted targets with cumulative weights for fast selection
 ;; targets: vector of WeightedTarget
 ;; cumulative-weights: vector of cumulative percentages, e.g., [50 80 100] for weights [50 30 20]
 (defrecord TargetGroup [targets cumulative-weights])
+
+;; Target group that includes DNS-backed targets (before resolution)
+;; Used during config parsing; resolved to TargetGroup at runtime
+;; dns-targets: vector of DNSWeightedTarget
+;; static-targets: vector of WeightedTarget (already resolved)
+(defrecord DNSTargetGroup [dns-targets static-targets])
 
 ;; Source route now holds a TargetGroup instead of single Target
 (defrecord SourceRoute [source prefix-len target-group])
@@ -233,6 +255,11 @@
         (:unhealthy-threshold merged)
         (:expected-codes merged)))))
 
+(defn dns-target?
+  "Check if a target specification uses DNS (has :host instead of :ip)."
+  [target-spec]
+  (and (map? target-spec) (contains? target-spec :host)))
+
 (defn parse-weighted-target
   "Parse a target map to WeightedTarget record with resolved IP.
    If weight is not specified, defaults to 100 (for single target scenarios).
@@ -245,6 +272,19 @@
      (or weight 100)
      (parse-health-check-config health-check global-health-defaults))))
 
+(defn parse-dns-weighted-target
+  "Parse a DNS-backed target map to DNSWeightedTarget record.
+   The hostname will be resolved at runtime by the DNS manager.
+   global-health-defaults: optional global health check defaults from settings."
+  ([target-map] (parse-dns-weighted-target target-map nil))
+  ([{:keys [host port weight dns-refresh-seconds health-check]} global-health-defaults]
+   (->DNSWeightedTarget
+     host
+     port
+     (or weight 100)
+     (or dns-refresh-seconds 30)
+     (parse-health-check-config health-check global-health-defaults))))
+
 (defn compute-cumulative-weights
   "Compute cumulative weights from a sequence of WeightedTarget records.
    Example: targets with weights [50, 30, 20] -> cumulative [50, 80, 100]"
@@ -255,16 +295,35 @@
           targets))
 
 (defn parse-target-group
-  "Parse a target specification into a TargetGroup.
+  "Parse a target specification into a TargetGroup or DNSTargetGroup.
    Accepts either a single target map or a vector of targets.
-   Validates weights for multi-target groups."
+   Validates weights for multi-target groups.
+
+   Returns:
+   - TargetGroup if all targets are IP-based
+   - DNSTargetGroup if any targets use DNS hostnames"
   [target-spec context-msg]
-  (let [targets (if (vector? target-spec) target-spec [target-spec])]
+  (let [targets (if (vector? target-spec) target-spec [target-spec])
+        has-dns? (some dns-target? targets)]
     ;; Validate weights before parsing
     (validate-target-weights! targets context-msg)
-    (let [parsed (mapv parse-weighted-target targets)
-          cumulative (compute-cumulative-weights parsed)]
-      (->TargetGroup parsed cumulative))))
+    (if has-dns?
+      ;; Has DNS targets - return DNSTargetGroup for runtime resolution
+      (let [dns-targets (filterv dns-target? targets)
+            static-targets (filterv #(not (dns-target? %)) targets)
+            parsed-dns (mapv parse-dns-weighted-target dns-targets)
+            parsed-static (mapv parse-weighted-target static-targets)]
+        (->DNSTargetGroup parsed-dns parsed-static))
+      ;; All static - return regular TargetGroup
+      (let [parsed (mapv parse-weighted-target targets)
+            cumulative (compute-cumulative-weights parsed)]
+        (->TargetGroup parsed cumulative)))))
+
+(defn dns-target-group?
+  "Check if a parsed target group contains DNS targets.
+   Returns true for DNSTargetGroup, false for TargetGroup."
+  [target-group]
+  (instance? DNSTargetGroup target-group))
 
 (defn parse-target
   "Parse a single target map to Target record with resolved IP.
