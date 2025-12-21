@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Weighted load balancing support per SNI hostname
   - Runtime SNI route management (`add-sni-route!`, `remove-sni-route!`, `list-sni-routes`)
   - Graceful fallback to default target when SNI not found or parsing fails
+- New macros for cleaner code patterns
+  - `with-lb-state` macro in core API for cleaner state access (replaces 25 `when-let` patterns)
+  - `when-root` and `root?` in test utilities for root privilege checking
+  - `with-bpf-maps` macro for automatic BPF map cleanup in tests
+  - `with-xdp-attached` macro for automatic XDP detachment in tests
+- Shared test utilities namespace (`lb.test-util`) for common test patterns
+- Integration with `bpf/with-program` macro from clj-ebpf library for program lifecycle
 
 ## [0.1.0] - 2025-12-21
 
