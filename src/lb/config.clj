@@ -3,6 +3,7 @@
    Handles configuration data structures, validation, and persistence."
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
+            [clojure.set :as set]
             [clojure.spec.alpha :as s]
             [lb.util :as util]
             [clojure.tools.logging :as log]))
@@ -811,10 +812,10 @@
         new-keys (set (map source-route-key new-routes))
         old-by-key (into {} (map (juxt source-route-key identity) old-routes))
         new-by-key (into {} (map (juxt source-route-key identity) new-routes))
-        added-keys (clojure.set/difference new-keys old-keys)
-        removed-keys (clojure.set/difference old-keys new-keys)
+        added-keys (set/difference new-keys old-keys)
+        removed-keys (set/difference old-keys new-keys)
         ;; Also check for modified routes (same key, different target)
-        common-keys (clojure.set/intersection old-keys new-keys)
+        common-keys (set/intersection old-keys new-keys)
         modified-keys (filter (fn [k]
                                 (some? (diff-target-group
                                          (:target-group (old-by-key k))
@@ -835,10 +836,10 @@
         new-hostnames (set (map :hostname new-routes))
         old-by-hostname (into {} (map (juxt :hostname identity) old-routes))
         new-by-hostname (into {} (map (juxt :hostname identity) new-routes))
-        added-hostnames (clojure.set/difference new-hostnames old-hostnames)
-        removed-hostnames (clojure.set/difference old-hostnames new-hostnames)
+        added-hostnames (set/difference new-hostnames old-hostnames)
+        removed-hostnames (set/difference old-hostnames new-hostnames)
         ;; Also check for modified routes (same hostname, different target)
-        common-hostnames (clojure.set/intersection old-hostnames new-hostnames)
+        common-hostnames (set/intersection old-hostnames new-hostnames)
         modified-hostnames (filter (fn [h]
                                      (some? (diff-target-group
                                               (:target-group (old-by-hostname h))
@@ -888,9 +889,9 @@
         new-proxy-names (set (map :name (:proxies new-config)))
         old-proxies-by-name (into {} (map (juxt :name identity) (:proxies old-config)))
         new-proxies-by-name (into {} (map (juxt :name identity) (:proxies new-config)))
-        added-names (clojure.set/difference new-proxy-names old-proxy-names)
-        removed-names (clojure.set/difference old-proxy-names new-proxy-names)
-        common-names (clojure.set/intersection old-proxy-names new-proxy-names)
+        added-names (set/difference new-proxy-names old-proxy-names)
+        removed-names (set/difference old-proxy-names new-proxy-names)
+        common-names (set/intersection old-proxy-names new-proxy-names)
         ;; Check for modified proxies
         proxy-diffs (keep (fn [name]
                             (let [diff (diff-proxy (old-proxies-by-name name)
