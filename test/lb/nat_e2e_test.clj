@@ -7,6 +7,7 @@
             [lb.conntrack :as conntrack]
             [lb.programs.xdp-ingress :as xdp]
             [lb.programs.tc-egress :as tc]
+            [lb.test-util :refer [when-root]]
             [clj-ebpf.core :as bpf]))
 
 ;;; =============================================================================
@@ -355,13 +356,7 @@
 (deftest ^:integration test-full-nat-path-with-maps
   ;; This test requires root privileges to create BPF maps
   ;; Run with: sudo clojure -M:test
-
-  (when (= 0 (-> (Runtime/getRuntime)
-                  (.exec "id -u")
-                  (.getInputStream)
-                  (slurp)
-                  (clojure.string/trim)
-                  (Integer/parseInt)))
+  (when-root
     (testing "Full NAT path with real BPF maps"
       ;; Use with-bpf-maps for automatic cleanup
       (with-bpf-maps [listen-map (maps/create-listen-map test-config)

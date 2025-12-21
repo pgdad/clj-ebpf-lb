@@ -5,6 +5,7 @@
             [lb.maps :as maps]
             [lb.programs.xdp-ingress :as xdp]
             [lb.util :as util]
+            [lb.test-util :refer [when-root]]
             [clojure.tools.logging :as log]
             [clojure.java.shell :refer [sh]]))
 
@@ -131,12 +132,7 @@
 
 (deftest ^:integration test-xdp-pass-program
   ;; Test the simplest XDP program that just passes all packets
-  (when (= 0 (-> (Runtime/getRuntime)
-                 (.exec "id -u")
-                 (.getInputStream)
-                 (slurp)
-                 (clojure.string/trim)
-                 (Integer/parseInt)))
+  (when-root
     (testing "Simple XDP pass program loads and allows traffic"
       (with-veth-pair veth "pass"
         (let [{:keys [veth0 ns]} veth]
@@ -166,12 +162,7 @@
 
 (deftest ^:integration test-xdp-ipv4-filter
   ;; Test IPv4 filter program
-  (when (= 0 (-> (Runtime/getRuntime)
-                 (.exec "id -u")
-                 (.getInputStream)
-                 (slurp)
-                 (clojure.string/trim)
-                 (Integer/parseInt)))
+  (when-root
     (testing "IPv4 filter program loads and passes IPv4 traffic"
       (with-veth-pair veth "ipv4"
         (let [{:keys [veth0 ns]} veth]
@@ -191,12 +182,7 @@
 
 (deftest ^:integration test-xdp-dnat-program
   ;; Test the full DNAT program with maps
-  (when (= 0 (-> (Runtime/getRuntime)
-                 (.exec "id -u")
-                 (.getInputStream)
-                 (slurp)
-                 (clojure.string/trim)
-                 (Integer/parseInt)))
+  (when-root
     (testing "XDP DNAT program loads with maps"
       (with-veth-pair veth "dnat"
         (let [{:keys [veth0 ns]} veth

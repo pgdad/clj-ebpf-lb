@@ -45,6 +45,19 @@
   []
   (some? @proxy-state))
 
+(defmacro with-lb-state
+  "Execute body with load balancer state bound to the specified binding.
+   Returns nil if the load balancer is not running.
+
+   Example:
+     (with-lb-state [state]
+       (let [{:keys [maps config]} state]
+         ;; work with state
+         ))"
+  [[binding] & body]
+  `(when-let [~binding @proxy-state]
+     ~@body))
+
 ;;; =============================================================================
 ;;; Initialization
 ;;; =============================================================================
@@ -128,7 +141,7 @@
 (defn shutdown!
   "Shutdown the reverse proxy and release all resources."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (log/info "Shutting down load balancer")
 
     ;; Stop health checking
@@ -212,7 +225,7 @@
 (defn attach-interfaces!
   "Attach proxy programs to network interfaces."
   [interfaces]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [xdp-prog-fd tc-prog-fd attached-interfaces]} state]
       (doseq [iface interfaces]
         (when-not (contains? @attached-interfaces iface)
@@ -233,7 +246,7 @@
 (defn detach-interfaces!
   "Detach proxy programs from network interfaces."
   [interfaces]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [attached-interfaces]} state]
       (doseq [iface interfaces]
         (when (contains? @attached-interfaces iface)
@@ -254,7 +267,7 @@
 (defn list-attached-interfaces
   "List currently attached interfaces."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (vec @(:attached-interfaces state))))
 
 ;;; =============================================================================
@@ -265,7 +278,7 @@
   "Add a new proxy configuration at runtime.
    Now supports weighted load balancing with TargetGroup records."
   [proxy-config]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [parsed (config/parse-proxy-config proxy-config)
           new-config (config/add-proxy (:config state) parsed)]
 
@@ -297,7 +310,7 @@
 (defn remove-proxy!
   "Remove a proxy configuration at runtime."
   [proxy-name]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
       (let [{:keys [listen-map config-map]} (:maps state)
             {:keys [listen source-routes]} proxy-cfg
@@ -325,7 +338,7 @@
    - Weighted targets: [{:ip \"10.0.0.1\" :port 8080 :weight 50}
                         {:ip \"10.0.0.2\" :port 8080 :weight 50}]"
   [proxy-name source target]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [config-map]} (:maps state)
           {:keys [ip prefix-len]} (util/resolve-to-ip source)
           ;; Normalize target to TargetGroup
@@ -363,7 +376,7 @@
 (defn remove-source-route!
   "Remove a source route from a proxy."
   [proxy-name source]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [config-map]} (:maps state)
           {:keys [ip prefix-len]} (util/resolve-to-ip source)]
 
@@ -386,7 +399,7 @@
    - Weighted targets: [{:ip \"10.0.0.1\" :port 8443 :weight 50}
                         {:ip \"10.0.0.2\" :port 8443 :weight 50}]"
   [proxy-name hostname target]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [sni-map]} (:maps state)
           ;; Normalize target to TargetGroup
           target-group (cond
@@ -422,7 +435,7 @@
 (defn remove-sni-route!
   "Remove an SNI route from a proxy."
   [proxy-name hostname]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [sni-map]} (:maps state)]
 
       ;; Remove from BPF map
@@ -438,7 +451,7 @@
   "List all SNI routes for a proxy.
    Returns a sequence of {:hostname :target-group} maps."
   [proxy-name]
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
       (:sni-routes proxy-cfg))))
 
@@ -446,7 +459,7 @@
   "List all SNI routes from BPF map.
    Note: Returns hostname hashes since original hostnames aren't stored in BPF."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (let [{:keys [sni-map]} (:maps state)]
       (maps/list-sni-routes sni-map))))
 
@@ -457,27 +470,27 @@
 (defn enable-stats!
   "Enable statistics collection."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (maps/enable-stats (get-in state [:maps :settings-map]))
     (log/info "Statistics collection enabled")))
 
 (defn disable-stats!
   "Disable statistics collection."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (maps/disable-stats (get-in state [:maps :settings-map]))
     (log/info "Statistics collection disabled")))
 
 (defn stats-enabled?
   "Check if statistics collection is enabled."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (maps/stats-enabled? (get-in state [:maps :settings-map]))))
 
 (defn start-stats-stream!
   "Start streaming statistics events."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (when-not @(:stats-stream state)
       (let [stream (stats/create-event-stream
                      (get-in state [:maps :stats-ringbuf]))]
@@ -488,7 +501,7 @@
 (defn stop-stats-stream!
   "Stop streaming statistics events."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (when-let [stream @(:stats-stream state)]
       (stats/stop-event-stream stream)
       (reset! (:stats-stream state) nil)
@@ -497,7 +510,7 @@
 (defn subscribe-to-stats
   "Subscribe to the stats stream. Returns a channel."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (when-let [stream @(:stats-stream state)]
       (stats/subscribe-to-stream stream))))
 
@@ -508,25 +521,25 @@
 (defn get-connections
   "Get all active connections."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (conntrack/get-all-connections (get-in state [:maps :conntrack-map]))))
 
 (defn get-connection-count
   "Get the number of active connections."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (conntrack/count-connections (get-in state [:maps :conntrack-map]))))
 
 (defn clear-connections!
   "Clear all tracked connections."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (conntrack/clear-all-connections! (get-in state [:maps :conntrack-map]))))
 
 (defn get-connection-stats
   "Get aggregated connection statistics."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (conntrack/aggregate-stats (get-in state [:maps :conntrack-map]))))
 
 ;;; =============================================================================
@@ -565,13 +578,13 @@
 (defn print-config
   "Print current configuration."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (println (config/format-config (:config state)))))
 
 (defn print-connections
   "Print active connections."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (conntrack/print-connections (get-in state [:maps :conntrack-map]))))
 
 ;;; =============================================================================
@@ -639,7 +652,7 @@
 (defn health-check-enabled?
   "Check if health checking is enabled."
   []
-  (when-let [state @proxy-state]
+  (with-lb-state [state]
     (get-in state [:config :settings :health-check-enabled])))
 
 ;;; =============================================================================
