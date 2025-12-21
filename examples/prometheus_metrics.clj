@@ -11,7 +11,7 @@
 ;;   - None for standalone metrics server
 ;;   - Running load balancer for full integration
 
-(ns examples.prometheus-metrics
+(ns prometheus-metrics
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.metrics :as metrics]
@@ -405,8 +405,9 @@
 (println "Prometheus metrics example loaded.")
 (println "")
 (println "To run the demo:")
-(println "  (examples.prometheus-metrics/run-demo)")
+(println "  (require 'prometheus-metrics)")
+(println "  (prometheus-metrics/run-demo)")
 (println "")
 (println "Or switch namespace first:")
-(println "  (in-ns 'examples.prometheus-metrics)")
+(println "  (in-ns 'prometheus-metrics)")
 (println "  (run-demo)")

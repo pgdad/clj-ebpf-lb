@@ -26,7 +26,8 @@
 
 (declare apply-config! attach-interfaces! detach-interfaces!
          register-health-checks! unregister-health-checks!
-         register-dns-targets! unregister-dns-targets!)
+         register-dns-targets! unregister-dns-targets!
+         create-drain-update-fn register-reload-functions!)
 
 ;;; =============================================================================
 ;;; Proxy State
