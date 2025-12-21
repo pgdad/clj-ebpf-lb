@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2025-12-21
+
 ### Added
 - Connection draining for graceful backend removal
   - Stop new connections while allowing existing ones to complete
@@ -17,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Status functions: `get-drain-status`, `get-all-draining`, `draining?`
   - Drain-aware weight computation integrates with health system
   - No BPF changes required (uses existing weight=0 handling)
+  - Comprehensive examples in `examples/connection-draining.clj`
 
 ## [0.2.0] - 2025-12-21
 
@@ -57,6 +60,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
-[Unreleased]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pgdad/clj-ebpf-lb/releases/tag/v0.1.0
