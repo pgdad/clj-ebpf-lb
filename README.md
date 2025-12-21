@@ -13,6 +13,7 @@ A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP
 - **TC Egress SNAT**: Return traffic has its source address rewritten to appear as the proxy
 - **Connection Tracking**: Full stateful NAT with per-CPU hash maps for scalability
 - **Source-Based Routing**: Route traffic to different backends based on client IP/subnet
+- **SNI-Based Routing**: Route TLS traffic based on hostname without terminating TLS (layer 4 passthrough)
 - **Weighted Load Balancing**: Distribute traffic across multiple backends with configurable weights
 - **Runtime Configuration**: Add/remove proxies and routes without restart
 - **Statistics Collection**: Real-time connection and traffic statistics via ring buffer
@@ -148,7 +149,50 @@ Route traffic to different backends based on the client's source IP:
 
 The routing precedence is:
 1. Most specific source route (longest prefix match)
-2. Default target (if no route matches)
+2. SNI hostname match (for TLS traffic)
+3. Default target (if no route matches)
+
+### SNI-Based Routing
+
+Route TLS traffic to different backends based on the Server Name Indication (SNI) hostname in the TLS ClientHello. This enables multi-tenant HTTPS load balancing without terminating TLS (layer 4 passthrough with layer 7 inspection).
+
+```clojure
+{:proxies
+ [{:name "https-gateway"
+   :listen {:interfaces ["eth0"] :port 443}
+   :default-target {:ip "10.0.0.1" :port 8443}
+   :sni-routes
+   [{:sni-hostname "api.example.com"
+     :target {:ip "10.0.1.1" :port 8443}}
+    {:sni-hostname "web.example.com"
+     :target {:ip "10.0.2.1" :port 8443}}
+    {:sni-hostname "app.example.com"
+     :targets [{:ip "10.0.3.1" :port 8443 :weight 70}
+               {:ip "10.0.3.2" :port 8443 :weight 30}]}]}]}
+```
+
+**How it works:**
+1. XDP program parses the TLS ClientHello to extract the SNI hostname
+2. Hostname is hashed (FNV-1a 64-bit) for efficient BPF map lookup
+3. If SNI route found, traffic is routed to the configured backend(s)
+4. If no SNI match or non-TLS traffic, falls back to source routes or default target
+
+**SNI Routing Features:**
+- **Case-insensitive**: `API.Example.COM` matches `api.example.com`
+- **Weighted targets**: Distribute traffic across multiple backends per hostname
+- **Zero TLS overhead**: No decryption/encryption, packets are passed through
+- **Kernel-level performance**: SNI parsing adds ~50-100ns per TLS connection
+
+**Use Cases:**
+- Multi-tenant SaaS with per-customer backends
+- Microservices routing (api.*, web.*, admin.*)
+- Blue/green deployments per service
+- Geographic or capacity-based routing per hostname
+
+**Limitations:**
+- Exact hostname match only (no wildcards like `*.example.com`)
+- Requires TLS 1.0+ with SNI extension (supported by all modern clients)
+- Maximum 64-byte hostnames (longer hostnames are truncated)
 
 ### Weighted Load Balancing
 
@@ -317,6 +361,27 @@ Use the load balancer as a library in your Clojure application:
 ;; Add/remove source routes
 (lb/add-source-route! "web" "10.20.0.0/16" {:ip "10.0.0.5" :port 8080})
 (lb/remove-source-route! "web" "10.20.0.0/16")
+
+;; Add/remove SNI routes (for TLS traffic)
+(lb/add-sni-route! "https-gateway" "api.example.com"
+                   {:ip "10.0.1.1" :port 8443})
+
+;; Add weighted SNI route
+(lb/add-sni-route! "https-gateway" "web.example.com"
+                   [{:ip "10.0.2.1" :port 8443 :weight 70}
+                    {:ip "10.0.2.2" :port 8443 :weight 30}])
+
+;; Remove SNI route (case-insensitive)
+(lb/remove-sni-route! "https-gateway" "api.example.com")
+
+;; List SNI routes
+(lb/list-sni-routes "https-gateway")
+;; => [{:hostname "web.example.com"
+;;      :targets [{:ip "10.0.2.1" :port 8443 :weight 70}
+;;                {:ip "10.0.2.2" :port 8443 :weight 30}]}]
+
+;; List all SNI routes across all proxies
+(lb/list-all-sni-routes)
 
 ;; Attach/detach interfaces
 (lb/attach-interfaces! ["eth1" "eth2"])
