@@ -30,7 +30,8 @@
      :health-fn    - (fn [] health-status) returns health status for all proxies
      :stats-fn     - (fn [] stats) returns aggregated stats map
      :dns-fn       - (fn [] dns-status) returns DNS status for all proxies
-     :proxies-fn   - (fn [] proxies) returns list of proxy configurations"
+     :proxies-fn   - (fn [] proxies) returns list of proxy configurations
+     :latency-fn   - (fn [] histograms) returns backend latency histograms"
   [sources]
   (reset! data-sources sources))
 
@@ -255,6 +256,22 @@
         "Health check latency in seconds"
         [:proxy_name :target_id]))))
 
+(defn- collect-backend-latency-histogram
+  "Collect lb_backend_latency_seconds histogram - connection duration per backend."
+  []
+  (when-let [latency-fn (:latency-fn @data-sources)]
+    (try
+      (let [histograms (latency-fn)]
+        (when (seq histograms)
+          (histograms/format-histogram-family
+            histograms
+            "lb_backend_latency_seconds"
+            "Backend connection latency in seconds"
+            [:proxy_name :target_ip :target_port])))
+      (catch Exception e
+        (log/warn e "Error collecting lb_backend_latency_seconds")
+        nil))))
+
 (defn- collect-circuit-breaker-state
   "Collect lb_circuit_breaker_state gauge - circuit breaker state (0=closed, 1=half-open, 2=open)."
   []
@@ -354,7 +371,7 @@
     "lb_info"
     "gauge"
     "Load balancer information"
-    [(format-metric-line "lb_info" {:version "0.6.0"} 1)]))
+    [(format-metric-line "lb_info" {:version "0.8.0"} 1)]))
 
 (defn- collect-up
   "Collect lb_up gauge - whether the load balancer is running."
@@ -384,6 +401,7 @@
                  (collect-backend-health)
                  (collect-dns-status)
                  (collect-health-latency-histogram)
+                 (collect-backend-latency-histogram)
                  (collect-circuit-breaker-state)
                  (collect-circuit-breaker-error-rate)]]
     (str (str/join "\n\n" (filter some? metrics)) "\n")))

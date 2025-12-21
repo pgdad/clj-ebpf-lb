@@ -16,6 +16,8 @@
             [lb.reload :as reload]
             [lb.dns :as dns]
             [lb.metrics :as metrics]
+            [lb.latency :as latency]
+            [lb.access-log :as access-log]
             [lb.lb-manager :as lb-manager]
             [lb.util :as util]
             [clojure.tools.logging :as log]
@@ -180,8 +182,31 @@
                    :dns-fn #(dns/get-all-status)
                    :circuit-breaker-fn #(circuit-breaker/get-status)
                    :lb-algorithm-fn #(lb-manager/get-algorithm)
-                   :lb-connections-fn #(lb-manager/get-connection-counts)})
+                   :lb-connections-fn #(lb-manager/get-connection-counts)
+                   :latency-fn #(latency/get-histograms-for-metrics)})
                 (metrics/start! (get-in config [:settings :metrics])))
+
+              ;; Start latency tracking if metrics are enabled (needs stats stream)
+              (when (get-in config [:settings :metrics :enabled])
+                (log/info "Starting backend latency tracking")
+                ;; Ensure stats stream is running for latency tracking
+                (let [stream (or @(:stats-stream state)
+                                 (let [s (stats/create-event-stream
+                                           (:stats-ringbuf ebpf-maps))]
+                                   (reset! (:stats-stream state) s)
+                                   s))
+                      proxy-name (or (:name (first (:proxies config))) "default")]
+                  (latency/start! stream (:conntrack-map ebpf-maps) proxy-name)))
+
+              ;; Start access logging if enabled (needs stats stream)
+              (when (get-in config [:settings :access-log :enabled])
+                (let [stream (or @(:stats-stream state)
+                                 (let [s (stats/create-event-stream
+                                           (:stats-ringbuf ebpf-maps))]
+                                   (reset! (:stats-stream state) s)
+                                   s))
+                      access-log-config (get-in config [:settings :access-log])]
+                  (access-log/start! access-log-config stream (:conntrack-map ebpf-maps))))
 
               (log/info "Load balancer initialized successfully")
               state))))
@@ -197,7 +222,15 @@
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
 
-    ;; Stop metrics server first
+    ;; Stop access logging first (before stats stream)
+    (when (access-log/running?)
+      (access-log/stop!))
+
+    ;; Stop latency tracking (before stats stream)
+    (when (latency/running?)
+      (latency/stop!))
+
+    ;; Stop metrics server
     (when (metrics/running?)
       (metrics/stop!)
       (metrics/clear-data-sources!))

@@ -20,6 +20,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [circuit_breaker.clj](#circuit-breaker) | Automatic failure detection and recovery | Advanced |
 | [least_connections.clj](#least-connections) | Dynamic weight adjustment based on connections | Intermediate |
 | [session_persistence.clj](#session-persistence) | Sticky sessions based on source IP hash | Intermediate |
+| [access_logging.clj](#access-logging) | Access logs and backend latency tracking | Intermediate |
 
 ## Prerequisites
 
@@ -594,6 +595,88 @@ Same source IP always produces the same hash, selecting the same backend (unless
 - Short-lived requests
 - When backends have unequal capacity
 - During canary deployments
+
+---
+
+### Access Logging
+
+Access logging and backend latency tracking for monitoring, debugging, and audit trails.
+
+**File: `access_logging.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'access-logging)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'access-logging)
+```
+
+The example demonstrates:
+- Configuring access logging to stdout and rotating file
+- JSON and CLF (Common Log Format) output formats
+- Backend latency histogram tracking
+- Prometheus metrics integration
+
+**JSON Log Format**:
+```json
+{"timestamp":"2025-01-15T10:30:45.123Z","event":"conn-closed",
+ "src":{"ip":"192.168.1.100","port":54321},
+ "dst":{"ip":"10.0.0.1","port":80},
+ "backend":{"ip":"10.0.0.5","port":8080},
+ "duration_ms":1523,"bytes_fwd":1024,"bytes_rev":4096,"protocol":"tcp"}
+```
+
+**CLF Log Format**:
+```
+192.168.1.100 - - [15/Jan/2025:10:30:45 +0000] "CONN-CLOSED 10.0.0.1:80 -> 10.0.0.5:8080" 1024/4096 1523ms
+```
+
+**Configuration**:
+```clojure
+{:settings
+ {:stats-enabled true               ; Required for access logging
+  :metrics {:enabled true           ; Required for latency histograms
+            :port 9090}
+  :access-log {:enabled true
+               :format :json         ; :json or :clf
+               :path "logs/access.log"
+               :max-file-size-mb 100  ; Rotate at 100MB
+               :max-files 10          ; Keep 10 rotated files
+               :buffer-size 10000}}}  ; Async buffer size
+```
+
+**Backend Latency Metrics** (available at `/metrics`):
+```
+# HELP lb_backend_latency_seconds Backend connection latency in seconds
+# TYPE lb_backend_latency_seconds histogram
+lb_backend_latency_seconds_bucket{proxy_name="web",target_ip="10.0.0.1",target_port="8080",le="0.01"} 15
+lb_backend_latency_seconds_bucket{proxy_name="web",target_ip="10.0.0.1",target_port="8080",le="+Inf"} 100
+lb_backend_latency_seconds_sum{proxy_name="web",target_ip="10.0.0.1",target_port="8080"} 45.678
+lb_backend_latency_seconds_count{proxy_name="web",target_ip="10.0.0.1",target_port="8080"} 100
+```
+
+**Key API Functions**:
+```clojure
+;; Access logging
+(require '[lb.access-log :as access-log])
+(access-log/running?)               ; Check if logging is active
+(access-log/get-status)             ; Get log file status
+(access-log/flush!)                 ; Flush buffers before shutdown
+
+;; Backend latency tracking
+(require '[lb.latency :as latency])
+(latency/running?)                  ; Check if tracking is active
+(latency/get-percentiles "web" "10.0.0.1:8080")
+;; => {:p50 0.023 :p95 0.15 :p99 0.45 :mean 0.056 :count 1523}
+(latency/get-all-histograms)        ; All per-backend histograms
+(latency/reset-histograms!)         ; Reset for testing
+```
 
 ---
 

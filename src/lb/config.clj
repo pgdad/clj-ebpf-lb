@@ -157,11 +157,24 @@
 (s/def ::load-balancing
   (s/keys :opt-un [::lb-algorithm ::lb-weighted ::lb-update-interval-ms]))
 
+;; Access log settings
+(s/def ::access-log-format #{:json :clf})
+(s/def ::access-log-path (s/and string? #(not (clojure.string/blank? %))))
+(s/def ::access-log-max-file-size-mb (s/and int? #(>= % 1) #(<= % 1024)))
+(s/def ::access-log-max-files (s/and int? #(>= % 1) #(<= % 100)))
+(s/def ::access-log-buffer-size (s/and int? #(>= % 100) #(<= % 100000)))
+
+(s/def ::access-log
+  (s/keys :opt-un [::enabled ::access-log-format ::access-log-path
+                   ::access-log-max-file-size-mb ::access-log-max-files
+                   ::access-log-buffer-size]))
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
                    ::default-drain-timeout-ms ::drain-check-interval-ms
-                   ::rate-limits ::metrics ::circuit-breaker ::load-balancing]))
+                   ::rate-limits ::metrics ::circuit-breaker ::load-balancing
+                   ::access-log]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -243,11 +256,29 @@
 ;; update-interval-ms: how often to update weights for least-connections (default 1000)
 (defrecord LoadBalancingConfig [algorithm weighted update-interval-ms])
 
+;; Access log configuration
+;; enabled: whether access logging is active
+;; format: :json (default) or :clf (Common Log Format)
+;; path: file path for log output (e.g., "logs/access.log")
+;; max-file-size-mb: max size before rotation (default 100)
+;; max-files: max number of rotated files to keep (default 10)
+;; buffer-size: async channel buffer size (default 10000)
+(defrecord AccessLogConfig [enabled format path max-file-size-mb max-files buffer-size])
+
 ;; Default load balancing configuration values
 (def default-load-balancing-config
   {:algorithm :weighted-random
    :weighted true
    :update-interval-ms 1000})
+
+;; Default access log configuration values
+(def default-access-log-config
+  {:enabled false
+   :format :json
+   :path "logs/access.log"
+   :max-file-size-mb 100
+   :max-files 10
+   :buffer-size 10000})
 
 ;; Source route now holds a TargetGroup instead of single Target
 ;; session-persistence: optional boolean for sticky sessions
@@ -270,7 +301,7 @@
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
                      health-check-enabled health-check-defaults
                      default-drain-timeout-ms drain-check-interval-ms
-                     load-balancing])
+                     load-balancing access-log])
 (defrecord Config [proxies settings])
 
 ;;; =============================================================================
@@ -353,6 +384,30 @@
       (:algorithm merged)
       (:weighted merged)
       (:update-interval-ms merged))))
+
+(defn parse-access-log-config
+  "Parse access log configuration, merging with defaults."
+  [access-log-map]
+  (let [;; Normalize keys from spec format to config format
+        normalized (cond-> (or access-log-map {})
+                     (contains? access-log-map :access-log-format)
+                     (assoc :format (:access-log-format access-log-map))
+                     (contains? access-log-map :access-log-path)
+                     (assoc :path (:access-log-path access-log-map))
+                     (contains? access-log-map :access-log-max-file-size-mb)
+                     (assoc :max-file-size-mb (:access-log-max-file-size-mb access-log-map))
+                     (contains? access-log-map :access-log-max-files)
+                     (assoc :max-files (:access-log-max-files access-log-map))
+                     (contains? access-log-map :access-log-buffer-size)
+                     (assoc :buffer-size (:access-log-buffer-size access-log-map)))
+        merged (merge default-access-log-config normalized)]
+    (->AccessLogConfig
+      (:enabled merged)
+      (:format merged)
+      (:path merged)
+      (:max-file-size-mb merged)
+      (:max-files merged)
+      (:buffer-size merged))))
 
 (defn dns-target?
   "Check if a target specification uses DNS (has :host instead of :ip)."
@@ -479,7 +534,8 @@
     (get settings :health-check-defaults default-health-check-config)
     (get settings :default-drain-timeout-ms 30000)       ; 30 seconds default
     (get settings :drain-check-interval-ms 1000)
-    (parse-load-balancing-config (get settings :load-balancing))))
+    (parse-load-balancing-config (get settings :load-balancing))
+    (parse-access-log-config (get settings :access-log))))
 
 (defn parse-config
   "Parse full configuration from EDN map."
@@ -611,7 +667,14 @@
     :load-balancing (let [lb (get-in config [:settings :load-balancing])]
                       {:algorithm (:algorithm lb)
                        :weighted (:weighted lb)
-                       :update-interval-ms (:update-interval-ms lb)})}})
+                       :update-interval-ms (:update-interval-ms lb)})
+    :access-log (let [al (get-in config [:settings :access-log])]
+                  {:enabled (:enabled al)
+                   :format (:format al)
+                   :path (:path al)
+                   :max-file-size-mb (:max-file-size-mb al)
+                   :max-files (:max-files al)
+                   :buffer-size (:buffer-size al)})}})
 
 (defn save-config-file
   "Save configuration to an EDN file."
@@ -627,7 +690,8 @@
 (def default-settings
   "Default settings values."
   (->Settings false 300 100000 false default-health-check-config 30000 1000
-              (parse-load-balancing-config nil)))
+              (parse-load-balancing-config nil)
+              (parse-access-log-config nil)))
 
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
@@ -673,7 +737,8 @@
        []     ; sni-routes
        false)] ; session-persistence
     (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config
-                30000 1000 (parse-load-balancing-config nil))))
+                30000 1000 (parse-load-balancing-config nil)
+                (parse-access-log-config nil))))
 
 ;;; =============================================================================
 ;;; Configuration Modification

@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2025-12-21
+
+### Added
+- Access logging for connection events with audit trail and debugging support
+  - Logs connection lifecycle events (new-conn, conn-closed) to stdout and file
+  - JSON format with structured data (timestamps, IPs, ports, duration, bytes)
+  - CLF (Common Log Format) style for familiar Apache/nginx-like output
+  - Rotating file writer with configurable size and file count limits
+  - Async non-blocking design with buffered channels
+  - Configuration: `{:settings {:access-log {:enabled true :format :json :path "logs/access.log"}}}`
+  - Runtime API: `access-log/running?`, `access-log/get-status`, `access-log/flush!`
+  - New modules: `lb.access-log`, `lb.access-log.logger`, `lb.access-log.file-writer`
+- Backend latency tracking for per-backend connection duration histograms
+  - Tracks connection lifetime (creation to close) as latency metric
+  - Prometheus histogram metrics: `lb_backend_latency_seconds` with buckets
+  - Percentile queries: p50, p95, p99, mean, count per backend
+  - Zero BPF changes required (uses existing stats event stream)
+  - Automatic integration when metrics enabled
+  - Runtime API: `latency/get-percentiles`, `latency/get-all-histograms`, `latency/get-status`
+  - New module: `lb.latency`
+  - Comprehensive examples in `examples/access_logging.clj`
+
+### Changed
+- Added `org.clojure/data.json` dependency for JSON formatting
+
 ## [0.7.0] - 2025-12-21
 
 ### Added
@@ -159,6 +184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
+[0.8.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.4.0...v0.5.0
