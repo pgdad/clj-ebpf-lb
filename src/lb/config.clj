@@ -12,17 +12,48 @@
 ;;; Specs for Configuration Validation
 ;;; =============================================================================
 
-;; IP address as string
-(s/def ::ip-string (s/and string? #(re-matches #"\d+\.\d+\.\d+\.\d+" %)))
+;; IPv4 address as string (dotted decimal)
+(s/def ::ipv4-string (s/and string? #(re-matches #"\d+\.\d+\.\d+\.\d+" %)))
 
-;; CIDR notation
-(s/def ::cidr-string (s/and string? #(re-matches #"\d+\.\d+\.\d+\.\d+(/\d+)?" %)))
+;; IPv6 address as string (colon-hex format, supports :: abbreviation)
+;; Uses util/ipv6? for validation which handles all common formats
+(s/def ::ipv6-string
+  (s/and string?
+         #(util/ipv6? %)))
+
+;; Unified IP address (IPv4 or IPv6)
+(s/def ::unified-ip (s/or :ipv4 ::ipv4-string :ipv6 ::ipv6-string))
+
+;; Legacy alias for backward compatibility
+(s/def ::ip-string ::ipv4-string)
+
+;; IPv4 CIDR notation
+(s/def ::ipv4-cidr-string (s/and string? #(re-matches #"\d+\.\d+\.\d+\.\d+(/\d+)?" %)))
+
+;; IPv6 CIDR notation
+(s/def ::ipv6-cidr-string
+  (s/and string?
+         #(let [parts (clojure.string/split % #"/" 2)]
+            (and (s/valid? ::ipv6-string (first parts))
+                 (or (= 1 (count parts))
+                     (when-let [prefix (second parts)]
+                       (let [n (try (Integer/parseInt prefix) (catch Exception _ -1))]
+                         (and (>= n 0) (<= n 128)))))))))
+
+;; Unified CIDR notation (IPv4 or IPv6)
+(s/def ::unified-cidr (s/or :ipv4 ::ipv4-cidr-string :ipv6 ::ipv6-cidr-string))
+
+;; Legacy alias for backward compatibility
+(s/def ::cidr-string ::ipv4-cidr-string)
 
 ;; Hostname
 (s/def ::hostname (s/and string? #(re-matches #"[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]*[a-zA-Z0-9])?)*" %)))
 
-;; Source specification (IP, CIDR, or hostname)
-(s/def ::source (s/or :cidr ::cidr-string :hostname ::hostname))
+;; Source specification (IPv4/IPv6 CIDR, or hostname)
+;; Supports both IPv4 (192.168.1.0/24) and IPv6 (2001:db8::/32) CIDR notation
+(s/def ::source (s/or :ipv4-cidr ::ipv4-cidr-string
+                      :ipv6-cidr ::ipv6-cidr-string
+                      :hostname ::hostname))
 
 ;; Port number
 (s/def ::port (s/and int? #(>= % 1) #(<= % 65535)))
@@ -44,8 +75,14 @@
                    ::healthy-threshold ::unhealthy-threshold ::expected-codes]))
 
 ;; Target specification (single target, with optional weight and health check)
+;; ::ip accepts IPv4 only for backward compatibility
 (s/def ::ip ::ip-string)
 (s/def ::target (s/keys :req-un [::ip ::port] :opt-un [::weight ::health-check]))
+
+;; Unified target specification (IPv4 or IPv6)
+;; Use ::ip6 key for unified IP to distinguish from legacy ::ip
+(s/def ::ip6 ::unified-ip)
+(s/def ::unified-target (s/keys :req-un [::ip6 ::port] :opt-un [::weight ::health-check]))
 
 ;; DNS-backed target specification (uses hostname instead of IP)
 (s/def ::host ::hostname)
