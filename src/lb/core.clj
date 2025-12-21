@@ -16,6 +16,7 @@
             [lb.reload :as reload]
             [lb.dns :as dns]
             [lb.metrics :as metrics]
+            [lb.lb-manager :as lb-manager]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -30,6 +31,7 @@
          register-health-checks! unregister-health-checks!
          register-dns-targets! unregister-dns-targets!
          register-circuit-breakers! unregister-circuit-breakers!
+         register-lb-proxies! unregister-lb-proxies!
          create-drain-update-fn create-circuit-breaker-update-fn
          register-reload-functions!)
 
@@ -163,6 +165,9 @@
               ;; Initialize circuit breaker if enabled
               (register-circuit-breakers! ebpf-maps config)
 
+              ;; Initialize least-connections load balancing if enabled
+              (register-lb-proxies! ebpf-maps config)
+
               ;; Register reload functions for hot reload support
               (register-reload-functions!)
 
@@ -173,7 +178,9 @@
                   {:conntrack-fn #(conntrack/get-all-connections (:conntrack-map ebpf-maps))
                    :health-fn #(health/get-all-status)
                    :dns-fn #(dns/get-all-status)
-                   :circuit-breaker-fn #(circuit-breaker/get-status)})
+                   :circuit-breaker-fn #(circuit-breaker/get-status)
+                   :lb-algorithm-fn #(lb-manager/get-algorithm)
+                   :lb-connections-fn #(lb-manager/get-connection-counts)})
                 (metrics/start! (get-in config [:settings :metrics])))
 
               (log/info "Load balancer initialized successfully")
@@ -204,6 +211,9 @@
 
     ;; Shutdown rate limiting
     (rate-limit/shutdown!)
+
+    ;; Shutdown least-connections load balancing
+    (unregister-lb-proxies!)
 
     ;; Shutdown circuit breaker
     (unregister-circuit-breakers! (:config state))
@@ -1045,6 +1055,91 @@
   "Print circuit breaker status for all targets."
   []
   (circuit-breaker/print-status))
+
+;;; =============================================================================
+;;; Least-Connections Load Balancing
+;;; =============================================================================
+
+(defn- create-health-status-fn
+  "Create a function that returns current health statuses for a proxy."
+  [proxy-name target-group]
+  (fn []
+    (let [targets (:targets target-group)]
+      (if-let [status (health/get-status proxy-name)]
+        (mapv (fn [target]
+                (let [target-id (str (util/u32->ip-string (:ip target)) ":" (:port target))]
+                  (get-in status [:targets target-id :healthy?] true)))
+              targets)
+        (vec (repeat (count targets) true))))))
+
+(defn- create-drain-status-fn
+  "Create a function that returns current drain statuses for a proxy."
+  [proxy-name target-group]
+  (fn []
+    (let [targets (:targets target-group)]
+      (mapv (fn [target]
+              (let [target-id (str (util/u32->ip-string (:ip target)) ":" (:port target))]
+                (drain/draining? target-id)))
+            targets))))
+
+(defn- create-cb-status-fn
+  "Create a function that returns current circuit breaker states for a proxy."
+  [proxy-name target-group]
+  (fn []
+    (let [targets (:targets target-group)]
+      (mapv (fn [target]
+              (let [target-id (str (util/u32->ip-string (:ip target)) ":" (:port target))]
+                (if-let [cb (circuit-breaker/get-circuit target-id)]
+                  (:state cb)
+                  :closed)))
+            targets))))
+
+(defn- register-lb-proxies!
+  "Register all proxies for least-connections load balancing."
+  [ebpf-maps config]
+  (let [lb-config (get-in config [:settings :load-balancing])]
+    (when (= :least-connections (:algorithm lb-config))
+      (log/info "Starting least-connections load balancing system")
+      ;; Start the manager with conntrack map
+      (lb-manager/start! (:conntrack-map ebpf-maps) lb-config)
+      ;; Register each proxy
+      (let [listen-map (:listen-map ebpf-maps)]
+        (doseq [proxy-cfg (:proxies config)]
+          (let [target-group (:default-target proxy-cfg)
+                proxy-name (:name proxy-cfg)
+                {:keys [interfaces port]} (:listen proxy-cfg)]
+            (lb-manager/register-proxy! proxy-name target-group interfaces port listen-map
+              :get-health-fn (create-health-status-fn proxy-name target-group)
+              :get-drain-fn (create-drain-status-fn proxy-name target-group)
+              :get-cb-fn (create-cb-status-fn proxy-name target-group))
+            (log/info "Registered proxy" proxy-name "for least-connections load balancing")))))))
+
+(defn- unregister-lb-proxies!
+  "Stop the least-connections load balancing system."
+  []
+  (when (lb-manager/running?)
+    (lb-manager/stop!)
+    (log/info "Least-connections load balancing system stopped")))
+
+(defn get-lb-algorithm
+  "Get the current load balancing algorithm (:weighted-random or :least-connections)."
+  []
+  (lb-manager/get-algorithm))
+
+(defn get-lb-status
+  "Get current load balancing status."
+  []
+  (lb-manager/get-status))
+
+(defn lb-least-connections?
+  "Check if least-connections load balancing is enabled."
+  []
+  (= :least-connections (lb-manager/get-algorithm)))
+
+(defn force-lb-update!
+  "Force an immediate weight update for least-connections."
+  []
+  (lb-manager/force-update!))
 
 ;;; =============================================================================
 ;;; Hot Reload

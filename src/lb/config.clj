@@ -146,11 +146,19 @@
   (s/keys :opt-un [::enabled ::error-threshold-pct ::cb-min-requests
                    ::open-duration-ms ::half-open-requests ::window-size-ms]))
 
+;; Load balancing settings
+(s/def ::lb-algorithm #{:weighted-random :least-connections})
+(s/def ::lb-weighted boolean?)
+(s/def ::lb-update-interval-ms (s/and int? #(>= % 100) #(<= % 10000)))
+
+(s/def ::load-balancing
+  (s/keys :opt-un [::lb-algorithm ::lb-weighted ::lb-update-interval-ms]))
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
                    ::default-drain-timeout-ms ::drain-check-interval-ms
-                   ::rate-limits ::metrics ::circuit-breaker]))
+                   ::rate-limits ::metrics ::circuit-breaker ::load-balancing]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -226,6 +234,18 @@
    :half-open-requests 3
    :window-size-ms 60000})
 
+;; Load balancing configuration
+;; algorithm: :weighted-random (default) or :least-connections
+;; weighted: whether to factor in original weights (default true)
+;; update-interval-ms: how often to update weights for least-connections (default 1000)
+(defrecord LoadBalancingConfig [algorithm weighted update-interval-ms])
+
+;; Default load balancing configuration values
+(def default-load-balancing-config
+  {:algorithm :weighted-random
+   :weighted true
+   :update-interval-ms 1000})
+
 ;; Source route now holds a TargetGroup instead of single Target
 (defrecord SourceRoute [source prefix-len target-group])
 
@@ -243,7 +263,8 @@
 
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
                      health-check-enabled health-check-defaults
-                     default-drain-timeout-ms drain-check-interval-ms])
+                     default-drain-timeout-ms drain-check-interval-ms
+                     load-balancing])
 (defrecord Config [proxies settings])
 
 ;;; =============================================================================
@@ -308,6 +329,24 @@
       (:open-duration-ms merged)
       (:half-open-requests merged)
       (:window-size-ms merged))))
+
+(defn parse-load-balancing-config
+  "Parse load balancing configuration, merging with defaults.
+   Config keys use lb- prefix in specs but normal names in config maps."
+  [lb-config-map]
+  (let [;; Handle both prefixed spec keys and normal config keys
+        normalized (cond-> (or lb-config-map {})
+                     (contains? lb-config-map :lb-algorithm)
+                     (assoc :algorithm (:lb-algorithm lb-config-map))
+                     (contains? lb-config-map :lb-weighted)
+                     (assoc :weighted (:lb-weighted lb-config-map))
+                     (contains? lb-config-map :lb-update-interval-ms)
+                     (assoc :update-interval-ms (:lb-update-interval-ms lb-config-map)))
+        merged (merge default-load-balancing-config normalized)]
+    (->LoadBalancingConfig
+      (:algorithm merged)
+      (:weighted merged)
+      (:update-interval-ms merged))))
 
 (defn dns-target?
   "Check if a target specification uses DNS (has :host instead of :ip)."
@@ -432,7 +471,8 @@
     (get settings :health-check-enabled false)
     (get settings :health-check-defaults default-health-check-config)
     (get settings :default-drain-timeout-ms 30000)       ; 30 seconds default
-    (get settings :drain-check-interval-ms 1000)))
+    (get settings :drain-check-interval-ms 1000)
+    (parse-load-balancing-config (get settings :load-balancing))))
 
 (defn parse-config
   "Parse full configuration from EDN map."
@@ -560,7 +600,11 @@
     :health-check-enabled (get-in config [:settings :health-check-enabled])
     :health-check-defaults (get-in config [:settings :health-check-defaults])
     :default-drain-timeout-ms (get-in config [:settings :default-drain-timeout-ms])
-    :drain-check-interval-ms (get-in config [:settings :drain-check-interval-ms])}})
+    :drain-check-interval-ms (get-in config [:settings :drain-check-interval-ms])
+    :load-balancing (let [lb (get-in config [:settings :load-balancing])]
+                      {:algorithm (:algorithm lb)
+                       :weighted (:weighted lb)
+                       :update-interval-ms (:update-interval-ms lb)})}})
 
 (defn save-config-file
   "Save configuration to an EDN file."
@@ -575,7 +619,8 @@
 
 (def default-settings
   "Default settings values."
-  (->Settings false 300 100000 false default-health-check-config 30000 1000))
+  (->Settings false 300 100000 false default-health-check-config 30000 1000
+              (parse-load-balancing-config nil)))
 
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
@@ -620,7 +665,7 @@
        []   ; source-routes
        [])] ; sni-routes
     (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config
-                30000 1000)))
+                30000 1000 (parse-load-balancing-config nil))))
 
 ;;; =============================================================================
 ;;; Configuration Modification

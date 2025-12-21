@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2025-12-21
+
+### Added
+- Least-connections load balancing algorithm for dynamic traffic distribution
+  - Routes new connections to backends with fewer active connections
+  - Userspace periodic weight updates leveraging existing conntrack data
+  - Background daemon scans connection counts every update-interval-ms
+  - Two modes: weighted (capacity-aware) and pure (ignores original weights)
+  - Weight formula: `capacity = original_weight / (1 + connections)`
+  - Integrates with health checks, drain, and circuit breaker systems
+  - Zero BPF changes required (uses existing weight mechanism)
+  - Configuration: `{:settings {:load-balancing {:algorithm :least-connections :weighted true :update-interval-ms 1000}}}`
+  - Runtime API: `get-lb-algorithm`, `get-lb-status`, `lb-least-connections?`, `force-lb-update!`
+  - Prometheus metrics: `lb_algorithm`, `lb_backend_connections`
+  - New modules: `lb.lb-algorithm`, `lb.lb-manager`
+  - Comprehensive examples in `examples/least_connections.clj`
+
 ## [0.5.0] - 2025-12-21
 
 ### Added
@@ -129,7 +146,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
-[Unreleased]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.2.0...v0.3.0

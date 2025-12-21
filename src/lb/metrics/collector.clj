@@ -304,6 +304,49 @@
         (log/warn e "Error collecting lb_circuit_breaker_error_rate")
         nil))))
 
+(defn- collect-lb-algorithm
+  "Collect lb_algorithm gauge - current load balancing algorithm."
+  []
+  (when-let [algo-fn (:lb-algorithm-fn @data-sources)]
+    (try
+      (let [algorithm (algo-fn)
+            value (case algorithm
+                    :weighted-random 0
+                    :least-connections 1
+                    0)]
+        (format-metric-family
+          "lb_algorithm"
+          "gauge"
+          "Current load balancing algorithm (0=weighted-random, 1=least-connections)"
+          [(format-metric-line "lb_algorithm" {} value)]))
+      (catch Exception e
+        (log/warn e "Error collecting lb_algorithm")
+        nil))))
+
+(defn- collect-lb-backend-connections
+  "Collect lb_backend_connections gauge - connection count per backend for least-connections."
+  []
+  (when-let [conn-fn (:lb-connections-fn @data-sources)]
+    (try
+      (let [all-conns (conn-fn)
+            lines (for [[proxy-name targets] all-conns
+                        [target-id count] targets
+                        :let [[ip port] (str/split target-id #":")]]
+                    (format-metric-line "lb_backend_connections"
+                                        {:proxy_name proxy-name
+                                         :target_ip ip
+                                         :target_port (or port "0")}
+                                        count))]
+        (when (seq lines)
+          (format-metric-family
+            "lb_backend_connections"
+            "gauge"
+            "Active connection count per backend for load balancing decisions"
+            lines)))
+      (catch Exception e
+        (log/warn e "Error collecting lb_backend_connections")
+        nil))))
+
 (defn- collect-info
   "Collect lb_info gauge - load balancer information."
   []
@@ -311,7 +354,7 @@
     "lb_info"
     "gauge"
     "Load balancer information"
-    [(format-metric-line "lb_info" {:version "0.5.0"} 1)]))
+    [(format-metric-line "lb_info" {:version "0.6.0"} 1)]))
 
 (defn- collect-up
   "Collect lb_up gauge - whether the load balancer is running."
@@ -333,6 +376,8 @@
   []
   (let [metrics [(collect-up)
                  (collect-info)
+                 (collect-lb-algorithm)
+                 (collect-lb-backend-connections)
                  (collect-connections-active)
                  (collect-bytes-total)
                  (collect-packets-total)

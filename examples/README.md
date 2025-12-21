@@ -18,6 +18,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [rate_limiting.clj](#rate-limiting) | Token bucket rate limiting | Advanced |
 | [prometheus_metrics.clj](#prometheus-metrics) | Prometheus metrics export | Intermediate |
 | [circuit_breaker.clj](#circuit-breaker) | Automatic failure detection and recovery | Advanced |
+| [least_connections.clj](#least-connections) | Dynamic weight adjustment based on connections | Intermediate |
 
 ## Prerequisites
 
@@ -451,6 +452,80 @@ CLOSED  OPEN
    :half-open-requests 3        ; Need 3 successes to close
    :window-size-ms 60000}}}     ; 60 second sliding window
 ```
+
+---
+
+### Least Connections
+
+Dynamic load balancing that routes new connections to backends with fewer active connections.
+
+**File: `least_connections.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'least-connections) (least-connections/-main)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'least-connections)
+(least-connections/-main)
+```
+
+The example demonstrates:
+- Configuring least-connections vs weighted-random algorithms
+- How weights are computed based on connection counts
+- Weighted mode (respects backend capacity) vs pure mode
+- Integration with health checks, drain, and circuit breaker
+- Real-time connection distribution monitoring
+
+**Key API Functions**:
+```clojure
+;; Query algorithm status
+(lb/get-lb-algorithm)          ; => :weighted-random or :least-connections
+(lb/get-lb-status)             ; => full status map
+(lb/lb-least-connections?)     ; => true if least-connections enabled
+
+;; Force immediate weight update
+(lb/force-lb-update!)
+```
+
+**Weight Computation**:
+```
+Original weights: [50, 50]
+Connection counts: [10, 50]
+
+Backend A capacity: 50 / (1 + 10) = 4.55
+Backend B capacity: 50 / (1 + 50) = 0.98
+Total: 5.53
+
+Effective weights: [82, 18]
+(Backend A gets ~82% of new connections)
+```
+
+**Configuration**:
+```clojure
+{:settings
+ {:load-balancing
+  {:algorithm :least-connections  ; or :weighted-random (default)
+   :weighted true                  ; Factor in original weights
+   :update-interval-ms 1000}}}     ; Update frequency (100-10000ms)
+```
+
+**When to use least-connections**:
+- Database connection pools
+- WebSocket servers
+- Long-polling endpoints
+- Streaming media
+- Mixed workloads with varying request durations
+
+**When to use weighted-random** (default):
+- Simple HTTP APIs with short requests
+- Stateless microservices
+- When you need explicit traffic ratios
 
 ---
 
