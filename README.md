@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/pgdad/clj-ebpf-lb/actions/workflows/ci.yml/badge.svg)](https://github.com/pgdad/clj-ebpf-lb/actions/workflows/ci.yml)
 [![Clojars Project](https://img.shields.io/clojars/v/org.clojars.pgdad/clj-ebpf-lb.svg)](https://clojars.org/org.clojars.pgdad/clj-ebpf-lb)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP (eXpress Data Path) for ingress DNAT and TC (Traffic Control) for egress SNAT, providing kernel-level packet processing for efficient traffic distribution. Can also be used as a simple reverse proxy.
 
