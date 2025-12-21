@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2025-12-21
+
+### Added
+- Admin HTTP REST API for runtime management without REPL access
+  - RESTful JSON API using Java's built-in HttpServer (zero dependencies)
+  - Complete proxy management: list, add, remove proxies
+  - Source route management: list, add, remove CIDR-based routes
+  - SNI route management: list, add, remove hostname-based TLS routes
+  - Connection management: list, count, stats, clear connections
+  - Health status queries per proxy and aggregate
+  - Connection draining control: start drain, cancel drain
+  - Circuit breaker control: force open, close, reset circuits
+  - DNS resolution status and forced re-resolution
+  - Load balancing status and forced weight updates
+  - Rate limit configuration: set source/backend limits, clear all
+  - Configuration hot reload trigger
+  - Optional API key authentication via X-API-Key header
+  - Optional CORS support for web dashboard integration
+  - Health endpoint at /health for Kubernetes probes
+  - Configuration: `{:settings {:admin-api {:enabled true :port 8081 :api-key nil}}}`
+  - Runtime API: `admin/start!`, `admin/stop!`, `admin/running?`, `admin/get-status`
+  - New modules: `lb.admin`, `lb.admin.server`, `lb.admin.handlers`
+  - Comprehensive examples with curl commands in `examples/admin_api.clj`
+
 ## [0.8.0] - 2025-12-21
 
 ### Added
@@ -184,6 +208,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
+[0.9.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.5.0...v0.6.0

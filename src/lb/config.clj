@@ -169,12 +169,21 @@
                    ::access-log-max-file-size-mb ::access-log-max-files
                    ::access-log-buffer-size]))
 
+;; Admin API settings
+(s/def ::admin-api-port (s/and int? #(>= % 1024) #(<= % 65535)))
+(s/def ::admin-api-key (s/nilable (s/and string? #(>= (count %) 8))))
+(s/def ::admin-api-allowed-origins (s/nilable (s/coll-of string?)))
+
+(s/def ::admin-api
+  (s/keys :opt-un [::enabled ::admin-api-port ::admin-api-key
+                   ::admin-api-allowed-origins]))
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
                    ::default-drain-timeout-ms ::drain-check-interval-ms
                    ::rate-limits ::metrics ::circuit-breaker ::load-balancing
-                   ::access-log]))
+                   ::access-log ::admin-api]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -265,6 +274,13 @@
 ;; buffer-size: async channel buffer size (default 10000)
 (defrecord AccessLogConfig [enabled format path max-file-size-mb max-files buffer-size])
 
+;; Admin API configuration
+;; enabled: whether admin API server is active
+;; port: HTTP port for admin API (default 8081)
+;; api-key: optional API key for authentication (nil = no auth)
+;; allowed-origins: optional list of CORS allowed origins (nil = no CORS)
+(defrecord AdminApiConfig [enabled port api-key allowed-origins])
+
 ;; Default load balancing configuration values
 (def default-load-balancing-config
   {:algorithm :weighted-random
@@ -279,6 +295,13 @@
    :max-file-size-mb 100
    :max-files 10
    :buffer-size 10000})
+
+;; Default admin API configuration values
+(def default-admin-api-config
+  {:enabled false
+   :port 8081
+   :api-key nil
+   :allowed-origins nil})
 
 ;; Source route now holds a TargetGroup instead of single Target
 ;; session-persistence: optional boolean for sticky sessions
@@ -301,7 +324,7 @@
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
                      health-check-enabled health-check-defaults
                      default-drain-timeout-ms drain-check-interval-ms
-                     load-balancing access-log])
+                     load-balancing access-log admin-api])
 (defrecord Config [proxies settings])
 
 ;;; =============================================================================
@@ -408,6 +431,24 @@
       (:max-file-size-mb merged)
       (:max-files merged)
       (:buffer-size merged))))
+
+(defn parse-admin-api-config
+  "Parse admin API configuration, merging with defaults."
+  [admin-api-map]
+  (let [;; Normalize keys from spec format to config format
+        normalized (cond-> (or admin-api-map {})
+                     (contains? admin-api-map :admin-api-port)
+                     (assoc :port (:admin-api-port admin-api-map))
+                     (contains? admin-api-map :admin-api-key)
+                     (assoc :api-key (:admin-api-key admin-api-map))
+                     (contains? admin-api-map :admin-api-allowed-origins)
+                     (assoc :allowed-origins (:admin-api-allowed-origins admin-api-map)))
+        merged (merge default-admin-api-config normalized)]
+    (->AdminApiConfig
+      (:enabled merged)
+      (:port merged)
+      (:api-key merged)
+      (:allowed-origins merged))))
 
 (defn dns-target?
   "Check if a target specification uses DNS (has :host instead of :ip)."
@@ -535,7 +576,8 @@
     (get settings :default-drain-timeout-ms 30000)       ; 30 seconds default
     (get settings :drain-check-interval-ms 1000)
     (parse-load-balancing-config (get settings :load-balancing))
-    (parse-access-log-config (get settings :access-log))))
+    (parse-access-log-config (get settings :access-log))
+    (parse-admin-api-config (get settings :admin-api))))
 
 (defn parse-config
   "Parse full configuration from EDN map."
@@ -674,7 +716,12 @@
                    :path (:path al)
                    :max-file-size-mb (:max-file-size-mb al)
                    :max-files (:max-files al)
-                   :buffer-size (:buffer-size al)})}})
+                   :buffer-size (:buffer-size al)})
+    :admin-api (let [aa (get-in config [:settings :admin-api])]
+                 {:enabled (:enabled aa)
+                  :port (:port aa)
+                  :api-key (:api-key aa)
+                  :allowed-origins (:allowed-origins aa)})}})
 
 (defn save-config-file
   "Save configuration to an EDN file."
@@ -691,7 +738,8 @@
   "Default settings values."
   (->Settings false 300 100000 false default-health-check-config 30000 1000
               (parse-load-balancing-config nil)
-              (parse-access-log-config nil)))
+              (parse-access-log-config nil)
+              (parse-admin-api-config nil)))
 
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
@@ -738,7 +786,8 @@
        false)] ; session-persistence
     (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config
                 30000 1000 (parse-load-balancing-config nil)
-                (parse-access-log-config nil))))
+                (parse-access-log-config nil)
+                (parse-admin-api-config nil))))
 
 ;;; =============================================================================
 ;;; Configuration Modification

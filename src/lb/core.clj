@@ -18,6 +18,7 @@
             [lb.metrics :as metrics]
             [lb.latency :as latency]
             [lb.access-log :as access-log]
+            [lb.admin :as admin]
             [lb.lb-manager :as lb-manager]
             [lb.util :as util]
             [clojure.tools.logging :as log]
@@ -208,6 +209,11 @@
                       access-log-config (get-in config [:settings :access-log])]
                   (access-log/start! access-log-config stream (:conntrack-map ebpf-maps))))
 
+              ;; Start admin API server if enabled
+              (when (get-in config [:settings :admin-api :enabled])
+                (log/info "Starting admin API server")
+                (admin/start! (get-in config [:settings :admin-api])))
+
               (log/info "Load balancer initialized successfully")
               state))))
 
@@ -222,7 +228,11 @@
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
 
-    ;; Stop access logging first (before stats stream)
+    ;; Stop admin API server first
+    (when (admin/running?)
+      (admin/stop!))
+
+    ;; Stop access logging (before stats stream)
     (when (access-log/running?)
       (access-log/stop!))
 

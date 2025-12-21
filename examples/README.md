@@ -21,6 +21,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [least_connections.clj](#least-connections) | Dynamic weight adjustment based on connections | Intermediate |
 | [session_persistence.clj](#session-persistence) | Sticky sessions based on source IP hash | Intermediate |
 | [access_logging.clj](#access-logging) | Access logs and backend latency tracking | Intermediate |
+| [admin_api.clj](#admin-http-api) | HTTP REST API for runtime management | Intermediate |
 
 ## Prerequisites
 
@@ -676,6 +677,94 @@ lb_backend_latency_seconds_count{proxy_name="web",target_ip="10.0.0.1",target_po
 ;; => {:p50 0.023 :p95 0.15 :p99 0.45 :mean 0.056 :count 1523}
 (latency/get-all-histograms)        ; All per-backend histograms
 (latency/reset-histograms!)         ; Reset for testing
+```
+
+---
+
+### Admin HTTP API
+
+HTTP REST API for runtime management without REPL access.
+
+**File: `admin_api.clj`**
+
+**Use Case**:
+- Automation and scripting of LB operations
+- Integration with orchestration tools (Kubernetes, Ansible)
+- Remote management via HTTP
+- Monitoring and health checks
+
+**Setup**:
+```bash
+# Start the load balancer with admin API enabled
+sudo clojure -M:dev
+
+# In REPL:
+(require 'admin-api)
+(lb/init! (config/parse-config admin-api/config-with-admin-api))
+
+# In another terminal, test the API:
+curl http://localhost:8081/api/v1/status
+curl http://localhost:8081/api/v1/proxies
+```
+
+**Example curl commands**:
+```bash
+# Get status
+curl http://localhost:8081/api/v1/status
+
+# List all proxies
+curl http://localhost:8081/api/v1/proxies
+
+# Add a new proxy
+curl -X POST http://localhost:8081/api/v1/proxies \
+  -H "Content-Type: application/json" \
+  -d '{"name":"web","listen":{"interfaces":["eth0"],"port":80},"default-target":{"ip":"10.0.0.1","port":8080}}'
+
+# Add a source route
+curl -X POST http://localhost:8081/api/v1/proxies/web/routes \
+  -H "Content-Type: application/json" \
+  -d '{"source":"192.168.1.0/24","target":{"ip":"10.0.0.5","port":8080}}'
+
+# Drain a backend
+curl -X POST http://localhost:8081/api/v1/drains \
+  -H "Content-Type: application/json" \
+  -d '{"proxy":"web","target":"10.0.0.1:8080","timeout_ms":30000}'
+
+# Force circuit open
+curl -X POST http://localhost:8081/api/v1/circuits/10.0.0.1%3A8080/open
+
+# With API key authentication
+curl -H "X-API-Key: my-secret-key" http://localhost:8081/api/v1/status
+```
+
+**Configuration**:
+```clojure
+{:settings
+ {:admin-api {:enabled true
+              :port 8081              ; HTTP port (default 8081)
+              :api-key "secret-key"   ; Optional API key auth
+              :allowed-origins nil}}} ; Optional CORS origins
+```
+
+**API Endpoints**:
+- `GET /api/v1/status` - Overall status
+- `GET /api/v1/config` - Current configuration
+- `GET/POST/DELETE /api/v1/proxies` - Proxy management
+- `GET/POST/DELETE /api/v1/proxies/:name/routes` - Source routes
+- `GET/POST/DELETE /api/v1/proxies/:name/sni-routes` - SNI routes
+- `GET/DELETE /api/v1/connections` - Connection management
+- `GET /api/v1/health` - Health status
+- `GET/POST/DELETE /api/v1/drains` - Connection draining
+- `GET/POST /api/v1/circuits/:target/*` - Circuit breaker control
+- `POST /api/v1/reload` - Config hot reload
+
+**Response format**:
+```json
+{
+  "success": true,
+  "data": { ... },
+  "error": null
+}
 ```
 
 ---
