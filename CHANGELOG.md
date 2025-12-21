@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2025-12-21
+
 ### Added
 - Prometheus metrics export for monitoring and observability
   - HTTP endpoint at `/metrics` with standard Prometheus text format
@@ -107,7 +109,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
-[Unreleased]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/pgdad/clj-ebpf-lb/releases/tag/v0.1.0
