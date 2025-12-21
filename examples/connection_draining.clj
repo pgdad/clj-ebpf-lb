@@ -13,7 +13,7 @@
 ;;   3. Background watcher monitors connection counts
 ;;   4. Drain completes when connections reach 0 or timeout expires
 
-(ns examples.connection-draining
+(ns connection-draining
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.drain :as drain]

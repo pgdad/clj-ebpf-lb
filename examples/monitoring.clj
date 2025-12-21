@@ -9,7 +9,7 @@
 ;;   - A running load balancer with stats-enabled: true
 ;;   - Traffic flowing through the load balancer
 
-(ns examples.monitoring
+(ns monitoring
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.stats :as stats]

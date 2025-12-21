@@ -7,7 +7,7 @@
 ;;
 ;; Or evaluate each section interactively.
 
-(ns examples.repl-usage
+(ns repl-usage
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.conntrack :as conntrack]

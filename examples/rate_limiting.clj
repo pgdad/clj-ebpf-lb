@@ -12,7 +12,7 @@
 ;;   - burst: maximum tokens (handles temporary traffic spikes)
 ;;   - Requests are dropped when bucket is empty
 
-(ns examples.rate-limiting
+(ns rate-limiting
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.rate-limit :as rate-limit]

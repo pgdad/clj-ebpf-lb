@@ -13,7 +13,7 @@
 ;;   3. Multiple A records expand to weighted targets automatically
 ;;   4. Graceful failure with last-known-good IP fallback
 
-(ns examples.dns-resolution
+(ns dns-resolution
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.dns :as dns]
