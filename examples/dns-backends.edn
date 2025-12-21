@@ -1,0 +1,95 @@
+;; DNS-Based Backend Resolution Configuration
+;;
+;; Demonstrates using DNS hostnames instead of static IPs for backend targets.
+;; Ideal for dynamic environments like Kubernetes, cloud deployments, or
+;; services with frequently changing IPs.
+;;
+;; Usage:
+;;   sudo clojure -M:run -c examples/dns-backends.edn
+;;
+;; Key Features:
+;;   - Use :host instead of :ip for DNS-backed targets
+;;   - Periodic re-resolution with :dns-refresh-seconds
+;;   - Multiple A records expand to weighted targets automatically
+;;   - Graceful failure with last-known-good IP fallback
+;;   - Mix static IPs and DNS targets in the same target group
+
+{:proxies
+ [;; Basic DNS backend
+  ;; The hostname is resolved on startup and periodically re-resolved
+  {:name "api-gateway"
+   :listen
+   {:interfaces ["eth0"]
+    :port 8080}
+   :default-target
+   {:host "api.backend.local"    ; DNS hostname instead of :ip
+    :port 3000
+    :dns-refresh-seconds 30}}    ; Re-resolve every 30 seconds
+
+  ;; DNS with health checking
+  ;; Resolved IPs are health-checked; unhealthy IPs get zero weight
+  {:name "web-frontend"
+   :listen
+   {:interfaces ["eth0"]
+    :port 80}
+   :default-target
+   {:host "web.backend.local"
+    :port 8000
+    :dns-refresh-seconds 15
+    :health-check
+    {:type :http
+     :path "/health"
+     :interval-ms 5000
+     :timeout-ms 2000}}}
+
+  ;; Mixed static and DNS targets
+  ;; Combine static IPs with DNS hostnames for hybrid deployments
+  {:name "hybrid-backend"
+   :listen
+   {:interfaces ["eth0"]
+    :port 9000}
+   :default-target
+   [{:ip "10.0.1.100" :port 8080 :weight 30}      ; Static datacenter backend
+    {:host "cloud.backend.local"                   ; Dynamic cloud backend
+     :port 8080
+     :weight 70
+     :dns-refresh-seconds 10}]}
+
+  ;; Kubernetes headless service pattern
+  ;; Headless services (clusterIP: None) return pod IPs as A records
+  ;; clj-ebpf-lb distributes weight equally across all resolved IPs
+  {:name "k8s-backend"
+   :listen
+   {:interfaces ["eth0"]
+    :port 8081}
+   :default-target
+   {:host "myapp.default.svc.cluster.local"  ; K8s DNS name
+    :port 8080
+    :weight 100
+    :dns-refresh-seconds 5                    ; Quick refresh for pod changes
+    :health-check
+    {:type :http
+     :path "/healthz"
+     :interval-ms 3000
+     :timeout-ms 1000}}}
+
+  ;; Multiple DNS backends with different refresh rates
+  ;; Adjust refresh intervals based on how often IPs change
+  {:name "multi-tier"
+   :listen
+   {:interfaces ["eth0"]
+    :port 443}
+   :default-target
+   [{:host "primary.backend.local"
+     :port 8443
+     :weight 60
+     :dns-refresh-seconds 30}    ; Primary changes less often
+    {:host "secondary.backend.local"
+     :port 8443
+     :weight 40
+     :dns-refresh-seconds 10}]}] ; Secondary is more dynamic
+
+ :settings
+ {:stats-enabled true
+  :health-check-enabled true
+  :connection-timeout-sec 300}}
