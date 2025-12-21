@@ -65,13 +65,25 @@
               (and (contains? % :targets) (not (contains? % :target))))))
 (s/def ::source-routes (s/coll-of ::source-route))
 
+;; SNI route - routes based on TLS SNI hostname (exact match only)
+(s/def ::sni-hostname (s/and string?
+                             #(re-matches #"[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?" %)
+                             #(<= (count %) 253)))  ; Max DNS name length
+(s/def ::sni-route
+  (s/and (s/keys :req-un [::sni-hostname]
+                 :opt-un [::target ::targets])
+         ;; Must have exactly one of :target or :targets
+         #(or (and (contains? % :target) (not (contains? % :targets)))
+              (and (contains? % :targets) (not (contains? % :target))))))
+(s/def ::sni-routes (s/coll-of ::sni-route))
+
 ;; Proxy configuration
 (s/def ::name (s/and string? #(> (count %) 0)))
 ;; Default target can be single target map or array of weighted targets
 (s/def ::default-target (s/or :single ::target :weighted ::targets))
 (s/def ::proxy-config
   (s/keys :req-un [::name ::listen ::default-target]
-          :opt-un [::source-routes]))
+          :opt-un [::source-routes ::sni-routes]))
 
 ;; Global settings
 (s/def ::stats-enabled boolean?)
@@ -127,10 +139,17 @@
 ;; Source route now holds a TargetGroup instead of single Target
 (defrecord SourceRoute [source prefix-len target-group])
 
+;; SNI route - routes TLS traffic based on SNI hostname
+;; hostname: the TLS SNI hostname to match (exact match, lowercase)
+;; hostname-hash: FNV-1a 64-bit hash of lowercase hostname for fast lookup
+;; target-group: TargetGroup with weighted targets
+(defrecord SNIRoute [hostname hostname-hash target-group])
+
 (defrecord Listen [interfaces port])
 
 ;; ProxyConfig now holds TargetGroup for default-target
-(defrecord ProxyConfig [name listen default-target source-routes])
+;; sni-routes: optional vector of SNIRoute for TLS SNI-based routing
+(defrecord ProxyConfig [name listen default-target source-routes sni-routes])
 
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
                      health-check-enabled health-check-defaults])
@@ -237,6 +256,16 @@
           context (format "proxy '%s' source-route %s" proxy-name source)]
       (->SourceRoute ip prefix-len (parse-target-group target-spec context)))))
 
+(defn parse-sni-route
+  "Parse an SNI route for TLS SNI-based routing.
+   Supports both :target (single) and :targets (weighted array) formats."
+  [{:keys [sni-hostname target targets]} proxy-name]
+  (let [hostname (clojure.string/lower-case sni-hostname)
+        hostname-hash (util/hostname->hash hostname)
+        target-spec (or targets target)
+        context (format "proxy '%s' sni-route %s" proxy-name sni-hostname)]
+    (->SNIRoute hostname hostname-hash (parse-target-group target-spec context))))
+
 (defn parse-listen
   "Parse listen configuration."
   [{:keys [interfaces port]}]
@@ -244,13 +273,14 @@
 
 (defn parse-proxy-config
   "Parse a single proxy configuration."
-  [{:keys [name listen default-target source-routes]}]
+  [{:keys [name listen default-target source-routes sni-routes]}]
   (let [default-context (format "proxy '%s' default-target" name)]
     (->ProxyConfig
       name
       (parse-listen listen)
       (parse-target-group default-target default-context)
-      (mapv #(parse-source-route % name) (or source-routes [])))))
+      (mapv #(parse-source-route % name) (or source-routes []))
+      (mapv #(parse-sni-route % name) (or sni-routes [])))))
 
 (defn parse-settings
   "Parse settings with defaults."
@@ -344,6 +374,16 @@
                   base)))
             targets))))
 
+(defn sni-route->map
+  "Convert an SNIRoute back to EDN format."
+  [^SNIRoute sr]
+  (let [target-map (target-group->map (:target-group sr))
+        base-route {:sni-hostname (:hostname sr)}]
+    ;; Use :targets if multiple, :target if single
+    (if (vector? target-map)
+      (assoc base-route :targets target-map)
+      (assoc base-route :target target-map))))
+
 (defn config->map
   "Convert parsed Config back to plain EDN map."
   [^Config config]
@@ -352,19 +392,24 @@
            (let [base {:name (:name p)
                        :listen {:interfaces (vec (get-in p [:listen :interfaces]))
                                 :port (get-in p [:listen :port])}
-                       :default-target (target-group->map (:default-target p))}]
-             (if (seq (:source-routes p))
-               (assoc base :source-routes
-                      (mapv (fn [^SourceRoute sr]
-                              (let [source-str (util/cidr->string {:ip (:source sr) :prefix-len (:prefix-len sr)})
-                                    target-map (target-group->map (:target-group sr))
-                                    base-route {:source source-str}]
-                                ;; Use :targets if multiple, :target if single
-                                (if (vector? target-map)
-                                  (assoc base-route :targets target-map)
-                                  (assoc base-route :target target-map))))
-                            (:source-routes p)))
-               base)))
+                       :default-target (target-group->map (:default-target p))}
+                 ;; Add source-routes if present
+                 with-source (if (seq (:source-routes p))
+                               (assoc base :source-routes
+                                      (mapv (fn [^SourceRoute sr]
+                                              (let [source-str (util/cidr->string {:ip (:source sr) :prefix-len (:prefix-len sr)})
+                                                    target-map (target-group->map (:target-group sr))
+                                                    base-route {:source source-str}]
+                                                ;; Use :targets if multiple, :target if single
+                                                (if (vector? target-map)
+                                                  (assoc base-route :targets target-map)
+                                                  (assoc base-route :target target-map))))
+                                            (:source-routes p)))
+                               base)]
+             ;; Add sni-routes if present
+             (if (seq (:sni-routes p))
+               (assoc with-source :sni-routes (mapv sni-route->map (:sni-routes p)))
+               with-source)))
          (:proxies config))
    :settings
    {:stats-enabled (get-in config [:settings :stats-enabled])
@@ -428,7 +473,8 @@
        name
        (->Listen [interface] port)
        (make-single-target-group target-ip target-port)
-       [])]
+       []   ; source-routes
+       [])] ; sni-routes
     (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config)))
 
 ;;; =============================================================================
@@ -488,6 +534,47 @@
                                                (= (:prefix-len r) prefix-len)))
                                         routes))))))
 
+(defn add-sni-route-to-proxy
+  "Add an SNI route to a proxy.
+   sni-route can be an SNIRoute record or a map with :sni-hostname and :target/:targets."
+  [^Config config proxy-name sni-route]
+  (let [route (if (instance? SNIRoute sni-route)
+                sni-route
+                (parse-sni-route sni-route proxy-name))]
+    ;; Check for duplicate hostname
+    (let [proxy (get-proxy config proxy-name)]
+      (when (some #(= (:hostname %) (:hostname route)) (:sni-routes proxy))
+        (throw (ex-info "SNI route for this hostname already exists"
+                        {:hostname (:hostname route) :proxy proxy-name}))))
+    (update-proxy config proxy-name
+                  #(update % :sni-routes conj route))))
+
+(defn remove-sni-route-from-proxy
+  "Remove an SNI route from a proxy by hostname."
+  [^Config config proxy-name hostname]
+  (let [normalized-hostname (clojure.string/lower-case hostname)]
+    (update-proxy config proxy-name
+                  #(update % :sni-routes
+                           (fn [routes]
+                             (vec (remove (fn [r]
+                                            (= (:hostname r) normalized-hostname))
+                                          routes)))))))
+
+(defn update-sni-route-in-proxy
+  "Update an existing SNI route in a proxy by hostname.
+   new-sni-route should be a map with :sni-hostname and :target/:targets."
+  [^Config config proxy-name hostname new-sni-route]
+  (let [normalized-hostname (clojure.string/lower-case hostname)
+        new-route (parse-sni-route new-sni-route proxy-name)]
+    (update-proxy config proxy-name
+                  #(update % :sni-routes
+                           (fn [routes]
+                             (mapv (fn [r]
+                                     (if (= (:hostname r) normalized-hostname)
+                                       new-route
+                                       r))
+                                   routes))))))
+
 (defn update-settings
   "Update global settings."
   [^Config config new-settings]
@@ -529,7 +616,15 @@
                   (map (fn [^SourceRoute r]
                          (str "    " (util/cidr->string {:ip (:source r) :prefix-len (:prefix-len r)})
                               " -> " (format-target-group (:target-group r))))
-                       (:source-routes proxy))))))))
+                       (:source-routes proxy)))
+                "\n"))
+         (when (seq (:sni-routes proxy))
+           (str "  SNI routes:\n"
+                (clojure.string/join "\n"
+                  (map (fn [^SNIRoute r]
+                         (str "    " (:hostname r)
+                              " -> " (format-target-group (:target-group r))))
+                       (:sni-routes proxy))))))))
 
 (defn format-config
   "Format full configuration for display."

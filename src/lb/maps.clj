@@ -14,6 +14,7 @@
   {:max-routes 10000           ; Maximum source routes (LPM entries)
    :max-listen-ports 256       ; Maximum listen port configurations
    :max-connections 100000     ; Maximum concurrent connections
+   :max-sni-routes 1000        ; Maximum SNI-based routes
    :ringbuf-size (* 256 1024)  ; 256KB ring buffer for stats
    :settings-entries 16})      ; Number of settings slots
 
@@ -93,25 +94,41 @@
                    :max-entries ringbuf-size
                    :map-name "proxy_stats"}))
 
+(defn create-sni-map
+  "Create hash map for TLS SNI hostname -> target routing with weighted load balancing.
+   Key: hostname_hash (8 bytes) - FNV-1a 64-bit hash of lowercase hostname
+   Value: Weighted route format (72 bytes):
+     Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+     Per target (8 bytes each, max 8): ip(4) + port(2) + cumulative_weight(2)"
+  [{:keys [max-sni-routes] :or {max-sni-routes (:max-sni-routes default-config)}}]
+  (log/info "Creating SNI hash map with max-entries:" max-sni-routes)
+  (bpf/create-map {:map-type :hash
+                   :key-size util/SNI-KEY-SIZE  ; 8 bytes
+                   :value-size util/WEIGHTED-ROUTE-MAX-SIZE  ; 72 bytes
+                   :max-entries max-sni-routes
+                   :map-name "proxy_sni"}))
+
 (defn create-all-maps
   "Create all maps required for the reverse proxy.
-   Returns a map of {:config-map :listen-map :conntrack-map :settings-map :stats-ringbuf}"
+   Returns a map of {:config-map :listen-map :sni-map :conntrack-map :settings-map :stats-ringbuf}"
   ([]
    (create-all-maps {}))
   ([opts]
    (let [config (merge default-config opts)]
      {:config-map (create-config-map config)
       :listen-map (create-listen-map config)
+      :sni-map (create-sni-map config)
       :conntrack-map (create-conntrack-map config)
       :settings-map (create-settings-map config)
       :stats-ringbuf (create-stats-ringbuf config)})))
 
 (defn close-all-maps
   "Close all maps and release resources."
-  [{:keys [config-map listen-map conntrack-map settings-map stats-ringbuf]}]
+  [{:keys [config-map listen-map sni-map conntrack-map settings-map stats-ringbuf]}]
   (log/info "Closing all eBPF maps")
   (when config-map (bpf/close-map config-map))
   (when listen-map (bpf/close-map listen-map))
+  (when sni-map (bpf/close-map sni-map))
   (when conntrack-map (bpf/close-map conntrack-map))
   (when settings-map (bpf/close-map settings-map))
   (when stats-ringbuf (bpf/close-map stats-ringbuf)))
@@ -230,6 +247,54 @@
   (->> (bpf/map-entries listen-map)
        (map (fn [[k v]]
               {:listen (util/decode-listen-key k)
+               :route (util/decode-weighted-route-value v)}))))
+
+;;; =============================================================================
+;;; SNI Map Operations (Hash - TLS SNI-based Routing)
+;;; =============================================================================
+
+(defn add-sni-route
+  "Add an SNI hostname route with weighted targets to the SNI map.
+   hostname: TLS SNI hostname (will be lowercased)
+   target-group: TargetGroup record with :targets and :cumulative-weights
+   flags: optional flags (default 1 = enabled)"
+  [sni-map hostname target-group & {:keys [flags] :or {flags 1}}]
+  (let [normalized-hostname (clojure.string/lower-case hostname)
+        hostname-hash (util/hostname->hash normalized-hostname)
+        key-bytes (util/encode-sni-key hostname-hash)
+        value-bytes (util/encode-weighted-route-value target-group flags)
+        targets (:targets target-group)]
+    (log/debug "Adding SNI route:" normalized-hostname
+               "(hash:" hostname-hash ")->" (count targets) "targets")
+    (bpf/map-update sni-map key-bytes value-bytes)))
+
+(defn remove-sni-route
+  "Remove an SNI hostname route from the SNI map."
+  [sni-map hostname]
+  (let [normalized-hostname (clojure.string/lower-case hostname)
+        hostname-hash (util/hostname->hash normalized-hostname)
+        key-bytes (util/encode-sni-key hostname-hash)]
+    (log/debug "Removing SNI route:" normalized-hostname)
+    (bpf/map-delete sni-map key-bytes)))
+
+(defn lookup-sni-route
+  "Look up an SNI hostname in the SNI map.
+   Returns weighted route data with :target-count, :flags, and :targets."
+  [sni-map hostname]
+  (let [normalized-hostname (clojure.string/lower-case hostname)
+        hostname-hash (util/hostname->hash normalized-hostname)
+        key-bytes (util/encode-sni-key hostname-hash)]
+    (when-let [value-bytes (bpf/map-lookup sni-map key-bytes)]
+      (util/decode-weighted-route-value value-bytes))))
+
+(defn list-sni-routes
+  "List all SNI routes in the SNI map.
+   Returns a sequence of {:hostname-hash <long> :route {...}} maps.
+   Note: Original hostnames are not stored in the map, only their hashes."
+  [sni-map]
+  (->> (bpf/map-entries sni-map)
+       (map (fn [[k v]]
+              {:hostname-hash (:hostname-hash (util/decode-sni-key k))
                :route (util/decode-weighted-route-value v)}))))
 
 ;;; =============================================================================

@@ -166,9 +166,9 @@
 
 (defn- apply-config!
   "Apply configuration to eBPF maps.
-   Now supports weighted load balancing with TargetGroup records."
+   Now supports weighted load balancing with TargetGroup records and SNI routing."
   [ebpf-maps config]
-  (let [{:keys [listen-map config-map settings-map]} ebpf-maps]
+  (let [{:keys [listen-map config-map sni-map settings-map]} ebpf-maps]
 
     ;; Apply settings
     (let [settings (:settings config)]
@@ -180,7 +180,7 @@
 
     ;; Apply proxy configurations
     (doseq [proxy-cfg (:proxies config)]
-      (let [{:keys [listen default-target source-routes]} proxy-cfg
+      (let [{:keys [listen default-target source-routes sni-routes]} proxy-cfg
             {:keys [interfaces port]} listen]
 
         ;; Add listen port for each interface
@@ -197,7 +197,13 @@
           (maps/add-source-route-weighted config-map
             {:ip (:source route)
              :prefix-len (:prefix-len route)}
-            (:target-group route)))))))
+            (:target-group route)))
+
+        ;; Add SNI routes for TLS hostname-based routing
+        (doseq [sni-route sni-routes]
+          (maps/add-sni-route sni-map
+            (:hostname sni-route)
+            (:target-group sni-route)))))))
 
 ;;; =============================================================================
 ;;; Interface Attachment
@@ -367,6 +373,82 @@
              config/remove-source-route-from-proxy proxy-name ip prefix-len)
 
       (log/info "Removed source route:" source))))
+
+;;; =============================================================================
+;;; SNI Route Management (TLS/HTTPS hostname-based routing)
+;;; =============================================================================
+
+(defn add-sni-route!
+  "Add an SNI route to a proxy for TLS hostname-based routing.
+   hostname: TLS SNI hostname to match (e.g., \"api.example.com\")
+   target can be:
+   - Single target: {:ip \"10.0.0.1\" :port 8443}
+   - Weighted targets: [{:ip \"10.0.0.1\" :port 8443 :weight 50}
+                        {:ip \"10.0.0.2\" :port 8443 :weight 50}]"
+  [proxy-name hostname target]
+  (when-let [state @proxy-state]
+    (let [{:keys [sni-map]} (:maps state)
+          ;; Normalize target to TargetGroup
+          target-group (cond
+                         ;; Already a TargetGroup record
+                         (instance? TargetGroup target)
+                         target
+
+                         ;; Vector of targets - create weighted target group
+                         (vector? target)
+                         (config/make-weighted-target-group target)
+
+                         ;; Single target map - create single target group
+                         :else
+                         (config/make-single-target-group
+                           (if (string? (:ip target))
+                             (util/ip-string->u32 (:ip target))
+                             (:ip target))
+                           (:port target)))
+          ;; For config update, prepare the route map
+          sni-route-map (if (vector? target)
+                          {:sni-hostname hostname :targets target}
+                          {:sni-hostname hostname :target target})]
+
+      ;; Update BPF map
+      (maps/add-sni-route sni-map hostname target-group)
+
+      ;; Update config state
+      (swap! proxy-state update :config
+             config/add-sni-route-to-proxy proxy-name sni-route-map)
+
+      (log/info "Added SNI route:" hostname "->" target))))
+
+(defn remove-sni-route!
+  "Remove an SNI route from a proxy."
+  [proxy-name hostname]
+  (when-let [state @proxy-state]
+    (let [{:keys [sni-map]} (:maps state)]
+
+      ;; Remove from BPF map
+      (maps/remove-sni-route sni-map hostname)
+
+      ;; Update config state
+      (swap! proxy-state update :config
+             config/remove-sni-route-from-proxy proxy-name hostname)
+
+      (log/info "Removed SNI route:" hostname))))
+
+(defn list-sni-routes
+  "List all SNI routes for a proxy.
+   Returns a sequence of {:hostname :target-group} maps."
+  [proxy-name]
+  (when-let [state @proxy-state]
+    (when-let [proxy-cfg (config/get-proxy (:config state) proxy-name)]
+      (:sni-routes proxy-cfg))))
+
+(defn list-all-sni-routes
+  "List all SNI routes from BPF map.
+   Note: Returns hostname hashes since original hostnames aren't stored in BPF."
+  []
+  (when-let [state @proxy-state]
+    (let [{:keys [sni-map]} (:maps state)]
+      (maps/list-sni-routes sni-map))))
 
 ;;; =============================================================================
 ;;; Statistics Control

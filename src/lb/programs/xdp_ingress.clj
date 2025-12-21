@@ -43,6 +43,7 @@
 ;; -64  : random_value (4 bytes) - for weighted selection
 ;; -72  : checksum scratch (8 bytes)
 ;; -80  : additional scratch (8 bytes)
+;; -88  : SNI key for map lookup (8 bytes: hostname_hash)
 ;; -96  : Conntrack key (16 bytes: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3))
 ;; -160 : Conntrack value (64 bytes):
 ;;        offset 0:  orig_dst_ip (4) - proxy's IP for SNAT to restore
@@ -209,12 +210,18 @@
 
    This program:
    1. Parses IPv4/TCP or IPv4/UDP packets
-   2. Looks up listen map by (ifindex, dst_port)
-   3. Falls back to config map LPM lookup by source IP
-   4. If match found, performs DNAT (rewrites dst IP and port)
-   5. Updates IP and L4 checksums
-   6. Creates conntrack entry for TC SNAT to use on reply path
-   7. Returns XDP_PASS to let kernel routing deliver packet
+   2. For TCP port 443, attempts SNI-based routing (TLS ClientHello parsing)
+   3. Falls back to listen map lookup by (ifindex, dst_port)
+   4. Falls back to config map LPM lookup by source IP
+   5. If match found, performs DNAT (rewrites dst IP and port)
+   6. Updates IP and L4 checksums
+   7. Creates conntrack entry for TC SNAT to use on reply path
+   8. Returns XDP_PASS to let kernel routing deliver packet
+
+   Routing priority:
+   1. Source IP exact/CIDR match (config map)
+   2. SNI hostname match (sni map, for TLS traffic)
+   3. Default target (listen map)
 
    Register allocation:
    r6 = saved XDP context (callee-saved)
@@ -224,7 +231,7 @@
    r0-r5 = scratch, clobbered by helpers
 
    Uses clj-ebpf.asm label-based assembly for automatic jump offset resolution."
-  [listen-map-fd config-map-fd conntrack-map-fd]
+  [listen-map-fd config-map-fd sni-map-fd conntrack-map-fd]
   (asm/assemble-with-labels
     (concat
       ;; =====================================================================
@@ -303,7 +310,301 @@
        (dsl/stx :h :r10 :r1 -28)        ; store at stack[-28] (old_dst_port)
        (dsl/stx :h :r10 :r1 -50)]       ; store at stack[-50] (for conntrack)
 
-      [(asm/jmp :lookup_listen)]
+      ;; Check if this is HTTPS traffic (port 443) for SNI-based routing
+      ;; Port 443 in network byte order = 0x01BB
+      ;; Only generate SNI parsing code if SNI map is provided
+      (if sni-map-fd
+        [(dsl/ldx :h :r1 :r10 -28)        ; load dst_port
+         (asm/jmp-imm :jeq :r1 common/HTTPS-PORT-BE :try_sni_lookup)
+         (asm/jmp :lookup_listen)]
+        [(asm/jmp :lookup_listen)])
+
+      ;; =====================================================================
+      ;; SNI-Based Routing for HTTPS (port 443)
+      ;; =====================================================================
+      ;; This section attempts to parse TLS ClientHello to extract SNI hostname.
+      ;; If successful, looks up SNI map for hostname-based routing.
+      ;; Falls back to listen map if:
+      ;; - Not a TLS handshake
+      ;; - Not a ClientHello
+      ;; - SNI extension not found
+      ;; - SNI not in map
+      ;; Note: This entire section is only generated when sni-map-fd is provided
+      (when sni-map-fd
+        (concat
+          [(asm/label :try_sni_lookup)]
+
+          ;; r0 still points to TCP header from earlier
+          ;; TCP payload starts after TCP header (min 20 bytes, could have options)
+          ;; For simplicity, we use minimum TCP header size (no options)
+          ;; TLS record header is first 5 bytes of payload
+
+          ;; Calculate TLS record start: data + ETH_HLEN + IP_MIN_HLEN + TCP_MIN_HLEN
+          ;; Using minimum TCP header size (20 bytes, no options) for TLS detection
+          [(dsl/mov-reg :r1 :r7)
+           (dsl/add :r1 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 20))
+           ;; Bounds check: need at least 5 bytes for TLS record header
+           (dsl/mov-reg :r2 :r1)
+           (dsl/add :r2 5)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]  ; not enough data
+
+          ;; r1 = TLS record start
+          ;; Check content type at offset 0 - must be 0x16 (Handshake)
+          [(dsl/ldx :b :r2 :r1 0)
+           (asm/jmp-imm :jne :r2 common/TLS-CONTENT-TYPE-HANDSHAKE :lookup_listen)]
+
+          ;; Load TLS record length (bytes 3-4, big-endian)
+          [(dsl/ldx :h :r3 :r1 3)]            ; r3 = TLS record length
+
+          ;; Bounds check: need TLS header (5) + handshake header (4) at minimum
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add :r2 9)                    ; 5 (TLS header) + 4 (handshake header)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
+
+          ;; Check handshake type at offset 5 - must be 0x01 (ClientHello)
+          [(dsl/ldx :b :r2 :r1 5)
+           (asm/jmp-imm :jne :r2 common/TLS-HANDSHAKE-CLIENT-HELLO :lookup_listen)]
+
+          ;; Now we have a TLS ClientHello. Parse to find SNI extension.
+          ;; ClientHello structure after handshake header (offset 9):
+          ;; - version: 2 bytes
+          ;; - random: 32 bytes
+          ;; - session_id_length: 1 byte
+          ;; - session_id: variable
+          ;; - cipher_suites_length: 2 bytes
+          ;; - cipher_suites: variable
+          ;; - compression_methods_length: 1 byte
+          ;; - compression_methods: variable
+          ;; - extensions_length: 2 bytes
+          ;; - extensions: variable
+
+          ;; r1 = TLS record start
+          ;; ClientHello body starts at offset 9 (5 + 4)
+          ;; First skip version (2) + random (32) = 34 bytes to session_id_length
+
+          ;; Bounds check for fixed ClientHello fields (9 + 34 + 1 = 44)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add :r2 44)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
+
+          ;; Load session_id_length at offset 43 (9 + 34)
+          [(dsl/ldx :b :r2 :r1 43)            ; r2 = session_id_length
+           ;; Calculate offset after session_id: 44 + session_id_length
+           (dsl/mov :r3 44)
+           (dsl/add-reg :r3 :r2)]              ; r3 = offset to cipher_suites_length
+
+          ;; Bounds check for cipher_suites_length (2 bytes)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/add :r2 2)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
+
+          ;; Load cipher_suites_length (2 bytes big-endian)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)               ; r2 = ptr to cipher_suites_length
+           (dsl/ldx :h :r4 :r2 0)              ; r4 = cipher_suites_length
+           ;; Calculate offset after cipher_suites
+           (dsl/add-reg :r3 :r4)
+           (dsl/add :r3 2)]                    ; r3 = offset to compression_methods_length
+
+          ;; Limit offset to prevent too deep parsing (security)
+          [(asm/jmp-imm :jgt :r3 300 :lookup_listen)]
+
+          ;; Bounds check for compression_methods_length (1 byte)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/add :r2 1)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
+
+          ;; Load compression_methods_length
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/ldx :b :r4 :r2 0)              ; r4 = compression_methods_length
+           ;; Calculate offset to extensions_length
+           (dsl/add-reg :r3 :r4)
+           (dsl/add :r3 1)]                    ; r3 = offset to extensions_length
+
+          ;; Limit offset
+          [(asm/jmp-imm :jgt :r3 400 :lookup_listen)]
+
+          ;; Bounds check for extensions_length (2 bytes)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/add :r2 2)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
+
+          ;; Load extensions_length
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/ldx :h :r4 :r2 0)              ; r4 = extensions_length
+           ;; r3 + 2 = offset to first extension
+           (dsl/add :r3 2)]
+
+          ;; Store extensions end offset: r3 + extensions_length
+          [(dsl/mov-reg :r5 :r3)
+           (dsl/add-reg :r5 :r4)]              ; r5 = extensions_end_offset
+
+          ;; Limit to avoid excessive parsing
+          [(asm/jmp-imm :jgt :r5 600 :lookup_listen)]
+
+          ;; Now iterate through extensions looking for SNI (type 0x0000)
+          ;; Each extension: type(2) + length(2) + data(length)
+          ;; r3 = current extension offset
+          ;; r5 = extensions end offset
+          ;; Use bounded loop (max 32 iterations)
+
+          ;; Store loop variables on stack
+          ;; stack[-72] = current extension offset
+          ;; stack[-76] = extensions end offset
+          [(dsl/stx :w :r10 :r3 -72)
+           (dsl/stx :w :r10 :r5 -76)
+           (dsl/mov :r0 0)]                    ; r0 = loop counter
+
+          [(asm/label :ext_loop)]
+
+          ;; Check loop bound (max 32 iterations for verifier)
+          [(asm/jmp-imm :jge :r0 common/MAX-TLS-EXTENSIONS :lookup_listen)]
+
+          ;; Load current offset and check against end
+          [(dsl/ldx :w :r3 :r10 -72)           ; r3 = current offset
+           (dsl/ldx :w :r5 :r10 -76)           ; r5 = end offset
+           (asm/jmp-reg :jge :r3 :r5 :lookup_listen)] ; no more extensions
+
+          ;; Bounds check for extension header (4 bytes: type + length)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/add :r2 4)
+           (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
+
+          ;; Load extension type (2 bytes)
+          [(dsl/mov-reg :r2 :r1)
+           (dsl/add-reg :r2 :r3)
+           (dsl/ldx :h :r4 :r2 0)]             ; r4 = extension type
+
+          ;; Check if SNI extension (type 0x0000)
+          [(asm/jmp-imm :jeq :r4 common/TLS-EXT-SNI :found_sni)]
+
+          ;; Not SNI, skip to next extension
+          ;; Load extension length and advance offset
+          [(dsl/ldx :h :r4 :r2 2)              ; r4 = extension length
+           (dsl/add :r3 4)                     ; skip type + length fields
+           (dsl/add-reg :r3 :r4)               ; skip extension data
+           (dsl/stx :w :r10 :r3 -72)           ; update current offset
+           (dsl/add :r0 1)                     ; increment loop counter
+           (asm/jmp :ext_loop)]
+
+          ;; =====================================================================
+          ;; Found SNI Extension - Parse and Hash Hostname
+          ;; =====================================================================
+          [(asm/label :found_sni)]
+
+          ;; r2 = pointer to SNI extension header
+          ;; SNI extension data format:
+          ;; - list_length: 2 bytes
+          ;; - For each entry:
+          ;;   - name_type: 1 byte (0 = hostname)
+          ;;   - name_length: 2 bytes
+          ;;   - name: variable
+
+          ;; Load extension length
+          [(dsl/ldx :h :r4 :r2 2)              ; r4 = extension length
+           ;; Bounds check for SNI list header (4 + 2 + 1 + 2 = 9 bytes min)
+           (dsl/mov-reg :r3 :r2)
+           (dsl/add :r3 9)
+           (asm/jmp-reg :jgt :r3 :r8 :lookup_listen)]
+
+          ;; Check name_type at offset 6 (after ext header + list_length)
+          [(dsl/ldx :b :r3 :r2 6)
+           (asm/jmp-imm :jne :r3 common/TLS-SNI-NAME-TYPE-HOSTNAME :lookup_listen)]
+
+          ;; Load hostname length at offset 7
+          [(dsl/ldx :h :r4 :r2 7)              ; r4 = hostname length
+           ;; Limit hostname length for hashing
+           (asm/jmp-imm :jgt :r4 common/MAX-SNI-LENGTH :lookup_listen)]
+
+          ;; Bounds check for hostname
+          [(dsl/mov-reg :r3 :r2)
+           (dsl/add :r3 9)                     ; offset to hostname
+           (dsl/add-reg :r3 :r4)               ; add hostname length
+           (asm/jmp-reg :jgt :r3 :r8 :lookup_listen)]
+
+          ;; Now compute FNV-1a hash of hostname
+          ;; r2 = extension header ptr
+          ;; r4 = hostname length
+          ;; hostname starts at r2 + 9
+          ;; We need to compute hash byte by byte with lowercase conversion
+
+          ;; Initialize FNV-1a hash (64-bit) using two 32-bit registers simulation
+          ;; Actually, BPF registers are 64-bit, so we can use single register
+          ;; FNV-1a offset basis: 0xcbf29ce484222325 (as signed long: -3750763034362895579)
+          [(dsl/lddw :r3 -3750763034362895579)] ; r3 = hash (FNV-1a offset basis)
+
+          ;; Store hostname ptr and length
+          [(dsl/mov-reg :r5 :r2)
+           (dsl/add :r5 9)                     ; r5 = hostname start
+           (dsl/stx :w :r10 :r4 -72)           ; store length
+           (dsl/stx :dw :r10 :r5 -80)]         ; store hostname ptr
+
+          ;; r0 = loop counter, r4 = length limit
+          [(dsl/mov :r0 0)]
+
+          [(asm/label :hash_loop)]
+
+          ;; Check loop bound
+          [(asm/jmp-imm :jge :r0 common/MAX-SNI-LENGTH :hash_done)]
+          [(dsl/ldx :w :r4 :r10 -72)           ; load length
+           (asm/jmp-reg :jge :r0 :r4 :hash_done)]
+
+          ;; Reload hostname ptr
+          [(dsl/ldx :dw :r5 :r10 -80)]
+
+          ;; Bounds check for this byte
+          [(dsl/mov-reg :r2 :r5)
+           (dsl/add-reg :r2 :r0)
+           (dsl/add :r2 1)
+           (asm/jmp-reg :jgt :r2 :r8 :hash_done)]
+
+          ;; Load byte and convert to lowercase
+          [(dsl/mov-reg :r2 :r5)
+           (dsl/add-reg :r2 :r0)
+           (dsl/ldx :b :r1 :r2 0)              ; r1 = byte
+
+           ;; Lowercase: if 'A' <= byte <= 'Z', add 32
+           ;; ASCII: A=65, Z=90, a=97
+           (dsl/mov-reg :r2 :r1)
+           (dsl/sub :r2 65)                    ; r2 = byte - 'A'
+           (asm/jmp-imm :jgt :r2 25 :no_lowercase)  ; if > 25, not uppercase
+           (dsl/add :r1 32)]                   ; convert to lowercase
+
+          [(asm/label :no_lowercase)]
+
+          ;; FNV-1a: hash = (hash XOR byte) * prime
+          [(dsl/xor-reg :r3 :r1)
+           ;; Multiply by FNV-1a prime 0x00000100000001B3 = 1099511628211
+           ;; This is a 64-bit multiply which BPF supports
+           (dsl/lddw :r2 1099511628211)
+           (dsl/mul-reg :r3 :r2)]
+
+          ;; Next byte
+          [(dsl/add :r0 1)
+           (asm/jmp :hash_loop)]
+
+          [(asm/label :hash_done)]
+
+          ;; r3 = computed FNV-1a hash of hostname
+          ;; Store as SNI key at stack[-88] (8 bytes)
+          [(dsl/stx :dw :r10 :r3 -88)]
+
+          ;; Look up SNI map
+          [(dsl/ld-map-fd :r1 sni-map-fd)
+           (dsl/mov-reg :r2 :r10)
+           (dsl/add :r2 -88)                   ; r2 = &sni_key
+           (dsl/call 1)]                       ; bpf_map_lookup_elem
+
+          ;; If found, use SNI route; otherwise fall through to listen map
+          [(asm/jmp-imm :jeq :r0 0 :lookup_listen)
+           (dsl/mov-reg :r9 :r0)               ; r9 = SNI route value ptr
+           (asm/jmp :do_nat)]))
 
       ;; =====================================================================
       ;; UDP Path: Parse UDP header and extract ports
@@ -720,22 +1021,25 @@
   "Build the XDP ingress program.
 
    Performs DNAT on incoming packets:
-   1. Looks up listen map by (ifindex, dst_port)
-   2. Falls back to config map LPM lookup by source IP
-   3. If match found, rewrites destination IP/port
-   4. Updates IP and L4 checksums
-   5. Creates conntrack entry for TC SNAT
-   6. Returns XDP_PASS to let kernel routing deliver packet
+   1. For TCP port 443, attempts SNI-based routing (TLS ClientHello parsing)
+   2. Falls back to listen map lookup by (ifindex, dst_port)
+   3. Falls back to config map LPM lookup by source IP
+   4. If match found, rewrites destination IP/port
+   5. Updates IP and L4 checksums
+   6. Creates conntrack entry for TC SNAT
+   7. Returns XDP_PASS to let kernel routing deliver packet
 
-   map-fds: Map containing :listen-map, optionally :config-map and :conntrack-map"
+   map-fds: Map containing :listen-map, optionally :config-map, :sni-map and :conntrack-map"
   [map-fds]
   (let [listen-map-fd (when (and (map? map-fds) (:listen-map map-fds))
                         (common/map-fd (:listen-map map-fds)))
         config-map-fd (when (and (map? map-fds) (:config-map map-fds))
                         (common/map-fd (:config-map map-fds)))
+        sni-map-fd (when (and (map? map-fds) (:sni-map map-fds))
+                     (common/map-fd (:sni-map map-fds)))
         conntrack-map-fd (when (and (map? map-fds) (:conntrack-map map-fds))
                            (common/map-fd (:conntrack-map map-fds)))]
-    (build-xdp-dnat-program listen-map-fd config-map-fd conntrack-map-fd)))
+    (build-xdp-dnat-program listen-map-fd config-map-fd sni-map-fd conntrack-map-fd)))
 
 ;;; =============================================================================
 ;;; Program Loading and Attachment

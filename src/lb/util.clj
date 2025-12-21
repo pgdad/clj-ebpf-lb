@@ -315,6 +315,51 @@
   []
   WEIGHTED-ROUTE-MAX-SIZE)
 
+;;; =============================================================================
+;;; SNI Hostname Hashing (for TLS SNI-based routing)
+;;; =============================================================================
+
+(def ^:const FNV1A-64-OFFSET-BASIS 0xcbf29ce484222325)
+(def ^:const FNV1A-64-PRIME 0x00000100000001B3)
+
+(defn fnv1a-64
+  "Compute FNV-1a 64-bit hash of a byte array.
+   This is a fast, non-cryptographic hash suitable for hash table lookups."
+  ^long [^bytes data]
+  (loop [hash (unchecked-long FNV1A-64-OFFSET-BASIS)
+         i 0]
+    (if (>= i (alength data))
+      hash
+      (let [b (bit-and (aget data i) 0xFF)
+            hash-xor (bit-xor hash b)
+            hash-mul (unchecked-multiply hash-xor FNV1A-64-PRIME)]
+        (recur hash-mul (inc i))))))
+
+(defn hostname->hash
+  "Hash a hostname for SNI map lookup using FNV-1a 64-bit.
+   Hostname is lowercased before hashing for case-insensitive matching."
+  ^long [^String hostname]
+  (fnv1a-64 (.getBytes (.toLowerCase hostname) "UTF-8")))
+
+(def ^:const SNI-KEY-SIZE 8)
+
+(defn encode-sni-key
+  "Encode SNI map key from hostname hash.
+   Key: hostname_hash (8 bytes) = 8 bytes total.
+   Uses native byte order for efficient lookup."
+  [hostname-hash]
+  (let [buf (ByteBuffer/allocate SNI-KEY-SIZE)]
+    (.order buf (ByteOrder/nativeOrder))
+    (.putLong buf (unchecked-long hostname-hash))
+    (.array buf)))
+
+(defn decode-sni-key
+  "Decode SNI map key from byte array."
+  [^bytes b]
+  (let [buf (ByteBuffer/wrap b)]
+    (.order buf (ByteOrder/nativeOrder))
+    {:hostname-hash (.getLong buf)}))
+
 (defn encode-conntrack-key
   "Encode connection tracking 5-tuple key.
    {src_ip (4) + dst_ip (4) + src_port (2) + dst_port (2) + protocol (1) + padding (3)}

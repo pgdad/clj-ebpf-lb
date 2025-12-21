@@ -34,6 +34,37 @@
 (def TCP-HLEN-MIN 20)
 (def UDP-HLEN 8)
 
+;; TLS constants for SNI parsing
+(def TLS-CONTENT-TYPE-HANDSHAKE 0x16)
+(def TLS-HANDSHAKE-CLIENT-HELLO 0x01)
+(def TLS-EXT-SNI 0x0000)
+(def TLS-SNI-NAME-TYPE-HOSTNAME 0x00)
+
+;; TLS record header offsets
+(def TLS-RECORD-CONTENT-TYPE-OFF 0)      ; 1 byte
+(def TLS-RECORD-VERSION-OFF 1)            ; 2 bytes
+(def TLS-RECORD-LENGTH-OFF 3)             ; 2 bytes
+(def TLS-RECORD-HEADER-SIZE 5)
+
+;; TLS handshake header offsets (from start of handshake)
+(def TLS-HANDSHAKE-TYPE-OFF 0)            ; 1 byte
+(def TLS-HANDSHAKE-LENGTH-OFF 1)          ; 3 bytes
+(def TLS-HANDSHAKE-HEADER-SIZE 4)
+
+;; SNI parsing limits
+(def MAX-SNI-LENGTH 64)                   ; Max hostname length to hash
+(def MAX-TLS-EXTENSIONS 32)               ; Bounded loop limit for extensions
+
+;; HTTPS port (network byte order)
+(def HTTPS-PORT-BE 0x01BB)                ; 443 in big-endian
+
+;; FNV-1a 64-bit hash constants for SNI hashing
+;; Must match lb.util/hostname->hash implementation
+(def FNV1A-64-OFFSET-BASIS-LO 0x84222325) ; Lower 32 bits of 0xcbf29ce484222325
+(def FNV1A-64-OFFSET-BASIS-HI 0xcbf29ce4) ; Upper 32 bits
+(def FNV1A-64-PRIME-LO 0x000001B3)        ; Lower 32 bits of 0x00000100000001B3
+(def FNV1A-64-PRIME-HI 0x00000100)        ; Upper 32 bits
+
 ;; BPF helper function IDs
 (def BPF-FUNC-map-lookup-elem 1)
 (def BPF-FUNC-map-update-elem 2)

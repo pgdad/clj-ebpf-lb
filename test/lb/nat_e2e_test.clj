@@ -32,12 +32,12 @@
       (is (zero? (mod (count bytecode) 8)))))
 
   (testing "XDP DNAT program with listen map"
-    (let [bytecode (xdp/build-xdp-dnat-program 999 nil nil)]
+    (let [bytecode (xdp/build-xdp-dnat-program 999 nil nil nil)]
       (is (bytes? bytecode))
       (is (> (count bytecode) 200)))) ; Should have substantial instructions
 
   (testing "XDP DNAT program with conntrack map"
-    (let [bytecode (xdp/build-xdp-dnat-program 999 nil 888)]
+    (let [bytecode (xdp/build-xdp-dnat-program 999 nil nil 888)]
       (is (bytes? bytecode))
       ;; With conntrack, should be larger
       (is (>= (/ (count bytecode) 8) 250)))))
