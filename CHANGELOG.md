@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- TLS/SNI-based routing for layer 4 passthrough with layer 7 inspection
+  - Route TLS traffic based on hostname without terminating TLS
+  - XDP-level TLS ClientHello parsing with SNI extraction
+  - FNV-1a 64-bit hashing for efficient BPF map lookup
+  - Case-insensitive hostname matching
+  - Weighted load balancing support per SNI hostname
+  - Runtime SNI route management (`add-sni-route!`, `remove-sni-route!`, `list-sni-routes`)
+  - Graceful fallback to default target when SNI not found or parsing fails
+
 ## [0.1.0] - 2025-12-21
 
 ### Added
