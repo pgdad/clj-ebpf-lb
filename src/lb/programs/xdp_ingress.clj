@@ -1018,11 +1018,7 @@
       (net/return-action net/XDP-PASS)
 
       [(asm/label :pass)]
-      (net/return-action net/XDP-PASS)
-
-      ;; Rate limited - drop packet
-      [(asm/label :rate_limited)]
-      (net/return-action net/XDP-DROP))))
+      (net/return-action net/XDP-PASS))))
 
 (defn build-xdp-ingress-program
   "Build the XDP ingress program.

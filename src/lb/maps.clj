@@ -511,6 +511,16 @@
 
 (def ^:const TOKEN-SCALE 1000)  ; Scale factor for token values (allows sub-token precision)
 
+(defn encode-array-key
+  "Encode an array map index as a 4-byte key.
+   BPF array maps use u32 keys, which need to be encoded as bytes
+   when using byte array values."
+  [index]
+  (let [buf (java.nio.ByteBuffer/allocate 4)]
+    (.order buf java.nio.ByteOrder/LITTLE_ENDIAN)
+    (.putInt buf (int index))
+    (.array buf)))
+
 (defn encode-rate-config
   "Encode rate limit configuration to bytes.
    rate: tokens per second
@@ -543,9 +553,10 @@
   (let [index (case limit-type
                 :source RATE-LIMIT-CONFIG-SRC
                 :backend RATE-LIMIT-CONFIG-BACKEND)
+        key (encode-array-key index)
         value (encode-rate-config rate burst)]
     (log/info "Setting" (name limit-type) "rate limit: rate=" rate "/sec, burst=" burst)
-    (bpf/map-update config-map index value)))
+    (bpf/map-update config-map key value)))
 
 (defn get-rate-limit-config
   "Get rate limit configuration.
@@ -555,8 +566,9 @@
   [config-map limit-type]
   (let [index (case limit-type
                 :source RATE-LIMIT-CONFIG-SRC
-                :backend RATE-LIMIT-CONFIG-BACKEND)]
-    (when-let [bytes (bpf/map-lookup config-map index)]
+                :backend RATE-LIMIT-CONFIG-BACKEND)
+        key (encode-array-key index)]
+    (when-let [bytes (bpf/map-lookup config-map key)]
       (decode-rate-config bytes))))
 
 (defn disable-rate-limit
