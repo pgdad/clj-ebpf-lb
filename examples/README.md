@@ -13,7 +13,10 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 | [kubernetes-ingress.edn](#kubernetes-ingress-style) | K8s-style ingress controller pattern | Advanced |
 | [repl_usage.clj](#repl-usage) | Interactive REPL session | Intermediate |
 | [monitoring.clj](#statistics-and-monitoring) | Real-time statistics monitoring | Advanced |
-| [connection-draining.clj](#connection-draining) | Graceful backend removal patterns | Advanced |
+| [connection_draining.clj](#connection-draining) | Graceful backend removal patterns | Advanced |
+| [dns_resolution.clj](#dns-resolution) | DNS-based backend discovery | Advanced |
+| [rate_limiting.clj](#rate-limiting) | Token bucket rate limiting | Advanced |
+| [prometheus_metrics.clj](#prometheus-metrics) | Prometheus metrics export | Intermediate |
 
 ## Prerequisites
 
@@ -179,13 +182,17 @@ Interactive usage from the Clojure REPL for development and debugging.
 
 **File: `repl_usage.clj`**
 
-**Instructions**:
+**Single-line execution**:
 ```bash
-# Start a REPL with the dev alias
-sudo clojure -M:dev
+sudo clojure -M:dev -e "(require 'repl-usage)"
+```
 
-# Load and run the example
-(load-file "examples/repl_usage.clj")
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'repl-usage)
 ```
 
 The example demonstrates:
@@ -203,13 +210,17 @@ Real-time statistics collection and monitoring.
 
 **File: `monitoring.clj`**
 
-**Instructions**:
+**Single-line execution**:
 ```bash
-# Start a REPL
-sudo clojure -M:dev
+sudo clojure -M:dev -e "(require 'monitoring)"
+```
 
-# Load and run the example
-(load-file "examples/monitoring.clj")
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'monitoring)
 ```
 
 The example demonstrates:
@@ -225,15 +236,19 @@ The example demonstrates:
 
 Graceful backend removal patterns for zero-downtime deployments.
 
-**File: `connection-draining.clj`**
+**File: `connection_draining.clj`**
 
-**Instructions**:
+**Single-line execution**:
 ```bash
-# Start a REPL
-sudo clojure -M:dev
+sudo clojure -M:dev -e "(require 'connection-draining)"
+```
 
-# Load and run the example
-(load-file "examples/connection-draining.clj")
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'connection-draining)
 ```
 
 The example demonstrates:
@@ -263,6 +278,100 @@ The example demonstrates:
 ;; Block until drain completes
 (lb/wait-for-drain! "ip:port")  ; => :completed, :timeout, or :cancelled
 ```
+
+---
+
+### DNS Resolution
+
+DNS-based backend discovery for dynamic environments like Kubernetes or cloud deployments.
+
+**File: `dns_resolution.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'dns-resolution)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'dns-resolution)
+```
+
+The example demonstrates:
+- Using DNS hostnames instead of static IPs
+- Periodic re-resolution with configurable intervals
+- Multiple A record expansion to weighted targets
+- Graceful failure with last-known-good IP fallback
+- Mixed static IP and DNS target configurations
+- Kubernetes headless service patterns
+
+---
+
+### Rate Limiting
+
+Token bucket rate limiting to protect backends and prevent client abuse.
+
+**File: `rate_limiting.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'rate-limiting)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'rate-limiting)
+```
+
+The example demonstrates:
+- Per-source IP rate limiting
+- Per-backend rate limiting
+- Token bucket algorithm configuration
+- Burst handling for traffic spikes
+- Runtime rate limit adjustment
+
+---
+
+### Prometheus Metrics
+
+Export metrics in Prometheus format for monitoring and alerting.
+
+**File: `prometheus_metrics.clj`**
+
+**Single-line execution**:
+```bash
+sudo clojure -M:dev -e "(require 'prometheus-metrics) (prometheus-metrics/run-demo)"
+```
+
+**Interactive REPL**:
+```bash
+sudo clojure -M:dev
+```
+```clojure
+(require 'prometheus-metrics)
+(prometheus-metrics/run-demo)
+```
+
+**Just start the metrics server**:
+```clojure
+(require '[lb.metrics :as metrics])
+(metrics/start! {:port 9090})
+;; Now visit http://localhost:9090/metrics
+```
+
+The example demonstrates:
+- Starting a standalone metrics server
+- Full integration with load balancer
+- Available metrics (connections, bytes, health, latency histograms)
+- Prometheus scrape configuration
+- Grafana query examples
+- Custom data source registration
 
 ---
 
