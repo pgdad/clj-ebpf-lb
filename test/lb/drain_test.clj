@@ -406,6 +406,9 @@
                            [{:ip "10.1.1.1" :port 8080 :weight 50}
                             {:ip "10.1.1.2" :port 8080 :weight 50}])]
 
+        ;; Set mock connection so drain won't complete immediately
+        (set-mock-connections! "10.1.1.1" 1)
+
         ;; Initialize
         (drain/init! :mock-conntrack-map
                      (fn [proxy-name new-tg]
