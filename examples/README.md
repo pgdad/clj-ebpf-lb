@@ -8,6 +8,7 @@ This directory contains example configurations and usage patterns for clj-ebpf-l
 |---------|-------------|------------|
 | [simple-proxy.edn](#simple-single-backend-proxy) | Basic single backend setup | Beginner |
 | [multi-backend.edn](#multi-backend-with-source-routing) | Source-based routing to multiple backends | Intermediate |
+| [sni-routing.edn](#sni-based-routing) | Route TLS traffic by hostname (SNI) | Intermediate |
 | [multi-interface.edn](#multi-interface-proxy) | Proxy across multiple network interfaces | Intermediate |
 | [kubernetes-ingress.edn](#kubernetes-ingress-style) | K8s-style ingress controller pattern | Advanced |
 | [repl_usage.clj](#repl-usage) | Interactive REPL session | Intermediate |
@@ -72,6 +73,50 @@ curl http://localhost:80  # Uses default backend (8080)
 # Traffic from 192.168.x.x would go to 8081
 # Traffic from 10.10.x.x would go to 8082
 ```
+
+---
+
+### SNI-Based Routing
+
+Route TLS traffic to different backends based on the SNI hostname without terminating TLS.
+
+**File: `sni-routing.edn`**
+
+**Use Case**:
+- Multi-tenant SaaS (customer-a.example.com, customer-b.example.com)
+- Microservices routing (api.myapp.io, web.myapp.io, admin.myapp.io)
+- Blue/green or canary deployments per service
+- HTTPS load balancing without TLS termination
+
+**Setup**:
+```bash
+# Start backend servers for different hostnames
+# Each backend handles TLS termination
+python3 -m http.server 8443 &  # Default backend
+python3 -m http.server 8444 &  # api.example.com backend
+python3 -m http.server 8445 &  # web.example.com backend
+
+# Run the proxy
+sudo clojure -M:run -c examples/sni-routing.edn
+
+# Test with curl (specify SNI hostname)
+curl -k --resolve api.example.com:443:127.0.0.1 https://api.example.com/
+curl -k --resolve web.example.com:443:127.0.0.1 https://web.example.com/
+
+# Or use openssl to verify SNI is being read
+openssl s_client -connect localhost:443 -servername api.example.com
+```
+
+**Routing Priority**:
+1. Source IP/CIDR routes (checked first)
+2. SNI hostname routes (checked second)
+3. Default target (fallback)
+
+**Features**:
+- Case-insensitive: `API.Example.COM` matches `api.example.com`
+- Weighted targets per hostname for canary/blue-green deployments
+- Zero TLS overhead (layer 4 passthrough)
+- ~50-100ns added latency per new TLS connection
 
 ---
 
@@ -284,6 +329,43 @@ ip link show eth0
   {:name "web"
    :listen {:interfaces ["eth0"] :port 80}
    :default-target {:ip "10.0.0.99" :port 8080}})  ; Maintenance server
+```
+
+### SNI-Based Multi-Tenant Routing
+
+```clojure
+;; Add SNI routes at runtime for new tenants
+(lb/add-sni-route! "https-gateway" "new-customer.example.com"
+                   {:ip "10.5.0.1" :port 8443})
+
+;; Weighted SNI route for canary deployment
+(lb/add-sni-route! "https-gateway" "api.example.com"
+                   [{:ip "10.5.1.1" :port 8443 :weight 90}   ; Stable
+                    {:ip "10.5.1.2" :port 8443 :weight 10}]) ; Canary
+
+;; Remove a tenant's route
+(lb/remove-sni-route! "https-gateway" "old-customer.example.com")
+
+;; List all SNI routes
+(lb/list-sni-routes "https-gateway")
+```
+
+### Per-Service Blue/Green with SNI
+
+```clojure
+;; Each service can have independent blue/green deployments
+;; API: 100% green (migration complete)
+(lb/add-sni-route! "gateway" "api.myapp.io"
+                   {:ip "10.0.1.2" :port 8443})  ; Green only
+
+;; Web: 50/50 split (mid-migration)
+(lb/add-sni-route! "gateway" "web.myapp.io"
+                   [{:ip "10.0.2.1" :port 8443 :weight 50}   ; Blue
+                    {:ip "10.0.2.2" :port 8443 :weight 50}]) ; Green
+
+;; Admin: 100% blue (not yet migrated)
+(lb/add-sni-route! "gateway" "admin.myapp.io"
+                   {:ip "10.0.3.1" :port 8443})  ; Blue only
 ```
 
 ## Next Steps
