@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Prometheus metrics export for monitoring and observability
+  - HTTP endpoint at `/metrics` with standard Prometheus text format
+  - Metrics include: `lb_connections_active`, `lb_bytes_total`, `lb_packets_total`
+  - Backend health status: `lb_backend_health` (1=healthy, 0=unhealthy)
+  - Health check latency histogram: `lb_health_check_latency_seconds`
+  - DNS resolution status: `lb_dns_resolution_status`
+  - System info: `lb_up`, `lb_info`
+  - Configurable port and path via settings
+  - Automatic integration with health check system for latency recording
+  - Configuration: `{:settings {:metrics {:enabled true :port 9090 :path "/metrics"}}}`
+  - Runtime API: `metrics/start!`, `metrics/stop!`, `metrics/running?`, `metrics/get-status`
 - DNS-based backend resolution for dynamic environments
   - Use `:host` instead of `:ip` for DNS-backed targets
   - Periodic re-resolution with configurable intervals (`:dns-refresh-seconds`)

@@ -123,11 +123,22 @@
 (s/def ::per-source ::per-source-rate-limit)
 (s/def ::per-backend ::per-backend-rate-limit)
 
+;; Metrics settings
+(s/def ::metrics-enabled boolean?)
+(s/def ::metrics-port (s/and int? #(>= % 1024) #(<= % 65535)))
+(s/def ::metrics-path (s/and string? #(clojure.string/starts-with? % "/")))
+
+(s/def ::metrics
+  (s/keys :opt-un [::metrics-enabled ::metrics-port ::metrics-path]))
+
+;; Alias for nested map keys
+(s/def ::enabled boolean?)
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
                    ::default-drain-timeout-ms ::drain-check-interval-ms
-                   ::rate-limits]))
+                   ::rate-limits ::metrics]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))

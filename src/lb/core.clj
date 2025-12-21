@@ -13,6 +13,7 @@
             [lb.rate-limit :as rate-limit]
             [lb.reload :as reload]
             [lb.dns :as dns]
+            [lb.metrics :as metrics]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -157,6 +158,15 @@
               ;; Register reload functions for hot reload support
               (register-reload-functions!)
 
+              ;; Start metrics server if enabled
+              (when (get-in config [:settings :metrics :enabled])
+                (log/info "Starting metrics server")
+                (metrics/register-data-sources!
+                  {:conntrack-fn #(conntrack/get-all-connections (:conntrack-map ebpf-maps))
+                   :health-fn #(health/get-all-status)
+                   :dns-fn #(dns/get-all-status)})
+                (metrics/start! (get-in config [:settings :metrics])))
+
               (log/info "Load balancer initialized successfully")
               state))))
 
@@ -171,7 +181,12 @@
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
 
-    ;; Disable hot reload first
+    ;; Stop metrics server first
+    (when (metrics/running?)
+      (metrics/stop!)
+      (metrics/clear-data-sources!))
+
+    ;; Disable hot reload
     (reload/disable-hot-reload!)
 
     ;; Stop DNS resolution daemon

@@ -19,6 +19,7 @@ A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP
 - **DNS-Based Backends**: Use DNS hostnames for dynamic backend discovery with periodic re-resolution
 - **Runtime Configuration**: Add/remove proxies and routes without restart
 - **Statistics Collection**: Real-time connection and traffic statistics via ring buffer
+- **Prometheus Metrics**: Built-in `/metrics` endpoint for Prometheus scraping
 - **ARM64 Support**: Full cross-platform support with QEMU-based ARM64 testing
 
 ## Requirements
@@ -458,6 +459,76 @@ Gracefully remove backends from the load balancer by stopping new connections wh
 3. Background watcher monitors connection counts via conntrack
 4. Drain completes when connections reach 0 or timeout expires
 5. Optional callback notifies completion status
+
+### Prometheus Metrics
+
+Export metrics in Prometheus format for monitoring and alerting. The metrics endpoint is compatible with Prometheus, Grafana, and other monitoring tools.
+
+**Enable metrics in settings:**
+```clojure
+:settings
+{:metrics {:enabled true
+           :port 9090              ; Metrics server port (default 9090)
+           :path "/metrics"}}      ; Endpoint path (default "/metrics")
+```
+
+**Available metrics:**
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lb_up` | gauge | - | Whether the load balancer is running (1=up) |
+| `lb_info` | gauge | version | Load balancer version information |
+| `lb_connections_active` | gauge | target_ip, target_port | Current active connections per backend |
+| `lb_bytes_total` | counter | target_ip, target_port, direction | Bytes transferred (forward/reverse) |
+| `lb_packets_total` | counter | target_ip, target_port, direction | Packets transferred (forward/reverse) |
+| `lb_backend_health` | gauge | proxy_name, target_ip, target_port | Backend health status (1=healthy, 0=unhealthy) |
+| `lb_health_check_latency_seconds` | histogram | proxy_name, target_id | Health check latency distribution |
+| `lb_dns_resolution_status` | gauge | proxy_name, hostname | DNS resolution status (1=resolved, 0=failed) |
+
+**Example Prometheus output:**
+```
+# HELP lb_up Whether the load balancer is running (1=up, 0=down)
+# TYPE lb_up gauge
+lb_up 1
+
+# HELP lb_backend_health Backend health status (1=healthy, 0=unhealthy)
+# TYPE lb_backend_health gauge
+lb_backend_health{proxy_name="web",target_ip="10.0.0.1",target_port="8080"} 1
+lb_backend_health{proxy_name="web",target_ip="10.0.0.2",target_port="8080"} 0
+
+# HELP lb_health_check_latency_seconds Health check latency in seconds
+# TYPE lb_health_check_latency_seconds histogram
+lb_health_check_latency_seconds_bucket{proxy_name="web",target_id="10.0.0.1:8080",le="0.005"} 45
+lb_health_check_latency_seconds_bucket{proxy_name="web",target_id="10.0.0.1:8080",le="0.01"} 120
+lb_health_check_latency_seconds_bucket{proxy_name="web",target_id="10.0.0.1:8080",le="+Inf"} 200
+lb_health_check_latency_seconds_sum{proxy_name="web",target_id="10.0.0.1:8080"} 1.234
+lb_health_check_latency_seconds_count{proxy_name="web",target_id="10.0.0.1:8080"} 200
+```
+
+**Prometheus scrape configuration:**
+```yaml
+scrape_configs:
+  - job_name: 'clj-ebpf-lb'
+    static_configs:
+      - targets: ['localhost:9090']
+```
+
+**Metrics API:**
+```clojure
+(require '[lb.metrics :as metrics])
+
+;; Start/stop metrics server
+(metrics/start! {:port 9090 :path "/metrics"})
+(metrics/stop!)
+(metrics/running?)  ; => true/false
+
+;; Get server status
+(metrics/get-status)
+;; => {:running true :port 9090 :path "/metrics" :url "http://localhost:9090/metrics"}
+
+;; Collect metrics programmatically (returns Prometheus text format)
+(metrics/collect-metrics)
+```
 
 ## Programmatic API
 

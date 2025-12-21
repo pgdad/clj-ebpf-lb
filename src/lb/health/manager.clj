@@ -4,6 +4,7 @@
   (:require [clojure.tools.logging :as log]
             [lb.health.checker :as checker]
             [lb.health.weights :as weights]
+            [lb.metrics :as metrics]
             [lb.util :as util]
             [lb.config :as config])
   (:import [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
@@ -234,6 +235,10 @@
               result (checker/perform-check health-check-config ip port)
               updated (transition-health target-health result)
               status-changed? (not= status (:status updated))]
+          ;; Record latency for Prometheus metrics (only on success)
+          (when (:success? result)
+            (metrics/record-health-check-latency!
+              proxy-name target-id (/ (:latency-ms result) 1000.0)))
           ;; Update state
           (swap! manager-state assoc-in
                  [:proxies proxy-name :target-healths target-id] updated)
