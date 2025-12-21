@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Connection draining for graceful backend removal
+  - Stop new connections while allowing existing ones to complete
+  - Background watcher monitors connection counts via conntrack
+  - Configurable drain timeout (default 30 seconds)
+  - Callback support for drain completion notification
+  - Runtime API: `drain-backend!`, `undrain-backend!`, `wait-for-drain!`
+  - Status functions: `get-drain-status`, `get-all-draining`, `draining?`
+  - Drain-aware weight computation integrates with health system
+  - No BPF changes required (uses existing weight=0 handling)
+
 ## [0.2.0] - 2025-12-21
 
 ### Added
