@@ -2,7 +2,8 @@
   "Tests for PROXY protocol v2 support."
   (:require [clojure.test :refer [deftest testing is are]]
             [lb.util :as util]
-            [lb.config :as config])
+            [lb.config :as config]
+            [lb.programs.tc-ingress :as tc-ingress])
   (:import [java.nio ByteBuffer ByteOrder]))
 
 ;;; =============================================================================
@@ -277,3 +278,56 @@
     (let [flags [util/FLAG-SESSION-PERSISTENCE
                  util/FLAG-PROXY-PROTOCOL-V2]]
       (is (= (count flags) (count (distinct flags)))))))
+
+;;; =============================================================================
+;;; TC Ingress Program Tests
+;;; =============================================================================
+
+(deftest tc-ingress-constants-test
+  (testing "PROXY v2 header size constants match util"
+    (is (= util/PROXY-V2-HEADER-SIZE-IPV4 tc-ingress/PROXY-V2-HEADER-SIZE-IPV4))
+    (is (= util/PROXY-V2-HEADER-SIZE-IPV6 tc-ingress/PROXY-V2-HEADER-SIZE-IPV6)))
+
+  (testing "TCP connection state constants"
+    (is (= 0 tc-ingress/CONN-STATE-NEW))
+    (is (= 1 tc-ingress/CONN-STATE-SYN-SENT))
+    (is (= 2 tc-ingress/CONN-STATE-SYN-RECV))
+    (is (= 3 tc-ingress/CONN-STATE-ESTABLISHED)))
+
+  (testing "PROXY flag constants"
+    (is (= 0x01 tc-ingress/PROXY-FLAG-ENABLED))
+    (is (= 0x02 tc-ingress/PROXY-FLAG-HEADER-INJECTED)))
+
+  (testing "Conntrack field offsets"
+    (is (= 96 tc-ingress/CT-OFF-CONN-STATE))
+    (is (= 97 tc-ingress/CT-OFF-PROXY-FLAGS))
+    (is (= 100 tc-ingress/CT-OFF-SEQ-OFFSET))
+    (is (= 104 tc-ingress/CT-OFF-ORIG-CLIENT-IP))
+    (is (= 120 tc-ingress/CT-OFF-ORIG-CLIENT-PORT))))
+
+(deftest tc-ingress-payload-shifting-constants-test
+  (testing "Payload shifting chunk size is 64 bytes"
+    (is (= 64 tc-ingress/SHIFT-CHUNK-SIZE)))
+
+  (testing "Maximum chunks allows for reasonable payload size"
+    ;; 24 chunks * 64 bytes = 1536 bytes, covering most MTU payloads
+    (is (= 24 tc-ingress/SHIFT-MAX-CHUNKS))
+    (is (= 1536 (* tc-ingress/SHIFT-MAX-CHUNKS tc-ingress/SHIFT-CHUNK-SIZE))))
+
+  (testing "Chunk size is power of 2 for efficient division"
+    (is (zero? (bit-and tc-ingress/SHIFT-CHUNK-SIZE
+                        (dec tc-ingress/SHIFT-CHUNK-SIZE))))))
+
+(deftest tc-ingress-program-build-test
+  (testing "TC pass program builds successfully"
+    (let [bytecode (tc-ingress/build-tc-pass-program)]
+      (is (bytes? bytecode))
+      (is (pos? (alength bytecode)))))
+
+  (testing "TC ingress PROXY program builds without conntrack map"
+    (let [bytecode (tc-ingress/build-tc-ingress-proxy-program nil)]
+      (is (bytes? bytecode))
+      (is (pos? (alength bytecode)))
+      ;; Program should be substantial (hundreds of bytes of BPF instructions)
+      ;; Each instruction is 8 bytes, expect at least ~50 instructions = 400 bytes
+      (is (> (alength bytecode) 400)))))

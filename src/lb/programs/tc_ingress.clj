@@ -47,15 +47,23 @@
 ;; r0-r5 = scratch, clobbered by helper calls
 
 ;; Stack layout for unified IPv4/IPv6 (negative offsets from r10):
-;; -40   : Conntrack key (40 bytes)
+;; -40   : Conntrack key (40 bytes, uses -80 to -41)
 ;; -44   : tcp_flags (2 bytes) + tcp_hdr_len (2 bytes)
 ;; -48   : L4 header offset (4 bytes)
 ;; -52   : af (1 byte) + protocol (1 byte) + pad (2 bytes)
 ;; -56   : payload_offset (4 bytes) - offset where TCP payload starts
 ;; -60   : total_len (2 bytes) + pad (2 bytes) - IP total length
 ;; -64   : seq_num (4 bytes) - TCP sequence number
-;; -92   : PROXY v2 header buffer (28 bytes for IPv4)
-;; -144  : PROXY v2 header buffer extension (52 bytes total for IPv6)
+;; -68   : conn_state (1 byte) - saved from conntrack
+;; -72   : header_size (4 bytes) - PROXY header size (28 or 52)
+;; -76   : payload_len (4 bytes) - original TCP payload length
+;; -80   : current_chunk (4 bytes) - current chunk index for shifting
+;; -144  : PROXY v2 header buffer start (52 bytes for IPv6, 28 for IPv4)
+;;         Layout: sig(12) + ver/cmd(1) + family(1) + len(2) + addresses
+;;         IPv4 addresses: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2)
+;;         IPv6 addresses: src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2)
+;; -208  : chunk_buffer (64 bytes) - temp buffer for payload shifting
+;; -212  : temp_len (4 bytes) - saved length for bpf_skb_store_bytes
 
 ;;; =============================================================================
 ;;; BPF Helper Function Numbers
@@ -100,6 +108,13 @@
 
 (def ^:const PROXY-V2-HEADER-SIZE-IPV4 28)
 (def ^:const PROXY-V2-HEADER-SIZE-IPV6 52)
+
+;; Payload shifting constants
+;; Chunk size for copying - must fit in stack buffer
+(def ^:const SHIFT-CHUNK-SIZE 64)
+;; Maximum number of chunks to shift (24 * 64 = 1536 bytes max payload)
+;; This covers most practical TCP payloads on standard MTU
+(def ^:const SHIFT-MAX-CHUNKS 24)
 
 ;; PROXY v2 signature (12 bytes): 0x0D 0x0A 0x0D 0x0A 0x00 0x0D 0x0A 0x51 0x55 0x49 0x54 0x0A
 ;; Split into 32-bit words for easier writing:
@@ -559,42 +574,166 @@
         ;; Reload data pointers after skb_change_tail
         (tc-reload-data-ptrs)
 
-        ;; Now we need to:
-        ;; 1. Move existing TCP payload down by header_size bytes
-        ;; 2. Write PROXY header at original payload position
-        ;; 3. Update IP total length
-        ;; 4. Update checksums
+        ;; =====================================================================
+        ;; PHASE 7a: Shift TCP Payload Down to Make Room for PROXY Header
+        ;; =====================================================================
+        ;;
+        ;; After bpf_skb_change_tail, the packet is extended at the END.
+        ;; The existing TCP payload is still at its original position.
+        ;; We need to move it down (to higher offsets) by header_size bytes.
+        ;;
+        ;; Algorithm:
+        ;; 1. Calculate original payload length
+        ;; 2. Copy chunks from END to START (backwards) to avoid overwriting
+        ;; 3. Use bounded iterations for BPF verifier
+        ;;
+        ;; payload_len = old_data_end - (data + payload_offset)
+        ;;             = (new_data_end - header_size) - (data + payload_offset)
 
-        ;; For payload movement, we use bpf_skb_store_bytes in a loop
-        ;; But BPF doesn't have loops. We need to copy in chunks.
-        ;; This is complex - for now, use a simplified approach:
-        ;; Use bpf_skb_load_bytes and bpf_skb_store_bytes to move data
+        ;; Calculate payload length
+        ;; r7 = data, r8 = data_end (new, after extend)
+        [(dsl/ldx :w :r1 :r10 -72)          ; header_size
+         (dsl/mov-reg :r2 :r8)              ; r2 = new data_end
+         (dsl/sub-reg :r2 :r1)              ; r2 = old data_end (new_data_end - header_size)
+         (dsl/ldx :w :r3 :r10 -56)          ; payload_offset
+         (dsl/mov-reg :r4 :r7)
+         (dsl/add-reg :r4 :r3)              ; r4 = data + payload_offset = payload_start
+         (dsl/sub-reg :r2 :r4)              ; r2 = payload_len = old_data_end - payload_start
+         (dsl/stx :w :r10 :r2 -76)]         ; Save payload_len
 
-        ;; Actually, a better approach: since we're inserting PROXY header
-        ;; at the START of TCP payload, and the packet has been extended,
-        ;; we can use bpf_skb_store_bytes to write the PROXY header,
-        ;; then shift the original payload.
+        ;; If payload is zero or negative, skip shifting
+        [(asm/jmp-imm :jle :r2 0 :build_proxy_header)]
 
-        ;; For simplicity, let's write the PROXY header directly.
-        ;; In practice, the payload shift would need chunked copying.
-        ;; For this implementation, we'll handle small payloads.
+        ;; Initialize chunk counter - we iterate from last chunk backwards
+        ;; num_chunks = (payload_len + CHUNK_SIZE - 1) / CHUNK_SIZE
+        ;; Start from chunk (num_chunks - 1) and go down to 0
+        [(dsl/mov-reg :r0 :r2)              ; r0 = payload_len
+         (dsl/add :r0 (dec SHIFT-CHUNK-SIZE)) ; r0 = payload_len + 63
+         (dsl/rsh :r0 6)                    ; r0 = num_chunks (divide by 64)
+         (dsl/sub :r0 1)                    ; r0 = last chunk index
+         (dsl/stx :w :r10 :r0 -80)]         ; Save current_chunk
+
+        ;; Bounded loop for shifting - unroll for BPF verifier
+        ;; Each iteration: copy one 64-byte chunk from (payload_offset + chunk*64)
+        ;; to (payload_offset + header_size + chunk*64)
+        ;;
+        ;; We use a jump-based bounded iteration pattern
+
+        [(asm/jmp :shift_loop_entry)]
+
+        [(asm/label :shift_chunk)]
+        ;; Load current chunk index
+        [(dsl/ldx :w :r1 :r10 -80)]         ; current_chunk
+
+        ;; Calculate source offset: payload_offset + (chunk_index * 64)
+        [(dsl/ldx :w :r2 :r10 -56)          ; payload_offset
+         (dsl/mov-reg :r3 :r1)
+         (dsl/lsh :r3 6)                    ; chunk_index * 64
+         (dsl/add-reg :r2 :r3)]             ; r2 = src_offset
+
+        ;; Calculate bytes to copy for this chunk
+        ;; For last chunk (highest offset), may be partial
+        ;; bytes_to_copy = min(64, payload_len - chunk_index * 64)
+        [(dsl/ldx :w :r4 :r10 -76)          ; payload_len
+         (dsl/sub-reg :r4 :r3)              ; r4 = payload_len - (chunk_index * 64)
+         (asm/jmp-imm :jge :r4 SHIFT-CHUNK-SIZE :full_chunk)]
+        ;; Partial chunk - use r4 as length
+        [(asm/jmp :do_shift)]
+
+        [(asm/label :full_chunk)]
+        [(dsl/mov :r4 SHIFT-CHUNK-SIZE)]
+
+        [(asm/label :do_shift)]
+        ;; r2 = src_offset, r4 = len
+        ;; Skip if length <= 0
+        [(asm/jmp-imm :jle :r4 0 :shift_next)]
+
+        ;; Bounds check length (max 64)
+        [(asm/jmp-imm :jgt :r4 SHIFT-CHUNK-SIZE :shift_next)]
+
+        ;; Load bytes from source using bpf_skb_load_bytes
+        ;; int bpf_skb_load_bytes(skb, offset, to, len)
+        [(dsl/mov-reg :r1 :r6)              ; r1 = skb
+                                             ; r2 = offset (already set)
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -208)                 ; r3 = &chunk_buffer
+         (dsl/stx :w :r10 :r4 -212)]        ; Save len to temp location
+        ;; r4 is already len
+        [(dsl/call BPF-FUNC-skb-load-bytes)]
+
+        ;; Check if load succeeded
+        [(asm/jmp-imm :jne :r0 0 :shift_next)]
+
+        ;; Calculate destination offset: src_offset + header_size
+        [(dsl/ldx :w :r1 :r10 -80)          ; current_chunk
+         (dsl/ldx :w :r2 :r10 -56)          ; payload_offset
+         (dsl/mov-reg :r3 :r1)
+         (dsl/lsh :r3 6)                    ; chunk_index * 64
+         (dsl/add-reg :r2 :r3)              ; r2 = src_offset
+         (dsl/ldx :w :r3 :r10 -72)          ; header_size
+         (dsl/add-reg :r2 :r3)]             ; r2 = dst_offset = src_offset + header_size
+
+        ;; Store bytes to destination using bpf_skb_store_bytes
+        ;; int bpf_skb_store_bytes(skb, offset, from, len, flags)
+        [(dsl/mov-reg :r1 :r6)              ; r1 = skb
+                                             ; r2 = dst_offset (already set)
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -208)                 ; r3 = &chunk_buffer
+         (dsl/ldx :w :r4 :r10 -212)         ; r4 = len (saved earlier)
+         (dsl/mov :r5 0)                    ; flags = 0 (no recompute csum for data)
+         (dsl/call BPF-FUNC-skb-store-bytes)]
+
+        [(asm/label :shift_next)]
+        ;; Decrement chunk counter and check if done
+        [(dsl/ldx :w :r0 :r10 -80)
+         (dsl/sub :r0 1)
+         (dsl/stx :w :r10 :r0 -80)]
+
+        [(asm/label :shift_loop_entry)]
+        ;; Check bounds: current_chunk must be >= 0
+        [(dsl/ldx :w :r0 :r10 -80)
+         (asm/jmp-imm :jsge :r0 0 :shift_bound_check)]
+        [(asm/jmp :build_proxy_header)]
+
+        [(asm/label :shift_bound_check)]
+        ;; Bound check: don't do more than SHIFT_MAX_CHUNKS iterations
+        [(asm/jmp-imm :jge :r0 SHIFT-MAX-CHUNKS :build_proxy_header)]
+        [(asm/jmp :shift_chunk)]
+
+        ;; =====================================================================
+        ;; PHASE 7b: Build PROXY v2 Header on Stack
+        ;; =====================================================================
+        [(asm/label :build_proxy_header)]
+
+        ;; Reload data pointers (may have been invalidated by helper calls)
+        (tc-reload-data-ptrs)
 
         ;; Build PROXY v2 header on stack and write it
-        ;; Write signature (12 bytes) + version/cmd (1) + family (1) + len (2)
+        ;; Write signature (12 bytes) + version/cmd (1) + family (1) + len (2) + addresses
+        ;;
+        ;; PROXY header buffer layout on stack (starting at -144, going up):
+        ;; -144: signature word 0 (4 bytes)
+        ;; -140: signature word 1 (4 bytes)
+        ;; -136: signature word 2 (4 bytes)
+        ;; -132: version/cmd (1) + family (1) = 2 bytes as halfword
+        ;; -130: address length (2 bytes, big-endian)
+        ;; -128: addresses start
+        ;;   IPv4: src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) = 12 bytes
+        ;;   IPv6: src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2) = 36 bytes
 
-        ;; First, build the header on stack at -92
+        ;; First, build the header on stack starting at -144
         ;; Signature word 0 (big-endian)
         [(dsl/mov :r0 PROXY-V2-SIG-WORD0)
          (dsl/end-to-be :r0 32)
-         (dsl/stx :w :r10 :r0 -92)]
+         (dsl/stx :w :r10 :r0 -144)]
         ;; Signature word 1
         [(dsl/mov :r0 PROXY-V2-SIG-WORD1)
          (dsl/end-to-be :r0 32)
-         (dsl/stx :w :r10 :r0 -88)]
+         (dsl/stx :w :r10 :r0 -140)]
         ;; Signature word 2
         [(dsl/mov :r0 PROXY-V2-SIG-WORD2)
          (dsl/end-to-be :r0 32)
-         (dsl/stx :w :r10 :r0 -84)]
+         (dsl/stx :w :r10 :r0 -136)]
 
         ;; Version/Command (1 byte) + Family (1 byte)
         [(dsl/ldx :b :r0 :r10 -52)          ; Load af
@@ -602,20 +741,20 @@
         ;; IPv4
         [(dsl/mov :r0 (bit-or (bit-shift-left PROXY-V2-VERSION-CMD 8)
                               PROXY-V2-FAMILY-TCP-IPV4))
-         (dsl/stx :h :r10 :r0 -80)]
+         (dsl/stx :h :r10 :r0 -132)]
         ;; Address length (big-endian)
         [(dsl/mov :r0 PROXY-V2-ADDR-LEN-IPV4)
          (dsl/end-to-be :r0 16)
-         (dsl/stx :h :r10 :r0 -78)]
+         (dsl/stx :h :r10 :r0 -130)]
         [(asm/jmp :write_addresses)]
 
         [(asm/label :ipv6_family)]
         [(dsl/mov :r0 (bit-or (bit-shift-left PROXY-V2-VERSION-CMD 8)
                               PROXY-V2-FAMILY-TCP-IPV6))
-         (dsl/stx :h :r10 :r0 -80)]
+         (dsl/stx :h :r10 :r0 -132)]
         [(dsl/mov :r0 PROXY-V2-ADDR-LEN-IPV6)
          (dsl/end-to-be :r0 16)
-         (dsl/stx :h :r10 :r0 -78)]
+         (dsl/stx :h :r10 :r0 -130)]
 
         ;; Write addresses from conntrack orig_client_ip/port
         [(asm/label :write_addresses)]
@@ -626,67 +765,61 @@
          (asm/jmp-imm :jeq :r0 6 :write_ipv6_addr)]
 
         ;; IPv4: write 4-byte src IP, 4-byte dst IP, 2-byte src port, 2-byte dst port
+        ;; Addresses start at -128
         ;; src IP = orig_client_ip (last 4 bytes of 16-byte field)
         [(dsl/ldx :w :r0 :r9 (+ CT-OFF-ORIG-CLIENT-IP 12))
-         (dsl/stx :w :r10 :r0 -76)]
-        ;; dst IP = current packet's dst IP (from key or reload from packet)
-        ;; Actually, dst should be the PROXY/VIP address, which is orig_dst in conntrack
-        ;; Load from conntrack offset 0 (orig_dst_ip, last 4 bytes)
+         (dsl/stx :w :r10 :r0 -128)]
+        ;; dst IP = PROXY/VIP address = orig_dst in conntrack (last 4 bytes)
         [(dsl/ldx :w :r0 :r9 12)            ; orig_dst_ip bytes 12-15
-         (dsl/stx :w :r10 :r0 -72)]
+         (dsl/stx :w :r10 :r0 -124)]
         ;; src port = orig_client_port
         [(dsl/ldx :h :r0 :r9 CT-OFF-ORIG-CLIENT-PORT)
-         (dsl/stx :h :r10 :r0 -68)]
+         (dsl/stx :h :r10 :r0 -120)]
         ;; dst port = orig_dst_port (at offset 16)
         [(dsl/ldx :h :r0 :r9 16)
-         (dsl/stx :h :r10 :r0 -66)]
+         (dsl/stx :h :r10 :r0 -118)]
 
         [(asm/jmp :store_proxy_header)]
 
         ;; IPv6: write 16-byte addresses
+        ;; Addresses start at -128
         [(asm/label :write_ipv6_addr)]
         ;; src IP (16 bytes)
         [(dsl/ldx :w :r0 :r9 (+ CT-OFF-ORIG-CLIENT-IP 0))
-         (dsl/stx :w :r10 :r0 -76)
+         (dsl/stx :w :r10 :r0 -128)
          (dsl/ldx :w :r0 :r9 (+ CT-OFF-ORIG-CLIENT-IP 4))
-         (dsl/stx :w :r10 :r0 -72)
+         (dsl/stx :w :r10 :r0 -124)
          (dsl/ldx :w :r0 :r9 (+ CT-OFF-ORIG-CLIENT-IP 8))
-         (dsl/stx :w :r10 :r0 -68)
+         (dsl/stx :w :r10 :r0 -120)
          (dsl/ldx :w :r0 :r9 (+ CT-OFF-ORIG-CLIENT-IP 12))
-         (dsl/stx :w :r10 :r0 -64)]
+         (dsl/stx :w :r10 :r0 -116)]
         ;; dst IP (16 bytes from conntrack offset 0)
         [(dsl/ldx :w :r0 :r9 0)
-         (dsl/stx :w :r10 :r0 -60)
+         (dsl/stx :w :r10 :r0 -112)
          (dsl/ldx :w :r0 :r9 4)
-         (dsl/stx :w :r10 :r0 -56)
+         (dsl/stx :w :r10 :r0 -108)
          (dsl/ldx :w :r0 :r9 8)
-         (dsl/stx :w :r10 :r0 -52)
+         (dsl/stx :w :r10 :r0 -104)
          (dsl/ldx :w :r0 :r9 12)
-         (dsl/stx :w :r10 :r0 -48)]
+         (dsl/stx :w :r10 :r0 -100)]
         ;; src port
         [(dsl/ldx :h :r0 :r9 CT-OFF-ORIG-CLIENT-PORT)
-         (dsl/stx :h :r10 :r0 -44)]
+         (dsl/stx :h :r10 :r0 -96)]
         ;; dst port
         [(dsl/ldx :h :r0 :r9 16)
-         (dsl/stx :h :r10 :r0 -42)]
+         (dsl/stx :h :r10 :r0 -94)]
 
         ;; Store PROXY header into packet using bpf_skb_store_bytes
         [(asm/label :store_proxy_header)]
 
-        ;; Get payload offset (where to insert header)
-        [(dsl/ldx :w :r2 :r10 -56)          ; payload_offset (was stored earlier)
-         (dsl/ldx :w :r3 :r10 -72)          ; header_size
-         (dsl/mov-reg :r1 :r6)              ; r1 = skb
-                                            ; r2 = offset (payload_offset)
-         (dsl/mov-reg :r4 :r10)
-         (dsl/add :r4 -92)                  ; r4 = &header on stack
-         ;; Swap r3 and r4 for correct arg order
-         ;; bpf_skb_store_bytes(skb, offset, from, len, flags)
-         (dsl/mov-reg :r5 :r3)              ; r5 = len (header_size)
-         (dsl/mov-reg :r3 :r4)              ; r3 = from
-         (dsl/mov :r4 0)                    ; Temp: store header_size
+        ;; bpf_skb_store_bytes(skb, offset, from, len, flags)
+        ;; r1 = skb, r2 = offset (payload_offset), r3 = from (&header), r4 = len, r5 = flags
+        [(dsl/mov-reg :r1 :r6)              ; r1 = skb
+         (dsl/ldx :w :r2 :r10 -56)          ; r2 = payload_offset
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -144)                 ; r3 = &header on stack (start at -144)
          (dsl/ldx :w :r4 :r10 -72)          ; r4 = header_size (len)
-         (dsl/mov :r5 BPF-F-RECOMPUTE-CSUM) ; flags
+         (dsl/mov :r5 BPF-F-RECOMPUTE-CSUM) ; r5 = flags
          (dsl/call BPF-FUNC-skb-store-bytes)]
 
         ;; Update seq_offset in conntrack
