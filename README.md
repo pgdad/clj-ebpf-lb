@@ -20,6 +20,7 @@ A high-performance eBPF-based Layer 4 load balancer written in Clojure. Uses XDP
 - **Runtime Configuration**: Add/remove proxies and routes without restart
 - **Statistics Collection**: Real-time connection and traffic statistics via ring buffer
 - **Prometheus Metrics**: Built-in `/metrics` endpoint for Prometheus scraping
+- **IPv6 Dual-Stack**: Full IPv4/IPv6 support with unified maps and programs
 - **ARM64 Support**: Full cross-platform support with QEMU-based ARM64 testing
 
 ## Requirements
@@ -459,6 +460,86 @@ Gracefully remove backends from the load balancer by stopping new connections wh
 3. Background watcher monitors connection counts via conntrack
 4. Drain completes when connections reach 0 or timeout expires
 5. Optional callback notifies completion status
+
+### IPv6 Dual-Stack Support
+
+Full IPv4/IPv6 dual-stack support enables the same proxy to handle both address families simultaneously. IPv6 addresses can be used for backends, source routes, and SNI routes.
+
+**IPv6-only backends:**
+```clojure
+:default-target
+[{:ip "::1" :port 8080 :weight 50}
+ {:ip "2001:db8::1" :port 8080 :weight 50}]
+```
+
+**Mixed IPv4/IPv6 backends (dual-stack):**
+```clojure
+:default-target
+[{:ip "10.0.0.1" :port 8080 :weight 25}      ; IPv4
+ {:ip "10.0.0.2" :port 8080 :weight 25}      ; IPv4
+ {:ip "2001:db8::1" :port 8080 :weight 25}   ; IPv6
+ {:ip "2001:db8::2" :port 8080 :weight 25}]  ; IPv6
+```
+
+**IPv6 source-based routing:**
+```clojure
+:source-routes
+[;; Route IPv6 documentation prefix to dedicated backend
+ {:source "2001:db8::/32"
+  :target {:ip "2001:db8::10" :port 8080}}
+ ;; Route unique local addresses
+ {:source "fd00::/8"
+  :target {:ip "fd00::1" :port 8080}}
+ ;; IPv4 routes work alongside IPv6
+ {:source "192.168.0.0/16"
+  :target {:ip "10.0.0.1" :port 8080}}]
+```
+
+**IPv6 SNI routing:**
+```clojure
+:sni-routes
+[{:sni-hostname "api.example.com"
+  :target {:ip "2001:db8::10" :port 8443}}
+ {:sni-hostname "www.example.com"
+  :target [{:ip "2001:db8::20" :port 8443 :weight 50}
+           {:ip "2001:db8::21" :port 8443 :weight 50}]}]
+```
+
+**Supported IPv6 address formats:**
+- Full: `2001:0db8:0000:0000:0000:0000:0000:0001`
+- Compressed: `2001:db8::1`, `::1`, `fe80::1`
+- CIDR notation: `2001:db8::/32`, `fe80::/10`
+
+**How it works:**
+1. XDP/TC programs detect EtherType (IPv4: 0x0800, IPv6: 0x86DD)
+2. IPv4 addresses are stored in unified 16-byte format (zero-padded)
+3. IPv6 has no IP header checksum (only TCP/UDP checksums updated)
+4. Conntrack uses unified 40-byte keys for both address families
+
+**IPv6 address utilities:**
+```clojure
+(require '[lb.util :as util])
+
+;; Detect address family
+(util/ipv6? "2001:db8::1")        ; => true
+(util/ipv4? "192.168.1.1")        ; => true
+(util/address-family "::1")       ; => :ipv6
+
+;; Parse addresses
+(util/ipv6-string->bytes "::1")
+(util/ip-string->bytes16 "192.168.1.1")  ; Unified 16-byte format
+
+;; Parse CIDR
+(util/parse-cidr-unified "2001:db8::/32")
+; => {:ip <16-bytes> :prefix-len 32 :af :ipv6}
+```
+
+**Limitations:**
+- IPv4-mapped addresses (`::ffff:192.168.1.1`) not supported - use native formats
+- Extension headers not supported (base IPv6 header only)
+- Maximum 8 targets per weighted group (same as IPv4)
+
+See `examples/ipv6_dual_stack.clj` for comprehensive examples.
 
 ### Prometheus Metrics
 
