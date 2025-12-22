@@ -78,6 +78,7 @@
 ;; -112 : L4 header offset from data (4 bytes)
 ;; -116 : target_count (4 bytes)
 ;; -120 : random_value (4 bytes)
+;; -124 : route_flags (2 bytes) + pad (2 bytes) - includes PROXY protocol flag
 ;; -128 : checksum scratch (8 bytes)
 ;; -136 : additional scratch (8 bytes)
 ;; -144 : SNI key for map lookup (8 bytes: hostname_hash)
@@ -712,7 +713,8 @@
       ;; Multiple targets: weighted selection based on flags
       ;; Check flags for session persistence (offset 4 in header, 2 bytes native order)
       ;; r9 = map value pointer
-      [(dsl/ldx :h :r6 :r9 4)]          ; r6 = flags
+      [(dsl/ldx :h :r6 :r9 4)           ; r6 = flags
+       (dsl/stx :h :r10 :r6 -124)]      ; Store flags at stack[-124] for PROXY protocol
 
       ;; If session-persistence flag (bit 0) set, use source IP hash; else use random
       [(asm/jmp-imm :jset :r6 1 :use_ip_hash)]  ; if flags & 0x01 goto use_ip_hash
@@ -792,6 +794,10 @@
       ;; Single target: use first target at offset 8
       ;; =====================================================================
       [(asm/label :single_target)]
+
+      ;; Store flags for PROXY protocol (even for single target)
+      [(dsl/ldx :h :r0 :r9 4)           ; r0 = flags
+       (dsl/stx :h :r10 :r0 -124)]      ; Store flags at stack[-124]
 
       ;; Load first target (at offset 8): ip(4) + port(2) + cumulative(2)
       [(dsl/ldx :w :r1 :r9 8)           ; r1 = new_dst_ip
@@ -1326,6 +1332,10 @@
       ;; If target_count == 1, skip weighted selection
       [(asm/jmp-imm :jeq :r0 1 :single_target_unified)]
 
+      ;; Store flags for PROXY protocol (at offset 4, 2 bytes)
+      [(dsl/ldx :h :r6 :r9 4)           ; r6 = flags
+       (dsl/stx :h :r10 :r6 -124)]      ; Store flags at stack[-124]
+
       ;; Multiple targets: use random selection (simplified for now)
       [(dsl/call common/BPF-FUNC-get-prandom-u32)]
       [(dsl/mod :r0 100)
@@ -1397,6 +1407,10 @@
       ;; Single target: use first target at offset 8
       ;; =====================================================================
       [(asm/label :single_target_unified)]
+
+      ;; Store flags for PROXY protocol (even for single target)
+      [(dsl/ldx :h :r0 :r9 4)           ; r0 = flags
+       (dsl/stx :h :r10 :r0 -124)]      ; Store flags at stack[-124]
 
       ;; Load first target IP (16 bytes)
       [(dsl/ldx :w :r1 :r9 8)
@@ -1838,16 +1852,41 @@
        (dsl/stx :dw :r10 :r0 -232)]     ; bytes_rev = 0
 
       ;; Initialize PROXY protocol fields at offset 96 from base (-312 + 96 = -216)
-      ;; conn_state(1) + proxy_flags(1) + pad(2) + seq_offset(4) = 8 bytes at -216
+      ;; Check if PROXY protocol flag is set (bit 2 = 0x04 in route flags at stack[-124])
+      [(dsl/ldx :h :r0 :r10 -124)       ; Load route flags
+       (asm/jmp-imm :jset :r0 4 :set_proxy_fields)]  ; If FLAG-PROXY-PROTOCOL-V2 (0x04) set
+
+      ;; PROXY disabled: zero all fields
       [(dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -216)]     ; Zero first 8 bytes of PROXY fields
+       (dsl/stx :dw :r10 :r0 -216)      ; conn_state=0, proxy_flags=0, pad, seq_offset=0
+       (dsl/stx :dw :r10 :r0 -208)      ; Zero orig_client_ip bytes 0-7
+       (dsl/stx :dw :r10 :r0 -200)      ; Zero orig_client_ip bytes 8-15
+       (dsl/stx :dw :r10 :r0 -192)]     ; Zero orig_client_port + pad
+      [(asm/jmp :conntrack_map_update)]
 
-      ;; orig_client_ip (16 bytes at -208 to -193)
-      [(dsl/stx :dw :r10 :r0 -208)
-       (dsl/stx :dw :r10 :r0 -200)]     ; Zero 16 bytes
+      ;; PROXY enabled: set fields
+      [(asm/label :set_proxy_fields)]
+      ;; conn_state = 0 (NEW), proxy_flags = 0x01 (ENABLED), pad = 0, seq_offset = 0
+      ;; Build 8-byte value: 0x01 at byte 1 (proxy_flags), rest zero
+      [(dsl/mov :r0 0x0100)             ; Little-endian: 0x00, 0x01 (conn_state=0, proxy_flags=1)
+       (dsl/stx :w :r10 :r0 -216)       ; Store conn_state + proxy_flags + pad
+       (dsl/mov :r0 0)
+       (dsl/stx :w :r10 :r0 -212)]      ; Store seq_offset = 0
 
-      ;; orig_client_port(2) + pad(6) = 8 bytes at -192
-      [(dsl/stx :dw :r10 :r0 -192)]     ; Zero last 8 bytes
+      ;; Copy original client IP from stack[-84] to orig_client_ip at stack[-208]
+      [(dsl/ldx :dw :r0 :r10 -84)
+       (dsl/stx :dw :r10 :r0 -208)
+       (dsl/ldx :dw :r0 :r10 -76)
+       (dsl/stx :dw :r10 :r0 -200)]
+
+      ;; Copy original client port from stack[-102] to orig_client_port at stack[-192]
+      [(dsl/ldx :h :r0 :r10 -102)       ; Load src_port (2 bytes)
+       (dsl/stx :h :r10 :r0 -192)       ; Store orig_client_port
+       (dsl/mov :r0 0)
+       (dsl/stx :h :r10 :r0 -190)       ; Zero pad (2 bytes)
+       (dsl/stx :w :r10 :r0 -188)]      ; Zero remaining pad (4 bytes)
+
+      [(asm/label :conntrack_map_update)]
 
       ;; Update conntrack map
       (if conntrack-map-fd
