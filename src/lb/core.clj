@@ -6,6 +6,7 @@
             [lb.maps :as maps]
             [lb.programs.xdp-ingress :as xdp]
             [lb.programs.tc-egress :as tc]
+            [lb.programs.tc-ingress :as tc-ingress]
             [lb.conntrack :as conntrack]
             [lb.stats :as stats]
             [lb.health :as health]
@@ -114,28 +115,33 @@
       (log/info "Loading XDP ingress program")
       (let [xdp-prog-fd (xdp/load-program ebpf-maps)]
 
-        ;; Load TC program
+        ;; Load TC egress program
         (log/info "Loading TC egress program")
         (let [tc-prog-fd (tc/load-program ebpf-maps)]
 
-          ;; Apply initial configuration
-          (log/info "Applying configuration")
-          (apply-config! ebpf-maps config)
+          ;; Load TC ingress program (for PROXY protocol header injection)
+          (log/info "Loading TC ingress program (PROXY protocol)")
+          (let [tc-ingress-prog-fd (tc-ingress/load-program ebpf-maps)]
 
-          ;; Set up cleanup daemon
-          (log/info "Starting cleanup daemon")
-          (let [cleanup-daemon (conntrack/start-cleanup-daemon
-                                 (:conntrack-map ebpf-maps)
-                                 (:settings-map ebpf-maps))]
+            ;; Apply initial configuration
+            (log/info "Applying configuration")
+            (apply-config! ebpf-maps config)
 
-            ;; Store state
-            (let [state {:config config
-                         :maps ebpf-maps
-                         :xdp-prog-fd xdp-prog-fd
-                         :tc-prog-fd tc-prog-fd
-                         :cleanup-daemon cleanup-daemon
-                         :attached-interfaces (atom #{})
-                         :stats-stream (atom nil)}]
+            ;; Set up cleanup daemon
+            (log/info "Starting cleanup daemon")
+            (let [cleanup-daemon (conntrack/start-cleanup-daemon
+                                   (:conntrack-map ebpf-maps)
+                                   (:settings-map ebpf-maps))]
+
+              ;; Store state
+              (let [state {:config config
+                           :maps ebpf-maps
+                           :xdp-prog-fd xdp-prog-fd
+                           :tc-prog-fd tc-prog-fd
+                           :tc-ingress-prog-fd tc-ingress-prog-fd
+                           :cleanup-daemon cleanup-daemon
+                           :attached-interfaces (atom #{})
+                           :stats-stream (atom nil)}]
               (set-state! state)
 
               ;; Attach to interfaces
@@ -215,7 +221,7 @@
                 (admin/start! (get-in config [:settings :admin-api])))
 
               (log/info "Load balancer initialized successfully")
-              state))))
+              state)))))
 
       (catch Exception e
         ;; Clean up on error
@@ -349,7 +355,7 @@
   "Attach proxy programs to network interfaces."
   [interfaces]
   (with-lb-state [state]
-    (let [{:keys [xdp-prog-fd tc-prog-fd attached-interfaces]} state]
+    (let [{:keys [xdp-prog-fd tc-prog-fd tc-ingress-prog-fd attached-interfaces]} state]
       (doseq [iface interfaces]
         (when-not (contains? @attached-interfaces iface)
           (log/info "Attaching to interface:" iface)
@@ -362,6 +368,10 @@
 
           ;; Attach TC egress program
           (tc/attach-to-interface tc-prog-fd iface)
+
+          ;; Attach TC ingress program (for PROXY protocol header injection)
+          (when tc-ingress-prog-fd
+            (tc-ingress/attach-to-interface tc-ingress-prog-fd iface))
 
           ;; Track attachment
           (swap! attached-interfaces conj iface))))))
@@ -378,8 +388,11 @@
           ;; Detach XDP
           (xdp/detach-from-interface iface)
 
-          ;; Detach TC
+          ;; Detach TC egress
           (tc/detach-from-interface iface)
+
+          ;; Detach TC ingress (PROXY protocol)
+          (tc-ingress/detach-from-interface iface)
 
           ;; Tear down TC qdisc
           (tc/teardown-tc-qdisc iface)

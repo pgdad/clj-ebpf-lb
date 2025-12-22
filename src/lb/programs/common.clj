@@ -77,6 +77,11 @@
 (def FNV1A-64-PRIME-LO 0x000001B3)        ; Lower 32 bits of 0x00000100000001B3
 (def FNV1A-64-PRIME-HI 0x00000100)        ; Upper 32 bits
 
+;; SKB (sk_buff) structure offsets for TC programs
+(def SKB-OFF-LEN 0)                        ; __u32 len at offset 0
+(def SKB-OFF-DATA 76)                      ; __u32 data at offset 76
+(def SKB-OFF-DATA-END 80)                  ; __u32 data_end at offset 80
+
 ;; BPF helper function IDs
 (def BPF-FUNC-map-lookup-elem 1)
 (def BPF-FUNC-map-update-elem 2)

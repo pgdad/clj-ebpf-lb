@@ -743,10 +743,13 @@
       ;; =====================================================================
       [(asm/label :do_snat_unified)]
 
-      ;; r9 = pointer to unified conntrack value (96 bytes)
+      ;; r9 = pointer to unified conntrack value (128 bytes)
       ;; Layout: orig_dst_ip(16) + orig_dst_port(2) + pad(2) +
       ;;         nat_dst_ip(16) + nat_dst_port(2) + pad(2) +
-      ;;         timestamps and counters
+      ;;         timestamps and counters ...
+      ;;         PROXY protocol fields at offset 96:
+      ;;           conn_state(1) + proxy_flags(1) + pad(2) +
+      ;;           seq_offset(4) + orig_client_ip(16) + orig_client_port(2) + pad(6)
 
       ;; Update last_seen_ns (at offset 40 in unified format)
       [(dsl/call BPF-FUNC-ktime-get-ns)
@@ -776,6 +779,12 @@
       ;; Load new_src_port (at offset 16)
       [(dsl/ldx :h :r0 :r9 16)
        (dsl/stx :h :r10 :r0 -88)]
+
+      ;; Load seq_offset from conntrack (offset 100) for PROXY protocol ACK adjustment
+      ;; If PROXY header was injected, seq_offset will be non-zero (28 for IPv4, 52 for IPv6)
+      ;; We need to subtract this from the ACK number in reply packets
+      [(dsl/ldx :w :r0 :r9 100)          ; seq_offset at conntrack offset 100
+       (dsl/stx :w :r10 :r0 -92)]        ; Save to stack[-92]
 
       ;; Branch by address family for SNAT
       [(dsl/ldx :b :r0 :r10 -62)
@@ -839,6 +848,39 @@
        (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
        (dsl/ldx :h :r1 :r10 -88)
        (dsl/stx :h :r0 :r1 0)]           ; tcp->sport
+
+      ;; Check if PROXY header was injected (seq_offset != 0)
+      ;; If so, adjust ACK number: tcp->ack_seq -= seq_offset
+      [(dsl/ldx :w :r1 :r10 -92)         ; Load seq_offset from stack
+       (asm/jmp-imm :jeq :r1 0 :done_unified)] ; Skip if zero
+
+      ;; ACK adjustment for PROXY protocol (IPv4)
+      ;; Need to reload data pointer and check bounds
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 12)) ; Need access to ack_seq
+       (asm/jmp-reg :jgt :r0 :r8 :done_unified)]
+
+      ;; Get TCP header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))]
+
+      ;; Load current ACK, subtract seq_offset, store back
+      [(dsl/ldx :w :r2 :r0 8)            ; r2 = old ack_seq (at TCP offset 8)
+       (dsl/mov-reg :r3 :r2)             ; Save old for checksum
+       (dsl/end-to-be :r2 32)            ; Network to host byte order
+       (dsl/ldx :w :r1 :r10 -92)         ; Reload seq_offset
+       (dsl/sub-reg :r2 :r1)             ; Subtract seq_offset
+       (dsl/end-to-be :r2 32)            ; Host to network byte order
+       (dsl/stx :w :r0 :r2 8)]           ; Store new ack_seq
+
+      ;; Update TCP checksum for ACK change
+      [(dsl/mov-reg :r1 :r6)             ; r1 = skb
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 16)) ; TCP checksum offset
+                                          ; r3 = old ack (already set above)
+       (dsl/ldx :w :r4 :r0 8)            ; r4 = new ack
+       (dsl/mov :r5 4)                   ; sizeof(u32)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
 
       [(asm/jmp :done_unified)]
 
@@ -982,6 +1024,39 @@
        (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
        (dsl/ldx :h :r1 :r10 -88)
        (dsl/stx :h :r0 :r1 0)]
+
+      ;; Check if PROXY header was injected (seq_offset != 0)
+      ;; If so, adjust ACK number: tcp->ack_seq -= seq_offset
+      [(dsl/ldx :w :r1 :r10 -92)         ; Load seq_offset from stack
+       (asm/jmp-imm :jeq :r1 0 :done_unified)] ; Skip if zero
+
+      ;; ACK adjustment for PROXY protocol (IPv6)
+      ;; Need to reload data pointer and check bounds
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN 12)) ; Need access to ack_seq
+       (asm/jmp-reg :jgt :r0 :r8 :done_unified)]
+
+      ;; Get TCP header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))]
+
+      ;; Load current ACK, subtract seq_offset, store back
+      [(dsl/ldx :w :r2 :r0 8)            ; r2 = old ack_seq (at TCP offset 8)
+       (dsl/mov-reg :r3 :r2)             ; Save old for checksum
+       (dsl/end-to-be :r2 32)            ; Network to host byte order
+       (dsl/ldx :w :r1 :r10 -92)         ; Reload seq_offset
+       (dsl/sub-reg :r2 :r1)             ; Subtract seq_offset
+       (dsl/end-to-be :r2 32)            ; Host to network byte order
+       (dsl/stx :w :r0 :r2 8)]           ; Store new ack_seq
+
+      ;; Update TCP checksum for ACK change
+      [(dsl/mov-reg :r1 :r6)             ; r1 = skb
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 16)) ; TCP checksum offset
+                                          ; r3 = old ack (already set above)
+       (dsl/ldx :w :r4 :r0 8)            ; r4 = new ack
+       (dsl/mov :r5 4)                   ; sizeof(u32)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
 
       [(asm/jmp :done_unified)]
 
