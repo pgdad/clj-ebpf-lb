@@ -64,6 +64,10 @@
 ;;         IPv6 addresses: src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2)
 ;; -208  : chunk_buffer (64 bytes) - temp buffer for payload shifting
 ;; -212  : temp_len (4 bytes) - saved length for bpf_skb_store_bytes
+;; -216  : original_pkt_len (4 bytes) - skb->len before extending
+;; -220  : seq_offset (4 bytes) - saved seq offset for adjust_seq
+;; -228  : seq_value (4 bytes) - buffer for seq number load/store
+;; -232  : old_seq (4 bytes) - old seq value for checksum update
 
 ;;; =============================================================================
 ;;; BPF Helper Function Numbers
@@ -491,27 +495,50 @@
         [(dsl/ldx :w :r1 :r9 CT-OFF-SEQ-OFFSET)
          (asm/jmp-imm :jeq :r1 0 :pass)]    ; No adjustment needed
 
-        ;; Reload data pointers
-        (tc-reload-data-ptrs)
+        ;; Use bpf_skb_load_bytes/store_bytes to avoid direct packet access issues
+        ;; r1 holds seq_offset from conntrack
 
-        ;; Get TCP header pointer
+        ;; Save seq_offset to stack (r1 will be clobbered by helper)
+        [(dsl/stx :w :r10 :r1 -220)]        ; Save seq_offset
+
+        ;; Calculate seq field offset in packet: L4_offset + 4
         [(dsl/ldx :w :r2 :r10 -48)          ; L4 offset
-         (dsl/mov-reg :r0 :r7)
-         (dsl/add-reg :r0 :r2)]
+         (dsl/add :r2 4)]                   ; seq field at TCP header + 4
 
-        ;; Bounds check for TCP seq field
-        [(dsl/mov-reg :r3 :r0)
-         (dsl/add :r3 8)                    ; Need access to seq (offset 4, 4 bytes)
-         (asm/jmp-reg :jgt :r3 :r8 :pass)]
+        ;; Load seq number using bpf_skb_load_bytes(skb, offset, to, len)
+        [(dsl/mov-reg :r1 :r6)              ; r1 = skb
+                                            ; r2 = offset (L4 + 4)
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -228)                 ; r3 = &stack_buf for seq (4 bytes)
+         (dsl/mov :r4 4)                    ; r4 = len
+         (dsl/call BPF-FUNC-skb-load-bytes)]
 
-        ;; Load current seq, add offset, store back
-        [(dsl/ldx :w :r2 :r0 4)             ; r2 = old seq
-         (dsl/mov-reg :r3 :r2)              ; Save old for checksum
-         ;; Convert to host order, add, convert back
+        ;; Check if load succeeded
+        [(asm/jmp-imm :jne :r0 0 :pass)]
+
+        ;; Load old seq from stack, save for checksum
+        [(dsl/ldx :w :r2 :r10 -228)         ; r2 = old seq (network order)
+         (dsl/stx :w :r10 :r2 -232)]        ; Save old seq to stack for later checksum use
+
+        ;; Add seq_offset: convert to host, add, convert back
+        [(dsl/ldx :w :r1 :r10 -220)         ; r1 = seq_offset
          (dsl/end-to-be :r2 32)             ; Network to host
-         (dsl/add-reg :r2 :r1)              ; Add offset
-         (dsl/end-to-be :r2 32)             ; Host to network
-         (dsl/stx :w :r0 :r2 4)]            ; Store new seq
+         (dsl/add-reg :r2 :r1)              ; r2 = old_seq + seq_offset
+         (dsl/end-to-be :r2 32)]            ; Host to network
+
+        ;; Store new seq to stack
+        [(dsl/stx :w :r10 :r2 -228)]
+
+        ;; Write new seq using bpf_skb_store_bytes
+        [(dsl/ldx :w :r2 :r10 -48)          ; L4 offset
+         (dsl/add :r2 4)                    ; seq field offset
+         (dsl/mov-reg :r1 :r6)              ; r1 = skb
+                                            ; r2 = offset
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -228)                 ; r3 = &new_seq on stack
+         (dsl/mov :r4 4)                    ; r4 = len
+         (dsl/mov :r5 0)                    ; flags = 0
+         (dsl/call BPF-FUNC-skb-store-bytes)]
 
         ;; Update TCP checksum using l4_csum_replace
         ;; bpf_l4_csum_replace(skb, csum_offset, old, new, flags)
@@ -519,9 +546,8 @@
          (dsl/add :r2 16)                   ; TCP checksum at offset 16
          (dsl/mov-reg :r1 :r6)              ; r1 = skb
                                             ; r2 = csum offset (already set)
-                                            ; r3 = old seq (already set)
-                                            ; r4 = new seq
-         (dsl/ldx :w :r4 :r0 4)             ; Load the new seq we just wrote
+         (dsl/ldx :w :r3 :r10 -232)         ; r3 = old seq (saved earlier)
+         (dsl/ldx :w :r4 :r10 -228)         ; r4 = new seq from stack
          (dsl/mov :r5 4)                    ; sizeof(u32)
          (dsl/call BPF-FUNC-l4-csum-replace)]
 
@@ -559,9 +585,12 @@
         ;; int bpf_skb_change_tail(skb, new_len, flags)
         [(asm/label :extend_packet)]
 
-        ;; Get current packet length from skb->len
+        ;; Save current packet length BEFORE extending (for payload_len calculation)
         [(dsl/ldx :w :r2 :r6 common/SKB-OFF-LEN) ; Current length
-         (dsl/ldx :w :r1 :r10 -72)          ; Header size to add
+         (dsl/stx :w :r10 :r2 -216)]        ; Save original_pkt_len
+
+        ;; Calculate new length and call bpf_skb_change_tail
+        [(dsl/ldx :w :r1 :r10 -72)          ; Header size to add
          (dsl/add-reg :r2 :r1)              ; New length = old + header_size
          (dsl/mov-reg :r1 :r6)              ; r1 = skb
                                             ; r2 = new_len (already set)
@@ -587,18 +616,14 @@
         ;; 2. Copy chunks from END to START (backwards) to avoid overwriting
         ;; 3. Use bounded iterations for BPF verifier
         ;;
-        ;; payload_len = old_data_end - (data + payload_offset)
-        ;;             = (new_data_end - header_size) - (data + payload_offset)
+        ;; payload_len = original_pkt_len - payload_offset
+        ;; (We saved original_pkt_len at -216 before extending)
 
-        ;; Calculate payload length
-        ;; r7 = data, r8 = data_end (new, after extend)
-        [(dsl/ldx :w :r1 :r10 -72)          ; header_size
-         (dsl/mov-reg :r2 :r8)              ; r2 = new data_end
-         (dsl/sub-reg :r2 :r1)              ; r2 = old data_end (new_data_end - header_size)
-         (dsl/ldx :w :r3 :r10 -56)          ; payload_offset
-         (dsl/mov-reg :r4 :r7)
-         (dsl/add-reg :r4 :r3)              ; r4 = data + payload_offset = payload_start
-         (dsl/sub-reg :r2 :r4)              ; r2 = payload_len = old_data_end - payload_start
+        ;; Calculate payload length using saved original packet length
+        ;; This avoids doing arithmetic on pkt_end pointer which is prohibited
+        [(dsl/ldx :w :r2 :r10 -216)         ; r2 = original_pkt_len (saved before extend)
+         (dsl/ldx :w :r3 :r10 -56)          ; r3 = payload_offset
+         (dsl/sub-reg :r2 :r3)              ; r2 = payload_len = original_len - payload_offset
          (dsl/stx :w :r10 :r2 -76)]         ; Save payload_len
 
         ;; If payload is zero or negative, skip shifting
@@ -610,20 +635,27 @@
         [(dsl/mov-reg :r0 :r2)              ; r0 = payload_len
          (dsl/add :r0 (dec SHIFT-CHUNK-SIZE)) ; r0 = payload_len + 63
          (dsl/rsh :r0 6)                    ; r0 = num_chunks (divide by 64)
-         (dsl/sub :r0 1)                    ; r0 = last chunk index
-         (dsl/stx :w :r10 :r0 -80)]         ; Save current_chunk
+         (dsl/sub :r0 1)]                   ; r0 = last chunk index
+
+        ;; Clamp the initial chunk index to ensure verifier knows the bound
+        ;; If r0 >= SHIFT_MAX_CHUNKS, skip shifting (payload too large)
+        [(asm/jmp-imm :jslt :r0 0 :build_proxy_header)]  ; Skip if negative
+        [(asm/jmp-imm :jge :r0 SHIFT-MAX-CHUNKS :build_proxy_header)]  ; Skip if too many chunks
+
+        ;; Now r0 is bounded [0, SHIFT_MAX_CHUNKS-1]
+        [(dsl/stx :w :r10 :r0 -80)]         ; Save current_chunk
 
         ;; Bounded loop for shifting - unroll for BPF verifier
         ;; Each iteration: copy one 64-byte chunk from (payload_offset + chunk*64)
         ;; to (payload_offset + header_size + chunk*64)
         ;;
-        ;; We use a jump-based bounded iteration pattern
+        ;; The verifier knows current_chunk is in [0, SHIFT_MAX_CHUNKS-1] at entry
 
-        [(asm/jmp :shift_loop_entry)]
+        [(asm/jmp :shift_loop_body)]
 
         [(asm/label :shift_chunk)]
-        ;; Load current chunk index
-        [(dsl/ldx :w :r1 :r10 -80)]         ; current_chunk
+        ;; r1 = current_chunk (already loaded and bounds-checked in shift_loop_body)
+        ;; r1 is guaranteed to be in [0, SHIFT_MAX_CHUNKS-1]
 
         ;; Calculate source offset: payload_offset + (chunk_index * 64)
         [(dsl/ldx :w :r2 :r10 -56)          ; payload_offset
@@ -675,29 +707,35 @@
 
         ;; Store bytes to destination using bpf_skb_store_bytes
         ;; int bpf_skb_store_bytes(skb, offset, from, len, flags)
+        ;; Reload len from stack and re-check bounds (verifier loses track after helper)
+        [(dsl/ldx :w :r4 :r10 -212)         ; r4 = len (saved earlier)
+         (asm/jmp-imm :jle :r4 0 :shift_next) ; Skip if len <= 0
+         (asm/jmp-imm :jgt :r4 SHIFT-CHUNK-SIZE :shift_next)] ; Skip if len > 64
+
         [(dsl/mov-reg :r1 :r6)              ; r1 = skb
                                              ; r2 = dst_offset (already set)
          (dsl/mov-reg :r3 :r10)
          (dsl/add :r3 -208)                 ; r3 = &chunk_buffer
-         (dsl/ldx :w :r4 :r10 -212)         ; r4 = len (saved earlier)
+                                             ; r4 = len (already loaded and checked)
          (dsl/mov :r5 0)                    ; flags = 0 (no recompute csum for data)
          (dsl/call BPF-FUNC-skb-store-bytes)]
 
         [(asm/label :shift_next)]
-        ;; Decrement chunk counter and check if done
-        [(dsl/ldx :w :r0 :r10 -80)
-         (dsl/sub :r0 1)
-         (dsl/stx :w :r10 :r0 -80)]
+        ;; Decrement chunk counter in-place and check before storing
+        [(dsl/ldx :w :r0 :r10 -80)          ; Load current_chunk
+         (dsl/sub :r0 1)]                   ; Decrement
+        ;; If r0 < 0 (signed), we're done
+        [(asm/jmp-imm :jslt :r0 0 :build_proxy_header)]
+        ;; Store and continue
+        [(dsl/stx :w :r10 :r0 -80)]
+        ;; Fall through to shift_loop_body
 
-        [(asm/label :shift_loop_entry)]
-        ;; Check bounds: current_chunk must be >= 0
-        [(dsl/ldx :w :r0 :r10 -80)
-         (asm/jmp-imm :jsge :r0 0 :shift_bound_check)]
-        [(asm/jmp :build_proxy_header)]
-
-        [(asm/label :shift_bound_check)]
-        ;; Bound check: don't do more than SHIFT_MAX_CHUNKS iterations
-        [(asm/jmp-imm :jge :r0 SHIFT-MAX-CHUNKS :build_proxy_header)]
+        [(asm/label :shift_loop_body)]
+        ;; Re-validate bounds after loading from stack (verifier requirement)
+        [(dsl/ldx :w :r1 :r10 -80)          ; Load current_chunk into r1
+         (asm/jmp-imm :jslt :r1 0 :build_proxy_header)          ; Exit if < 0
+         (asm/jmp-imm :jge :r1 SHIFT-MAX-CHUNKS :build_proxy_header)]  ; Exit if >= MAX
+        ;; r1 is now bounded [0, SHIFT_MAX_CHUNKS-1], continue to shift_chunk
         [(asm/jmp :shift_chunk)]
 
         ;; =====================================================================

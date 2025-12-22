@@ -366,8 +366,8 @@
                              [{:ip "10.0.0.1" :port 8080 :weight 100 :proxy-protocol :v2}])
               flags util/FLAG-PROXY-PROTOCOL-V2]
 
-          ;; Add to listen map with PROXY flag
-          (maps/add-listen-port listen-map ifindex port target-group flags)
+          ;; Add to listen map with PROXY flag using weighted function
+          (maps/add-listen-port-weighted listen-map ifindex port target-group :flags flags)
 
           ;; Verify the entry
           (let [entries (maps/list-listen-ports listen-map)]
@@ -393,7 +393,7 @@
             ;; Add listen port with PROXY protocol flag
             (maps/add-listen-port listen-map ifindex 80
               {:ip (util/ip-string->u32 "10.200.2.2") :port 9999}
-              util/FLAG-PROXY-PROTOCOL-V2)
+              :flags util/FLAG-PROXY-PROTOCOL-V2)
 
             ;; Build all three programs
             (let [xdp-bytecode (xdp/build-xdp-ingress-program
@@ -464,10 +464,8 @@
   (when-root
     (testing "Conntrack entries with PROXY fields work in real BPF maps"
       (with-bpf-maps [conntrack-map (maps/create-conntrack-map-unified {:max-connections 100})]
-        (let [key {:src-ip (util/ip-string->u32 "192.168.1.100")
-                   :src-ip-v6 (util/ip-string->bytes16 "192.168.1.100")
-                   :dst-ip (util/ip-string->u32 "10.0.0.1")
-                   :dst-ip-v6 (util/ip-string->bytes16 "10.0.0.1")
+        (let [key {:src-ip (util/ip-string->bytes16 "192.168.1.100")
+                   :dst-ip (util/ip-string->bytes16 "10.0.0.1")
                    :src-port 54321
                    :dst-port 80
                    :protocol 6}

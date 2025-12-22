@@ -443,7 +443,7 @@
                      :target {:ip "127.0.0.1" :port 9002 :proxy-protocol :v2}}]}]}
             parsed (config/parse-config cfg)
             source-route (first (:source-routes (first (:proxies parsed))))
-            target (get-in source-route [:target :targets 0])]
+            target (get-in source-route [:target-group :targets 0])]
         (is parsed)
         (is (= :v2 (:proxy-protocol target)))))))
 

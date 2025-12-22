@@ -713,11 +713,12 @@
       ;; Multiple targets: weighted selection based on flags
       ;; Check flags for session persistence (offset 4 in header, 2 bytes native order)
       ;; r9 = map value pointer
-      [(dsl/ldx :h :r6 :r9 4)           ; r6 = flags
-       (dsl/stx :h :r10 :r6 -124)]      ; Store flags at stack[-124] for PROXY protocol
+      ;; Use r0 to avoid clobbering r6 (which holds ctx in some code paths)
+      [(dsl/ldx :h :r0 :r9 4)           ; r0 = flags
+       (dsl/stx :h :r10 :r0 -124)]      ; Store flags at stack[-124] for PROXY protocol
 
       ;; If session-persistence flag (bit 0) set, use source IP hash; else use random
-      [(asm/jmp-imm :jset :r6 1 :use_ip_hash)]  ; if flags & 0x01 goto use_ip_hash
+      [(asm/jmp-imm :jset :r0 1 :use_ip_hash)]  ; if flags & 0x01 goto use_ip_hash
 
       ;; Default: use random selection
       [(dsl/call common/BPF-FUNC-get-prandom-u32)]
@@ -1333,8 +1334,9 @@
       [(asm/jmp-imm :jeq :r0 1 :single_target_unified)]
 
       ;; Store flags for PROXY protocol (at offset 4, 2 bytes)
-      [(dsl/ldx :h :r6 :r9 4)           ; r6 = flags
-       (dsl/stx :h :r10 :r6 -124)]      ; Store flags at stack[-124]
+      ;; Use r0 before it gets clobbered by prandom call
+      [(dsl/ldx :h :r0 :r9 4)           ; r0 = flags
+       (dsl/stx :h :r10 :r0 -124)]      ; Store flags at stack[-124]
 
       ;; Multiple targets: use random selection (simplified for now)
       [(dsl/call common/BPF-FUNC-get-prandom-u32)]
