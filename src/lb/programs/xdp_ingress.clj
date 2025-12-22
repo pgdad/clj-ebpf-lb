@@ -82,7 +82,8 @@
 ;; -136 : additional scratch (8 bytes)
 ;; -144 : SNI key for map lookup (8 bytes: hostname_hash)
 ;; -184 : Conntrack key (40 bytes: src_ip(16) + dst_ip(16) + ports(4) + proto(1) + pad(3))
-;; -280 : Conntrack value (96 bytes): see unified conntrack format in maps.clj
+;; -312 : Conntrack value (128 bytes): see unified conntrack format in util.clj
+;;        Includes PROXY protocol fields at offset 96
 
 ;;; =============================================================================
 ;;; Simple Pass-Through XDP Program
@@ -1778,61 +1779,75 @@
        (dsl/stx :b :r10 :r0 -147)       ; pad[0]
        (dsl/stx :h :r10 :r0 -146)]      ; pad[1-2]
 
-      ;; Build conntrack value at stack[-280] (96 bytes)
+      ;; Build conntrack value at stack[-312] (128 bytes)
       ;; Layout: orig_dst_ip(16) + orig_dst_port(2) + pad(2) +
       ;;         nat_dst_ip(16) + nat_dst_port(2) + pad(2) +
       ;;         created_ns(8) + last_seen_ns(8) +
-      ;;         packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8)
+      ;;         packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8) +
+      ;;         conn_state(1) + proxy_flags(1) + pad(2) + seq_offset(4) +
+      ;;         orig_client_ip(16) + orig_client_port(2) + pad(6)
 
       ;; Copy orig_dst_ip (old_dst_ip from stack[-44..-29])
       [(dsl/ldx :w :r0 :r10 -44)
-       (dsl/stx :w :r10 :r0 -280)
+       (dsl/stx :w :r10 :r0 -312)
        (dsl/ldx :w :r0 :r10 -40)
-       (dsl/stx :w :r10 :r0 -276)
+       (dsl/stx :w :r10 :r0 -308)
        (dsl/ldx :w :r0 :r10 -36)
-       (dsl/stx :w :r10 :r0 -272)
+       (dsl/stx :w :r10 :r0 -304)
        (dsl/ldx :w :r0 :r10 -32)
-       (dsl/stx :w :r10 :r0 -268)]
+       (dsl/stx :w :r10 :r0 -300)]
 
       ;; orig_dst_port and pad
       [(dsl/ldx :h :r0 :r10 -48)        ; old_dst_port
-       (dsl/stx :h :r10 :r0 -264)
+       (dsl/stx :h :r10 :r0 -296)
        (dsl/mov :r0 0)
-       (dsl/stx :h :r10 :r0 -262)]      ; pad
+       (dsl/stx :h :r10 :r0 -294)]      ; pad
 
       ;; Copy nat_dst_ip
       [(dsl/ldx :w :r0 :r10 -64)
-       (dsl/stx :w :r10 :r0 -260)
+       (dsl/stx :w :r10 :r0 -292)
        (dsl/ldx :w :r0 :r10 -60)
-       (dsl/stx :w :r10 :r0 -256)
+       (dsl/stx :w :r10 :r0 -288)
        (dsl/ldx :w :r0 :r10 -56)
-       (dsl/stx :w :r10 :r0 -252)
+       (dsl/stx :w :r10 :r0 -284)
        (dsl/ldx :w :r0 :r10 -52)
-       (dsl/stx :w :r10 :r0 -248)]
+       (dsl/stx :w :r10 :r0 -280)]
 
       ;; nat_dst_port and pad
       [(dsl/ldx :h :r0 :r10 -68)
-       (dsl/stx :h :r10 :r0 -244)
+       (dsl/stx :h :r10 :r0 -276)
        (dsl/mov :r0 0)
-       (dsl/stx :h :r10 :r0 -242)]
+       (dsl/stx :h :r10 :r0 -274)]
 
       ;; Get timestamp
       [(dsl/call BPF-FUNC-ktime-get-ns)
-       (dsl/stx :dw :r10 :r0 -240)      ; created_ns
-       (dsl/stx :dw :r10 :r0 -232)]     ; last_seen_ns
+       (dsl/stx :dw :r10 :r0 -272)      ; created_ns
+       (dsl/stx :dw :r10 :r0 -264)]     ; last_seen_ns
 
       ;; Initialize counters
       [(dsl/mov :r0 1)
-       (dsl/stx :dw :r10 :r0 -224)      ; packets_fwd = 1
+       (dsl/stx :dw :r10 :r0 -256)      ; packets_fwd = 1
        (dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -216)]     ; packets_rev = 0
+       (dsl/stx :dw :r10 :r0 -248)]     ; packets_rev = 0
 
       ;; Calculate packet length
       [(dsl/mov-reg :r0 :r8)
        (dsl/sub-reg :r0 :r7)
-       (dsl/stx :dw :r10 :r0 -208)      ; bytes_fwd
+       (dsl/stx :dw :r10 :r0 -240)      ; bytes_fwd
        (dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -200)]     ; bytes_rev = 0
+       (dsl/stx :dw :r10 :r0 -232)]     ; bytes_rev = 0
+
+      ;; Initialize PROXY protocol fields at offset 96 from base (-312 + 96 = -216)
+      ;; conn_state(1) + proxy_flags(1) + pad(2) + seq_offset(4) = 8 bytes at -216
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -216)]     ; Zero first 8 bytes of PROXY fields
+
+      ;; orig_client_ip (16 bytes at -208 to -193)
+      [(dsl/stx :dw :r10 :r0 -208)
+       (dsl/stx :dw :r10 :r0 -200)]     ; Zero 16 bytes
+
+      ;; orig_client_port(2) + pad(6) = 8 bytes at -192
+      [(dsl/stx :dw :r10 :r0 -192)]     ; Zero last 8 bytes
 
       ;; Update conntrack map
       (if conntrack-map-fd
@@ -1840,7 +1855,7 @@
          (dsl/mov-reg :r2 :r10)
          (dsl/add :r2 -184)             ; &key
          (dsl/mov-reg :r3 :r10)
-         (dsl/add :r3 -280)             ; &value
+         (dsl/add :r3 -312)             ; &value
          (dsl/mov :r4 0)                ; BPF_ANY
          (dsl/call 2)]                  ; bpf_map_update_elem
         [])

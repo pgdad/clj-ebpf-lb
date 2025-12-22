@@ -80,14 +80,15 @@
 (defn- build-target-group
   "Build a TargetGroup from resolved IPs."
   [dns-target resolved-ips]
-  (let [{:keys [port weight health-check]} dns-target
+  (let [{:keys [port weight health-check proxy-protocol]} dns-target
         target-maps (resolver/expand-to-weighted-targets
                       resolved-ips port weight health-check)
         ;; Convert to WeightedTarget records
         targets (mapv (fn [{:keys [ip port weight health-check]}]
                         (config/->WeightedTarget ip port weight
                           (when health-check
-                            (config/parse-health-check-config health-check nil))))
+                            (config/parse-health-check-config health-check nil))
+                          proxy-protocol))
                       target-maps)
         cumulative (config/compute-cumulative-weights targets)]
     (config/->TargetGroup targets cumulative)))

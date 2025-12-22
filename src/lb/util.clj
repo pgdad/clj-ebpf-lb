@@ -434,9 +434,30 @@
 ;; (src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2) + protocol(1) + pad(3))
 (def ^:const CONNTRACK-KEY-UNIFIED-SIZE 40)
 
-;; Unified conntrack value: 96 bytes
-;; (orig_dst_ip(16) + orig_dst_port(2) + pad(2) + nat_dst_ip(16) + nat_dst_port(2) + pad(2) + counters(56))
-(def ^:const CONNTRACK-VALUE-UNIFIED-SIZE 96)
+;; Unified conntrack value: 128 bytes
+;; Existing fields (96 bytes):
+;;   orig_dst_ip(16) + orig_dst_port(2) + pad(2) + nat_dst_ip(16) + nat_dst_port(2) + pad(2) + counters(56)
+;; PROXY protocol fields (32 bytes at offset 96):
+;;   conn_state(1) + proxy_flags(1) + pad(2) + seq_offset(4) + orig_client_ip(16) + orig_client_port(2) + pad(6)
+(def ^:const CONNTRACK-VALUE-UNIFIED-SIZE 128)
+
+;; PROXY protocol field offsets within conntrack value
+(def ^:const CONNTRACK-PROXY-OFFSET 96)       ; Start of PROXY fields
+(def ^:const CONNTRACK-CONN-STATE-OFFSET 96)  ; TCP connection state
+(def ^:const CONNTRACK-PROXY-FLAGS-OFFSET 97) ; PROXY protocol flags
+(def ^:const CONNTRACK-SEQ-OFFSET-OFFSET 100) ; Sequence number adjustment
+(def ^:const CONNTRACK-ORIG-CLIENT-IP-OFFSET 104)   ; Original client IP (16 bytes)
+(def ^:const CONNTRACK-ORIG-CLIENT-PORT-OFFSET 120) ; Original client port (2 bytes)
+
+;; TCP connection states for PROXY protocol injection
+(def ^:const CONN-STATE-NEW 0)
+(def ^:const CONN-STATE-SYN-SENT 1)
+(def ^:const CONN-STATE-SYN-RECV 2)
+(def ^:const CONN-STATE-ESTABLISHED 3)
+
+;; PROXY protocol flags (bit positions)
+(def ^:const PROXY-FLAG-ENABLED 0x01)        ; PROXY protocol enabled for this connection
+(def ^:const PROXY-FLAG-HEADER-INJECTED 0x02) ; PROXY header already injected
 
 ;; Unified weighted route target: 20 bytes (ip(16) + port(2) + weight(2))
 (def ^:const WEIGHTED-ROUTE-TARGET-UNIFIED-SIZE 20)
@@ -447,6 +468,7 @@
 
 ;; Route flags (stored in header bytes 4-5)
 (def ^:const FLAG-SESSION-PERSISTENCE 0x0001)
+(def ^:const FLAG-PROXY-PROTOCOL-V2 0x0004)
 
 (defn encode-weighted-route-value
   "Encode weighted route value for BPF map.
@@ -632,12 +654,17 @@
 
 (defn encode-conntrack-value-unified
   "Encode unified connection tracking value.
-   {orig_dst_ip (16) + orig_dst_port (2) + padding (2) + nat_dst_ip (16) + nat_dst_port (2) + padding (2) +
-    created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
-   Total: 96 bytes.
+   Existing fields (96 bytes):
+     orig_dst_ip (16) + orig_dst_port (2) + padding (2) + nat_dst_ip (16) + nat_dst_port (2) + padding (2) +
+     created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)
+   PROXY protocol fields (32 bytes):
+     conn_state (1) + proxy_flags (1) + pad (2) + seq_offset (4) +
+     orig_client_ip (16) + orig_client_port (2) + pad (6)
+   Total: 128 bytes.
    IPs in network byte order, counters in native order."
   [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
-           created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev]}]
+           created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev
+           conn-state proxy-flags seq-offset orig-client-ip orig-client-port]}]
   (let [buf (ByteBuffer/allocate CONNTRACK-VALUE-UNIFIED-SIZE)
         zero-ip (byte-array 16)]
     ;; IPs in network byte order
@@ -656,16 +683,28 @@
     (.putLong buf (or packets-rev 0))
     (.putLong buf (or bytes-fwd 0))
     (.putLong buf (or bytes-rev 0))
+    ;; PROXY protocol fields (32 bytes at offset 96)
+    (.put buf (unchecked-byte (or conn-state CONN-STATE-NEW)))
+    (.put buf (unchecked-byte (or proxy-flags 0)))
+    (.putShort buf (short 0))  ; padding
+    (.putInt buf (unchecked-int (or seq-offset 0)))
+    (.order buf ByteOrder/BIG_ENDIAN)  ; IPs in network order
+    (.put buf ^bytes (or orig-client-ip zero-ip))
+    (.putShort buf (unchecked-short (or orig-client-port 0)))
+    ;; Padding (6 bytes)
+    (.putShort buf (short 0))
+    (.putInt buf (int 0))
     (.array buf)))
 
 (defn decode-conntrack-value-unified
-  "Decode unified connection tracking value from byte array (96 bytes)."
+  "Decode unified connection tracking value from byte array (128 bytes)."
   [^bytes b]
   (when (< (alength b) CONNTRACK-VALUE-UNIFIED-SIZE)
     (throw (ex-info "Buffer too small for conntrack value" {:size (alength b)})))
   (let [buf (ByteBuffer/wrap b)
         orig-dst-ip (byte-array 16)
-        nat-dst-ip (byte-array 16)]
+        nat-dst-ip (byte-array 16)
+        orig-client-ip (byte-array 16)]
     ;; IPs in network byte order
     (.order buf ByteOrder/BIG_ENDIAN)
     (.get buf orig-dst-ip)
@@ -676,17 +715,36 @@
             _ (.getShort buf)]  ; padding
         ;; Counters in native order
         (.order buf (ByteOrder/nativeOrder))
-        {:orig-dst-ip orig-dst-ip
-         :orig-dst-port orig-dst-port
-         :nat-dst-ip nat-dst-ip
-         :nat-dst-port nat-dst-port
-         :created-ns (.getLong buf)
-         :last-seen (.getLong buf)
-         :packets-fwd (.getLong buf)
-         :packets-rev (.getLong buf)
-         :bytes-fwd (.getLong buf)
-         :bytes-rev (.getLong buf)
-         :af (bytes16->address-family orig-dst-ip)}))))
+        (let [created-ns (.getLong buf)
+              last-seen (.getLong buf)
+              packets-fwd (.getLong buf)
+              packets-rev (.getLong buf)
+              bytes-fwd (.getLong buf)
+              bytes-rev (.getLong buf)
+              ;; PROXY protocol fields (32 bytes at offset 96)
+              conn-state (bit-and (.get buf) 0xFF)
+              proxy-flags (bit-and (.get buf) 0xFF)
+              _ (.getShort buf)  ; padding
+              seq-offset (.getInt buf)]
+          (.order buf ByteOrder/BIG_ENDIAN)
+          (.get buf orig-client-ip)
+          (let [orig-client-port (bit-and (.getShort buf) 0xFFFF)]
+            {:orig-dst-ip orig-dst-ip
+             :orig-dst-port orig-dst-port
+             :nat-dst-ip nat-dst-ip
+             :nat-dst-port nat-dst-port
+             :created-ns created-ns
+             :last-seen last-seen
+             :packets-fwd packets-fwd
+             :packets-rev packets-rev
+             :bytes-fwd bytes-fwd
+             :bytes-rev bytes-rev
+             :conn-state conn-state
+             :proxy-flags proxy-flags
+             :seq-offset seq-offset
+             :orig-client-ip orig-client-ip
+             :orig-client-port orig-client-port
+             :af (bytes16->address-family orig-dst-ip)}))))))
 
 (defn encode-weighted-route-value-unified
   "Encode unified weighted route value for BPF map.
@@ -1028,3 +1086,150 @@
 (def TC-ACT-OK 0)
 (def TC-ACT-SHOT 2)
 (def TC-ACT-REDIRECT 7)
+
+;;; =============================================================================
+;;; PROXY Protocol v2 Encoding
+;;; =============================================================================
+
+;; PROXY v2 signature (12 bytes): "\r\n\r\n\0\r\nQUIT\n"
+(def PROXY-V2-SIGNATURE
+  (byte-array [(byte 0x0D) (byte 0x0A) (byte 0x0D) (byte 0x0A)
+               (byte 0x00) (byte 0x0D) (byte 0x0A) (byte 0x51)
+               (byte 0x55) (byte 0x49) (byte 0x54) (byte 0x0A)]))
+
+;; Version + Command: 0x21 = version 2, PROXY command
+(def ^:const PROXY-V2-VERSION-CMD 0x21)
+
+;; Family + Protocol bytes
+(def ^:const PROXY-V2-FAMILY-TCP-IPV4 0x11)  ; AF_INET + STREAM
+(def ^:const PROXY-V2-FAMILY-TCP-IPV6 0x21)  ; AF_INET6 + STREAM
+
+;; Address section sizes
+(def ^:const PROXY-V2-ADDR-SIZE-IPV4 12)  ; src(4) + dst(4) + ports(4)
+(def ^:const PROXY-V2-ADDR-SIZE-IPV6 36)  ; src(16) + dst(16) + ports(4)
+
+;; Full header sizes (signature(12) + ver/cmd(1) + family(1) + len(2) + addrs)
+(def ^:const PROXY-V2-HEADER-SIZE-IPV4 28)  ; 16 + 12
+(def ^:const PROXY-V2-HEADER-SIZE-IPV6 52)  ; 16 + 36
+
+(defn encode-proxy-v2-header-ipv4
+  "Encode a PROXY protocol v2 header for IPv4 TCP connection.
+
+   Arguments:
+   - src-ip: Source IP as u32 (network byte order)
+   - src-port: Source port number
+   - dst-ip: Destination IP as u32 (network byte order)
+   - dst-port: Destination port number
+
+   Returns: 28-byte array containing complete PROXY v2 header"
+  [src-ip src-port dst-ip dst-port]
+  (let [buf (ByteBuffer/allocate PROXY-V2-HEADER-SIZE-IPV4)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    ;; Signature (12 bytes)
+    (.put buf ^bytes PROXY-V2-SIGNATURE)
+    ;; Version + Command (1 byte)
+    (.put buf (unchecked-byte PROXY-V2-VERSION-CMD))
+    ;; Address Family + Protocol (1 byte)
+    (.put buf (unchecked-byte PROXY-V2-FAMILY-TCP-IPV4))
+    ;; Address length (2 bytes, big-endian)
+    (.putShort buf (unchecked-short PROXY-V2-ADDR-SIZE-IPV4))
+    ;; Source IP (4 bytes, network byte order)
+    (.putInt buf (unchecked-int src-ip))
+    ;; Destination IP (4 bytes, network byte order)
+    (.putInt buf (unchecked-int dst-ip))
+    ;; Source port (2 bytes, network byte order)
+    (.putShort buf (unchecked-short src-port))
+    ;; Destination port (2 bytes, network byte order)
+    (.putShort buf (unchecked-short dst-port))
+    (.array buf)))
+
+(defn encode-proxy-v2-header-ipv6
+  "Encode a PROXY protocol v2 header for IPv6 TCP connection.
+
+   Arguments:
+   - src-ip: Source IP as 16-byte array
+   - src-port: Source port number
+   - dst-ip: Destination IP as 16-byte array
+   - dst-port: Destination port number
+
+   Returns: 52-byte array containing complete PROXY v2 header"
+  [^bytes src-ip src-port ^bytes dst-ip dst-port]
+  (let [buf (ByteBuffer/allocate PROXY-V2-HEADER-SIZE-IPV6)]
+    (.order buf ByteOrder/BIG_ENDIAN)
+    ;; Signature (12 bytes)
+    (.put buf ^bytes PROXY-V2-SIGNATURE)
+    ;; Version + Command (1 byte)
+    (.put buf (unchecked-byte PROXY-V2-VERSION-CMD))
+    ;; Address Family + Protocol (1 byte)
+    (.put buf (unchecked-byte PROXY-V2-FAMILY-TCP-IPV6))
+    ;; Address length (2 bytes, big-endian)
+    (.putShort buf (unchecked-short PROXY-V2-ADDR-SIZE-IPV6))
+    ;; Source IP (16 bytes)
+    (.put buf src-ip)
+    ;; Destination IP (16 bytes)
+    (.put buf dst-ip)
+    ;; Source port (2 bytes, network byte order)
+    (.putShort buf (unchecked-short src-port))
+    ;; Destination port (2 bytes, network byte order)
+    (.putShort buf (unchecked-short dst-port))
+    (.array buf)))
+
+(defn decode-proxy-v2-header
+  "Decode a PROXY protocol v2 header from byte array.
+
+   Returns nil if signature doesn't match, otherwise returns:
+   {:version :command :family :protocol :src-ip :src-port :dst-ip :dst-port}
+
+   For IPv4, IPs are returned as u32.
+   For IPv6, IPs are returned as 16-byte arrays."
+  [^bytes header]
+  (when (>= (alength header) 16)  ; Minimum header size
+    (let [buf (ByteBuffer/wrap header)]
+      (.order buf ByteOrder/BIG_ENDIAN)
+      ;; Check signature (12 bytes)
+      (let [sig (byte-array 12)]
+        (.get buf sig)
+        (when (java.util.Arrays/equals sig ^bytes PROXY-V2-SIGNATURE)
+          (let [ver-cmd (bit-and (.get buf) 0xFF)
+                fam-proto (bit-and (.get buf) 0xFF)
+                addr-len (bit-and (.getShort buf) 0xFFFF)
+                version (bit-and (unsigned-bit-shift-right ver-cmd 4) 0x0F)
+                command (bit-and ver-cmd 0x0F)
+                family (bit-and (unsigned-bit-shift-right fam-proto 4) 0x0F)
+                protocol (bit-and fam-proto 0x0F)]
+            (cond
+              ;; IPv4 (family=1)
+              (and (= family 1) (>= (- (alength header) 16) 12))
+              {:version version
+               :command command
+               :family :ipv4
+               :protocol (if (= protocol 1) :tcp :udp)
+               :src-ip (Integer/toUnsignedLong (.getInt buf))
+               :dst-ip (Integer/toUnsignedLong (.getInt buf))
+               :src-port (bit-and (.getShort buf) 0xFFFF)
+               :dst-port (bit-and (.getShort buf) 0xFFFF)}
+
+              ;; IPv6 (family=2)
+              (and (= family 2) (>= (- (alength header) 16) 36))
+              (let [src-ip (byte-array 16)
+                    dst-ip (byte-array 16)]
+                (.get buf src-ip)
+                (.get buf dst-ip)
+                {:version version
+                 :command command
+                 :family :ipv6
+                 :protocol (if (= protocol 1) :tcp :udp)
+                 :src-ip src-ip
+                 :dst-ip dst-ip
+                 :src-port (bit-and (.getShort buf) 0xFFFF)
+                 :dst-port (bit-and (.getShort buf) 0xFFFF)})
+
+              :else nil)))))))
+
+(defn proxy-v2-header-size
+  "Return the PROXY v2 header size for a given address family.
+   :ipv4 -> 28 bytes, :ipv6 -> 52 bytes"
+  [family]
+  (case family
+    :ipv4 PROXY-V2-HEADER-SIZE-IPV4
+    :ipv6 PROXY-V2-HEADER-SIZE-IPV6))

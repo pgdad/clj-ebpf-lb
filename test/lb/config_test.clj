@@ -294,13 +294,13 @@
 
 (deftest compute-cumulative-weights-test
   (testing "Compute cumulative weights for single target"
-    (let [targets [(config/->WeightedTarget 0 8080 100 nil)]]
+    (let [targets [(config/->WeightedTarget 0 8080 100 nil nil)]]
       (is (= [100] (config/compute-cumulative-weights targets)))))
 
   (testing "Compute cumulative weights for multiple targets"
-    (let [targets [(config/->WeightedTarget 0 8080 50 nil)
-                   (config/->WeightedTarget 1 8080 30 nil)
-                   (config/->WeightedTarget 2 8080 20 nil)]]
+    (let [targets [(config/->WeightedTarget 0 8080 50 nil nil)
+                   (config/->WeightedTarget 1 8080 30 nil nil)
+                   (config/->WeightedTarget 2 8080 20 nil nil)]]
       (is (= [50 80 100] (config/compute-cumulative-weights targets))))))
 
 (deftest parse-weighted-target-test
@@ -312,7 +312,15 @@
 
   (testing "Parse weighted target without weight defaults to 100"
     (let [target (config/parse-weighted-target {:ip "10.0.0.1" :port 8080})]
-      (is (= 100 (:weight target))))))
+      (is (= 100 (:weight target)))))
+
+  (testing "Parse weighted target with proxy-protocol"
+    (let [target (config/parse-weighted-target {:ip "10.0.0.1" :port 8080 :proxy-protocol :v2})]
+      (is (= :v2 (:proxy-protocol target)))))
+
+  (testing "Parse weighted target without proxy-protocol is nil"
+    (let [target (config/parse-weighted-target {:ip "10.0.0.1" :port 8080})]
+      (is (nil? (:proxy-protocol target))))))
 
 (deftest parse-target-group-test
   (testing "Parse single target to target group"

@@ -61,6 +61,9 @@
 ;; Weight for load balancing (1-100, represents percentage)
 (s/def ::weight (s/and int? #(>= % 1) #(<= % 100)))
 
+;; PROXY protocol version for header injection
+(s/def ::proxy-protocol #{:v2})
+
 ;;; Health Check Specs
 (s/def ::health-check-type #{:tcp :http :https :none})
 (s/def ::path (s/and string? #(clojure.string/starts-with? % "/")))
@@ -77,7 +80,7 @@
 ;; Target specification (single target, with optional weight and health check)
 ;; ::ip accepts IPv4 only for backward compatibility
 (s/def ::ip ::ip-string)
-(s/def ::target (s/keys :req-un [::ip ::port] :opt-un [::weight ::health-check]))
+(s/def ::target (s/keys :req-un [::ip ::port] :opt-un [::weight ::health-check ::proxy-protocol]))
 
 ;; Unified target specification (IPv4 or IPv6)
 ;; Use ::ip6 key for unified IP to distinguish from legacy ::ip
@@ -88,7 +91,7 @@
 (s/def ::host ::hostname)
 (s/def ::dns-refresh-seconds (s/and int? #(>= % 1) #(<= % 3600)))
 (s/def ::dns-target (s/keys :req-un [::host ::port]
-                            :opt-un [::weight ::health-check ::dns-refresh-seconds]))
+                            :opt-un [::weight ::health-check ::dns-refresh-seconds ::proxy-protocol]))
 
 ;; Weighted targets array (for load balancing across multiple backends)
 ;; Can contain either IP-based or DNS-based targets
@@ -256,7 +259,8 @@
    :expected-codes [200 201 202 204]})
 
 ;; Weighted target extends Target with weight (1-100 percentage) and optional health check
-(defrecord WeightedTarget [ip port weight health-check])
+;; proxy-protocol: nil (disabled) or :v2 (inject PROXY v2 header)
+(defrecord WeightedTarget [ip port weight health-check proxy-protocol])
 
 ;; DNS-backed weighted target - resolved to IPs at runtime
 ;; host: hostname to resolve
@@ -264,7 +268,8 @@
 ;; weight: weight for this target (1-100)
 ;; dns-refresh-seconds: how often to re-resolve DNS
 ;; health-check: optional health check config
-(defrecord DNSWeightedTarget [host port weight dns-refresh-seconds health-check])
+;; proxy-protocol: nil (disabled) or :v2 (inject PROXY v2 header)
+(defrecord DNSWeightedTarget [host port weight dns-refresh-seconds health-check proxy-protocol])
 
 ;; Group of weighted targets with cumulative weights for fast selection
 ;; targets: vector of WeightedTarget
@@ -497,25 +502,27 @@
    If weight is not specified, defaults to 100 (for single target scenarios).
    global-health-defaults: optional global health check defaults from settings."
   ([target-map] (parse-weighted-target target-map nil))
-  ([{:keys [ip port weight health-check]} global-health-defaults]
+  ([{:keys [ip port weight health-check proxy-protocol]} global-health-defaults]
    (->WeightedTarget
      (util/ip-string->u32 ip)
      port
      (or weight 100)
-     (parse-health-check-config health-check global-health-defaults))))
+     (parse-health-check-config health-check global-health-defaults)
+     proxy-protocol)))
 
 (defn parse-dns-weighted-target
   "Parse a DNS-backed target map to DNSWeightedTarget record.
    The hostname will be resolved at runtime by the DNS manager.
    global-health-defaults: optional global health check defaults from settings."
   ([target-map] (parse-dns-weighted-target target-map nil))
-  ([{:keys [host port weight dns-refresh-seconds health-check]} global-health-defaults]
+  ([{:keys [host port weight dns-refresh-seconds health-check proxy-protocol]} global-health-defaults]
    (->DNSWeightedTarget
      host
      port
      (or weight 100)
      (or dns-refresh-seconds 30)
-     (parse-health-check-config health-check global-health-defaults))))
+     (parse-health-check-config health-check global-health-defaults)
+     proxy-protocol)))
 
 (defn compute-cumulative-weights
   "Compute cumulative weights from a sequence of WeightedTarget records.
@@ -685,17 +692,17 @@
       (let [t (first targets)
             base {:ip (util/u32->ip-string (:ip t))
                   :port (:port t)}]
-        (if (:health-check t)
-          (assoc base :health-check (health-check->map (:health-check t)))
-          base))
+        (cond-> base
+          (:health-check t) (assoc :health-check (health-check->map (:health-check t)))
+          (:proxy-protocol t) (assoc :proxy-protocol (:proxy-protocol t))))
       ;; Multiple targets - return array with weights
       (mapv (fn [t]
               (let [base {:ip (util/u32->ip-string (:ip t))
                           :port (:port t)
                           :weight (:weight t)}]
-                (if (:health-check t)
-                  (assoc base :health-check (health-check->map (:health-check t)))
-                  base)))
+                (cond-> base
+                  (:health-check t) (assoc :health-check (health-check->map (:health-check t)))
+                  (:proxy-protocol t) (assoc :proxy-protocol (:proxy-protocol t)))))
             targets))))
 
 (defn sni-route->map
@@ -781,23 +788,25 @@
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
    Convenience function for simple configurations."
-  ([ip port] (make-single-target-group ip port nil))
-  ([ip port health-check]
+  ([ip port] (make-single-target-group ip port nil nil))
+  ([ip port health-check] (make-single-target-group ip port health-check nil))
+  ([ip port health-check proxy-protocol]
    (let [ip-u32 (if (string? ip) (util/ip-string->u32 ip) ip)]
      (->TargetGroup
-       [(->WeightedTarget ip-u32 port 100 health-check)]
+       [(->WeightedTarget ip-u32 port 100 health-check proxy-protocol)]
        [100]))))
 
 (defn make-weighted-target-group
   "Create a TargetGroup with multiple weighted targets.
-   targets should be a sequence of {:ip :port :weight :health-check} maps.
+   targets should be a sequence of {:ip :port :weight :health-check :proxy-protocol} maps.
    Validates that weights sum to 100."
   [targets]
   (validate-target-weights! targets "make-weighted-target-group")
-  (let [parsed (mapv (fn [{:keys [ip port weight health-check]}]
+  (let [parsed (mapv (fn [{:keys [ip port weight health-check proxy-protocol]}]
                        (->WeightedTarget (util/ip-string->u32 ip) port weight
                                          (when health-check
-                                           (parse-health-check-config health-check nil))))
+                                           (parse-health-check-config health-check nil))
+                                         proxy-protocol))
                      targets)
         cumulative (compute-cumulative-weights parsed)]
     (->TargetGroup parsed cumulative)))

@@ -523,7 +523,7 @@
   (testing "Unified key size constants"
     (is (= 20 util/LPM-KEY-UNIFIED-SIZE))
     (is (= 40 util/CONNTRACK-KEY-UNIFIED-SIZE))
-    (is (= 96 util/CONNTRACK-VALUE-UNIFIED-SIZE))
+    (is (= 128 util/CONNTRACK-VALUE-UNIFIED-SIZE))  ; Extended for PROXY protocol
     (is (= 168 util/WEIGHTED-ROUTE-UNIFIED-MAX-SIZE))))
 
 (deftest encode-lpm-key-unified-test
@@ -577,6 +577,66 @@
         (is (= 54321 (:src-port decoded)))
         (is (= 443 (:dst-port decoded)))
         (is (= 6 (:protocol decoded)))))))
+
+(deftest encode-conntrack-value-unified-test
+  (testing "Conntrack value with basic fields"
+    (let [orig-ip (util/ip-string->bytes16 "10.0.0.1")
+          nat-ip (util/ip-string->bytes16 "192.168.1.1")
+          value {:orig-dst-ip orig-ip
+                 :orig-dst-port 8080
+                 :nat-dst-ip nat-ip
+                 :nat-dst-port 9080
+                 :created-ns 1000
+                 :last-seen 2000
+                 :packets-fwd 100
+                 :packets-rev 50
+                 :bytes-fwd 10000
+                 :bytes-rev 5000}
+          encoded (util/encode-conntrack-value-unified value)]
+      (is (= 128 (count encoded)))
+      (let [decoded (util/decode-conntrack-value-unified encoded)]
+        (is (= (vec orig-ip) (vec (:orig-dst-ip decoded))))
+        (is (= 8080 (:orig-dst-port decoded)))
+        (is (= (vec nat-ip) (vec (:nat-dst-ip decoded))))
+        (is (= 9080 (:nat-dst-port decoded)))
+        (is (= 1000 (:created-ns decoded)))
+        (is (= 2000 (:last-seen decoded)))
+        (is (= 100 (:packets-fwd decoded)))
+        (is (= 50 (:packets-rev decoded)))
+        (is (= 10000 (:bytes-fwd decoded)))
+        (is (= 5000 (:bytes-rev decoded)))
+        ;; PROXY fields default to zero
+        (is (= 0 (:conn-state decoded)))
+        (is (= 0 (:proxy-flags decoded)))
+        (is (= 0 (:seq-offset decoded))))))
+
+  (testing "Conntrack value with PROXY protocol fields"
+    (let [orig-ip (util/ip-string->bytes16 "10.0.0.1")
+          nat-ip (util/ip-string->bytes16 "192.168.1.1")
+          client-ip (util/ip-string->bytes16 "203.0.113.50")
+          value {:orig-dst-ip orig-ip
+                 :orig-dst-port 8080
+                 :nat-dst-ip nat-ip
+                 :nat-dst-port 9080
+                 :created-ns 1000
+                 :last-seen 2000
+                 :packets-fwd 100
+                 :packets-rev 50
+                 :bytes-fwd 10000
+                 :bytes-rev 5000
+                 :conn-state util/CONN-STATE-ESTABLISHED
+                 :proxy-flags (bit-or util/PROXY-FLAG-ENABLED util/PROXY-FLAG-HEADER-INJECTED)
+                 :seq-offset 28
+                 :orig-client-ip client-ip
+                 :orig-client-port 45678}
+          encoded (util/encode-conntrack-value-unified value)]
+      (is (= 128 (count encoded)))
+      (let [decoded (util/decode-conntrack-value-unified encoded)]
+        (is (= util/CONN-STATE-ESTABLISHED (:conn-state decoded)))
+        (is (= 3 (:proxy-flags decoded)))  ; ENABLED | HEADER-INJECTED
+        (is (= 28 (:seq-offset decoded)))
+        (is (= (vec client-ip) (vec (:orig-client-ip decoded))))
+        (is (= 45678 (:orig-client-port decoded)))))))
 
 (deftest encode-weighted-route-value-unified-test
   (testing "Single IPv4 target unified encoding"
@@ -651,3 +711,68 @@
         (is (= 3 (:ifindex decoded)))
         (is (= 443 (:port decoded)))
         (is (= :ipv6 (:af decoded)))))))
+
+;;; =============================================================================
+;;; PROXY Protocol v2 Encoding Tests
+;;; =============================================================================
+
+(deftest proxy-v2-constants-test
+  (testing "PROXY v2 header sizes"
+    (is (= 28 util/PROXY-V2-HEADER-SIZE-IPV4))
+    (is (= 52 util/PROXY-V2-HEADER-SIZE-IPV6))
+    (is (= 12 (count util/PROXY-V2-SIGNATURE)))))
+
+(deftest encode-proxy-v2-header-ipv4-test
+  (testing "Encode IPv4 PROXY v2 header"
+    (let [src-ip (util/ip-string->u32 "192.168.1.100")
+          dst-ip (util/ip-string->u32 "10.0.0.1")
+          header (util/encode-proxy-v2-header-ipv4 src-ip 12345 dst-ip 8080)]
+      (is (= 28 (count header)))
+      ;; Check signature at beginning
+      (is (java.util.Arrays/equals
+            (byte-array (take 12 header))
+            util/PROXY-V2-SIGNATURE))
+      ;; Decode and verify
+      (let [decoded (util/decode-proxy-v2-header header)]
+        (is (some? decoded))
+        (is (= 2 (:version decoded)))
+        (is (= 1 (:command decoded)))
+        (is (= :ipv4 (:family decoded)))
+        (is (= :tcp (:protocol decoded)))
+        (is (= src-ip (:src-ip decoded)))
+        (is (= dst-ip (:dst-ip decoded)))
+        (is (= 12345 (:src-port decoded)))
+        (is (= 8080 (:dst-port decoded)))))))
+
+(deftest encode-proxy-v2-header-ipv6-test
+  (testing "Encode IPv6 PROXY v2 header"
+    (let [src-ip (util/ipv6-string->bytes "2001:db8::1")
+          dst-ip (util/ipv6-string->bytes "2001:db8::2")
+          header (util/encode-proxy-v2-header-ipv6 src-ip 54321 dst-ip 443)]
+      (is (= 52 (count header)))
+      ;; Check signature at beginning
+      (is (java.util.Arrays/equals
+            (byte-array (take 12 header))
+            util/PROXY-V2-SIGNATURE))
+      ;; Decode and verify
+      (let [decoded (util/decode-proxy-v2-header header)]
+        (is (some? decoded))
+        (is (= 2 (:version decoded)))
+        (is (= 1 (:command decoded)))
+        (is (= :ipv6 (:family decoded)))
+        (is (= :tcp (:protocol decoded)))
+        (is (java.util.Arrays/equals src-ip (:src-ip decoded)))
+        (is (java.util.Arrays/equals dst-ip (:dst-ip decoded)))
+        (is (= 54321 (:src-port decoded)))
+        (is (= 443 (:dst-port decoded)))))))
+
+(deftest decode-proxy-v2-header-invalid-test
+  (testing "Invalid headers return nil"
+    (is (nil? (util/decode-proxy-v2-header (byte-array 10))))
+    (is (nil? (util/decode-proxy-v2-header (byte-array 28))))
+    (is (nil? (util/decode-proxy-v2-header (byte-array (repeat 28 0)))))))
+
+(deftest proxy-v2-header-size-test
+  (testing "Header size helper"
+    (is (= 28 (util/proxy-v2-header-size :ipv4)))
+    (is (= 52 (util/proxy-v2-header-size :ipv6)))))
