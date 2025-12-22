@@ -421,7 +421,7 @@
                                   :conntrack-map conntrack-map})
                   tc-in-bytecode (tc-ingress/build-tc-ingress-proxy-program
                                    {:conntrack-map conntrack-map})
-                  tc-out-bytecode (tc-egress/build-tc-egress-program
+                  tc-out-bytecode (tc-egress/build-tc-egress-program-unified
                                     {:conntrack-map conntrack-map})]
 
               (is (bytes? xdp-bytecode))
@@ -614,8 +614,8 @@
                     (is xdp-prog "XDP should load")
                     (println "XDP loaded successfully!")
 
-                    ;; Now build and load TC egress
-                    (let [tc-out-bytecode (tc-egress/build-tc-egress-program
+                    ;; Now build and load TC egress (use unified version for unified map)
+                    (let [tc-out-bytecode (tc-egress/build-tc-egress-program-unified
                                             {:conntrack-map conntrack-map})]
                       (println "TC egress bytecode length:" (count tc-out-bytecode))
 

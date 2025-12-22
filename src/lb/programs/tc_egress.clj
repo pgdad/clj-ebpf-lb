@@ -527,11 +527,12 @@
       ;; Load data and data_end pointers from SKB context
       (tc-load-data-ptrs-32 :r7 :r8 :r1)
 
-      ;; Check Ethernet header bounds
-      (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass_unified :r9)
-
-      ;; Load ethertype
-      (eth/load-ethertype :r9 :r7)
+      ;; Check Ethernet header bounds and load ethertype
+      ;; Check at data+14, then access at offset -2 (ethertype at byte 12-13)
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)                         ; r9 = data + 14
+       (asm/jmp-reg :jgt :r9 :r8 :pass_unified)           ; bounds check
+       (dsl/ldx :h :r9 :r9 -2)]                            ; r9 = ethertype (from r9 - 2 = data + 12)
 
       ;; Branch on EtherType: IPv4 or IPv6
       [(asm/jmp-imm :jeq :r9 common/ETH-P-IP-BE :ipv4_tc_path)
@@ -547,14 +548,15 @@
       [(dsl/mov :r0 4)
        (dsl/stx :b :r10 :r0 -62)]
 
-      ;; Calculate IP header pointer: data + ETH_HLEN
-      (eth/get-ip-header-ptr :r9 :r7)
+      ;; Check bounds for IP header + L4 ports (need data + 38)
+      ;; r9 = data + 38 covers: ETH (14) + IP (20) + 4 bytes of TCP/UDP
+      ;; All access uses IMMEDIATE offsets from r9 (no register additions)
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 4))  ; r9 = data + 38
+       (asm/jmp-reg :jgt :r9 :r8 :pass_unified)]           ; bounds check
 
-      ;; Check IP header bounds (minimum 20 bytes)
-      (asm/check-bounds :r9 :r8 net/IPV4-MIN-HLEN :pass_unified :r0)
-
-      ;; Load and store protocol
-      [(dsl/ldx :b :r0 :r9 9)
+      ;; Load and store protocol (IP header offset 9 = data + 23 = r9 - 15)
+      [(dsl/ldx :b :r0 :r9 -15)          ; protocol at data + 23
        (dsl/stx :b :r10 :r0 -61)]
 
       ;; For reply packet from backend to client:
@@ -562,30 +564,29 @@
       ;; - For conntrack lookup, we need REVERSE key: key.src = client, key.dst = backend
 
       ;; Load source IP (backend) - store as old_src_ip (unified 16-byte) and key.dst_ip
-      ;; Zero-pad for unified format
+      ;; src_ip is at IP header offset 12 = data + 26 = r9 - 12
       [(dsl/mov :r0 0)
        (dsl/stx :dw :r10 :r0 -56)        ; zero bytes 0-7 of old_src_ip
        (dsl/stx :w :r10 :r0 -48)         ; zero bytes 8-11 of old_src_ip
-       (dsl/ldx :w :r0 :r9 12)           ; load src_ip (4 bytes)
+       (dsl/ldx :w :r0 :r9 -12)          ; load src_ip at r9 - 12
        (dsl/stx :w :r10 :r0 -44)]        ; store at bytes 12-15 of old_src_ip
 
       ;; key.dst_ip = backend (16 bytes, zero-padded)
       [(dsl/mov :r0 0)
        (dsl/stx :dw :r10 :r0 -24)        ; zero bytes 0-7 of key.dst_ip at -40+16=-24
        (dsl/stx :w :r10 :r0 -16)         ; zero bytes 8-11
-       (dsl/ldx :w :r0 :r9 12)           ; src_ip (backend)
+       (dsl/ldx :w :r0 :r9 -12)          ; src_ip (backend) at r9 - 12
        (dsl/stx :w :r10 :r0 -12)]        ; store at bytes 12-15 of key.dst_ip
 
       ;; Load destination IP (client) - store as key.src_ip
+      ;; dst_ip is at IP header offset 16 = data + 30 = r9 - 8
       [(dsl/mov :r0 0)
        (dsl/stx :dw :r10 :r0 -40)        ; zero bytes 0-7 of key.src_ip
        (dsl/stx :w :r10 :r0 -32)         ; zero bytes 8-11
-       (dsl/ldx :w :r0 :r9 16)           ; dst_ip (client)
+       (dsl/ldx :w :r0 :r9 -8)           ; dst_ip (client) at r9 - 8
        (dsl/stx :w :r10 :r0 -28)]        ; store at bytes 12-15 of key.src_ip
 
-      ;; Store L4 header offset
-      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
-       (dsl/stx :w :r10 :r0 -68)]
+      ;; r9 remains in register for TCP/UDP port access (r9 = data + 38)
 
       [(asm/jmp :protocol_tc_dispatch)]
 
@@ -598,52 +599,51 @@
       [(dsl/mov :r0 6)
        (dsl/stx :b :r10 :r0 -62)]
 
-      ;; Check IPv6 header bounds (fixed 40 bytes)
-      [(dsl/mov-reg :r0 :r7)
-       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
-       (asm/jmp-reg :jgt :r0 :r8 :pass_unified)]
-
-      ;; Get IPv6 header pointer
+      ;; Check bounds for IPv6 header + L4 ports (need data + 58)
+      ;; r9 = data + 58 covers: ETH (14) + IPv6 (40) + 4 bytes of TCP/UDP
+      ;; All access uses IMMEDIATE offsets from r9 (no register additions)
       [(dsl/mov-reg :r9 :r7)
-       (dsl/add :r9 net/ETH-HLEN)]
+       (dsl/add :r9 (+ net/ETH-HLEN common/IPV6-HLEN 4))  ; r9 = data + 58
+       (asm/jmp-reg :jgt :r9 :r8 :pass_unified)]          ; bounds check
 
       ;; Load and store Next Header (protocol)
-      [(dsl/ldx :b :r0 :r9 common/IPV6-OFF-NEXT-HEADER)
+      ;; Next Header at IPv6 offset 6 = data + 20 = r9 - 38
+      [(dsl/ldx :b :r0 :r9 (- common/IPV6-OFF-NEXT-HEADER (+ common/IPV6-HLEN 4)))
        (dsl/stx :b :r10 :r0 -61)]
 
       ;; Load source IP (backend, 16 bytes) - store as old_src_ip
-      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
+      ;; Source IP at IPv6 offset 8 = data + 22 = r9 - 36
+      [(dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 0) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -56)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 4) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -52)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 8) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -48)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 12) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -44)]
 
       ;; key.dst_ip = backend (16 bytes)
-      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
+      [(dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 0) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -24)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 4) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -20)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 8) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -16)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 12) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -12)]
 
       ;; Load destination IP (client, 16 bytes) - store as key.src_ip
-      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
+      ;; Dest IP at IPv6 offset 24 = data + 38 = r9 - 20
+      [(dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 0) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -40)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 4) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -36)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 8) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -32)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
+       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 12) (+ common/IPV6-HLEN 4)))
        (dsl/stx :w :r10 :r0 -28)]
 
-      ;; Store L4 header offset
-      [(dsl/mov :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
-       (dsl/stx :w :r10 :r0 -68)]
+      ;; r9 remains in register for TCP/UDP port access (r9 = data + 58)
 
       ;; Fall through to protocol dispatch
 
@@ -662,26 +662,20 @@
       ;; =====================================================================
       [(asm/label :tcp_tc_path_unified)]
 
-      ;; Get L4 header offset
-      [(dsl/ldx :w :r1 :r10 -68)]
+      ;; r9 was already set up with bounds check in IPv4/IPv6 paths
+      ;; r9 = data + L4_start + 4 (data+38 for IPv4, data+58 for IPv6)
+      ;; r9 is callee-saved and wasn't touched by protocol dispatch
 
-      ;; Calculate L4 header pointer
-      [(dsl/mov-reg :r0 :r7)
-       (dsl/add-reg :r0 :r1)]
-
-      ;; Check TCP header bounds
-      [(dsl/mov-reg :r1 :r0)
-       (dsl/add :r1 4)
-       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
-
-      ;; Load ports and build reverse key
+      ;; Load ports using negative offsets from r9
+      ;; src_port at L4_offset + 0 = r9 - 4
+      ;; dst_port at L4_offset + 2 = r9 - 2
       ;; Reply has: src=backend_port, dst=client_port
       ;; Key needs: src_port=client_port, dst_port=backend_port
-      [(dsl/ldx :h :r1 :r0 0)            ; src_port (backend)
+      [(dsl/ldx :h :r1 :r9 -4)           ; src_port (backend) at r9-4
        (dsl/stx :h :r10 :r1 -60)         ; old_src_port
        (dsl/stx :h :r10 :r1 -6)]         ; key.dst_port at -40+32+2=-6
 
-      [(dsl/ldx :h :r1 :r0 2)            ; dst_port (client)
+      [(dsl/ldx :h :r1 :r9 -2)           ; dst_port (client) at r9-2
        (dsl/stx :h :r10 :r1 -8)]         ; key.src_port at -40+32=-8
 
       ;; Store protocol and padding
@@ -698,20 +692,15 @@
       ;; =====================================================================
       [(asm/label :udp_tc_path_unified)]
 
-      [(dsl/ldx :w :r1 :r10 -68)]
+      ;; r9 was already set up with bounds check in IPv4/IPv6 paths
+      ;; r9 = data + L4_start + 4 (data+38 for IPv4, data+58 for IPv6)
 
-      [(dsl/mov-reg :r0 :r7)
-       (dsl/add-reg :r0 :r1)]
-
-      [(dsl/mov-reg :r1 :r0)
-       (dsl/add :r1 4)
-       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
-
-      [(dsl/ldx :h :r1 :r0 0)
+      ;; Load ports using negative offsets from r9
+      [(dsl/ldx :h :r1 :r9 -4)           ; src_port at r9-4
        (dsl/stx :h :r10 :r1 -60)
        (dsl/stx :h :r10 :r1 -6)]
 
-      [(dsl/ldx :h :r1 :r0 2)
+      [(dsl/ldx :h :r1 :r9 -2)           ; dst_port at r9-2
        (dsl/stx :h :r10 :r1 -8)]
 
       [(dsl/ldx :b :r0 :r10 -61)
@@ -898,14 +887,16 @@
        (dsl/call BPF-FUNC-l3-csum-replace)]
 
       ;; Check if UDP checksum is enabled
+      ;; We need to read UDP checksum at offset 6 (2 bytes) from UDP header
+      ;; UDP header is at ETH_HLEN + IPV4_MIN_HLEN = 34
+      ;; Access range: [34, 42) - we need to check data + 42 <= data_end
+      ;; Use same register for bounds check and access to satisfy BPF verifier
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
-      [(dsl/mov-reg :r1 :r7)
-       (dsl/add :r1 42)
-       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
-
       [(dsl/mov-reg :r0 :r7)
-       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
-       (dsl/ldx :h :r1 :r0 6)]
+       (dsl/add :r0 42)                                    ; r0 = data + 42
+       (asm/jmp-reg :jgt :r0 :r8 :pass_unified)            ; bounds check
+       (dsl/sub :r0 8)                                     ; r0 = data + 34 (UDP header)
+       (dsl/ldx :h :r1 :r0 6)]                             ; read checksum at offset 6
       [(asm/jmp-imm :jeq :r1 0 :udp_write_v4_unified)]
 
       ;; Update UDP checksum
@@ -925,20 +916,24 @@
 
       [(asm/label :udp_write_v4_unified)]
 
+      ;; Reload data pointers and check bounds for both IP and UDP header writes
+      ;; IP header write: offset 12 from ETH_HLEN (needs data + 14 + 16 = 30)
+      ;; UDP header write: offset 0 from UDP header (needs data + 34 + 2 = 36)
+      ;; We need data + 42 for full UDP access, use max for safety
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
-      [(dsl/mov-reg :r1 :r7)
-       (dsl/add :r1 42)
-       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
-
       [(dsl/mov-reg :r9 :r7)
-       (dsl/add :r9 net/ETH-HLEN)
-       (dsl/ldx :w :r1 :r10 -72)
-       (dsl/stx :w :r9 :r1 12)]
+       (dsl/add :r9 42)                                    ; r9 = data + 42
+       (asm/jmp-reg :jgt :r9 :r8 :pass_unified)            ; bounds check
+       (dsl/sub :r9 28)                                    ; r9 = data + 14 (IP header)
+       (dsl/ldx :w :r1 :r10 -72)                           ; new_src_ip
+       (dsl/stx :w :r9 :r1 12)]                            ; ip->saddr at offset 12
 
       [(dsl/mov-reg :r0 :r7)
-       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
-       (dsl/ldx :h :r1 :r10 -88)
-       (dsl/stx :h :r0 :r1 0)]
+       (dsl/add :r0 42)                                    ; r0 = data + 42
+       (asm/jmp-reg :jgt :r0 :r8 :pass_unified)            ; bounds check (redundant but safe)
+       (dsl/sub :r0 8)                                     ; r0 = data + 34 (UDP header)
+       (dsl/ldx :h :r1 :r10 -88)                           ; new_src_port
+       (dsl/stx :h :r0 :r1 0)]                             ; udp->sport
 
       [(asm/jmp :done_unified)]
 
@@ -1066,14 +1061,15 @@
       [(asm/label :udp_snat_v6_unified)]
 
       ;; Check UDP checksum (mandatory for IPv6, but check anyway)
+      ;; UDP header is at ETH_HLEN + IPV6_HLEN = 14 + 40 = 54
+      ;; We need to read checksum at offset 6 (2 bytes), so need data + 54 + 8 = 62
+      ;; Use same register for bounds check and access to satisfy BPF verifier
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
-      [(dsl/mov-reg :r1 :r7)
-       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 8))
-       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
-
       [(dsl/mov-reg :r0 :r7)
-       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
-       (dsl/ldx :h :r1 :r0 6)]
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN 8))  ; r0 = data + 62
+       (asm/jmp-reg :jgt :r0 :r8 :pass_unified)           ; bounds check
+       (dsl/sub :r0 8)                                     ; r0 = data + 54 (UDP header)
+       (dsl/ldx :h :r1 :r0 6)]                             ; read checksum at offset 6
       [(asm/jmp-imm :jeq :r1 0 :udp_write_v6_unified)]
 
       ;; Update UDP checksum for 16-byte address (4 words)
@@ -1115,14 +1111,16 @@
 
       [(asm/label :udp_write_v6_unified)]
 
+      ;; Reload data pointers and check bounds for IPv6 header + UDP header writes
+      ;; IPv6 src address: at offset 8 from IPv6 header (need data + 14 + 8 + 16 = 38)
+      ;; UDP sport: at offset 0 from UDP header (need data + 54 + 2 = 56)
+      ;; Use max offset (62) for safety to cover all accesses
       (tc-load-data-ptrs-32 :r7 :r8 :r6)
-      [(dsl/mov-reg :r1 :r7)
-       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 8))
-       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
-
-      ;; Write new src_ip
       [(dsl/mov-reg :r9 :r7)
-       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/add :r9 (+ net/ETH-HLEN common/IPV6-HLEN 8))  ; r9 = data + 62
+       (asm/jmp-reg :jgt :r9 :r8 :pass_unified)           ; bounds check
+       (dsl/sub :r9 48)                                       ; r9 = data + 14 (IPv6 header)
+       ;; Write new src_ip (16 bytes at offset 8 in IPv6 header)
        (dsl/ldx :w :r1 :r10 -84)
        (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 0))
        (dsl/ldx :w :r1 :r10 -80)
@@ -1132,11 +1130,13 @@
        (dsl/ldx :w :r1 :r10 -72)
        (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 12))]
 
-      ;; Write new src_port
+      ;; Write new src_port to UDP header
       [(dsl/mov-reg :r0 :r7)
-       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
-       (dsl/ldx :h :r1 :r10 -88)
-       (dsl/stx :h :r0 :r1 0)]
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN 8))  ; r0 = data + 62
+       (asm/jmp-reg :jgt :r0 :r8 :pass_unified)           ; bounds check
+       (dsl/sub :r0 8)                                     ; r0 = data + 54 (UDP header)
+       (dsl/ldx :h :r1 :r10 -88)                           ; new_src_port
+       (dsl/stx :h :r0 :r1 0)]                             ; udp->sport
 
       ;; Fall through to done_unified
 
