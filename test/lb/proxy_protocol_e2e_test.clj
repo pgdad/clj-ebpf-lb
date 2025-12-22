@@ -400,7 +400,7 @@
 ;; arenas with proper lifetime management.
 ;;
 ;; Status: Tests disabled until clj-ebpf is fixed.
-;; See: https://github.com/pgdad/clj-ebpf/issues/XXX (TODO: file issue)
+;; See: https://github.com/pgdad/clj-ebpf/issues/1
 
 (deftest ^:skip-clj-ebpf-bug full-stack-program-loading-test
   (when-root
