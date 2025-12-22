@@ -259,7 +259,7 @@
 ;;; Load Balancer Init Tests (require root)
 ;;; =============================================================================
 
-(deftest proxy-protocol-lb-init-test
+(deftest ^:integration proxy-protocol-lb-init-test
   (when-root
     (testing "Load balancer initializes with proxy-protocol targets"
       (let [cfg (config/parse-config
@@ -279,7 +279,7 @@
           (finally
             (lb/shutdown!)))))))
 
-(deftest proxy-protocol-mixed-targets-init-test
+(deftest ^:integration proxy-protocol-mixed-targets-init-test
   (when-root
     (testing "Load balancer handles mixed proxy-protocol and non-proxy targets"
       (let [cfg (config/parse-config

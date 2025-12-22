@@ -92,7 +92,7 @@
 ;;; Load Balancer Init Tests (require root)
 ;;; =============================================================================
 
-(deftest session-persistence-lb-init-test
+(deftest ^:integration session-persistence-lb-init-test
   (when-root
     (testing "Load balancer initializes with session-persistence enabled"
       (let [cfg (config/parse-config
