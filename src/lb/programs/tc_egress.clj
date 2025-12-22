@@ -34,7 +34,7 @@
 ;; r9 = IP header pointer / map value ptr (callee-saved)
 ;; r0-r5 = scratch, clobbered by helper calls
 
-;; Stack layout (negative offsets from r10):
+;; Stack layout for IPv4 (negative offsets from r10):
 ;; -16  : Conntrack key (16 bytes): {src_ip(4) + dst_ip(4) + src_port(2) + dst_port(2) + proto(1) + pad(3)}
 ;; -20  : old_src_ip (4 bytes) - source IP before SNAT
 ;; -24  : old_src_port (2 bytes) + padding (2 bytes)
@@ -42,6 +42,20 @@
 ;; -32  : L4 header offset from data (4 bytes)
 ;; -40  : scratch space (8 bytes)
 ;; -48  : packet length (8 bytes) - saved for stats update
+;;
+;; ============================================================================
+;; Unified stack layout for IPv4/IPv6 dual-stack (used by build-tc-snat-program-unified):
+;; ============================================================================
+;; -40  : Conntrack key (40 bytes): {src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2) + proto(1) + pad(3)}
+;; -56  : old_src_ip (16 bytes) - source IP before SNAT
+;; -60  : old_src_port (2 bytes) + padding (2 bytes)
+;; -61  : protocol (1 byte)
+;; -62  : af (1 byte) - 4 = IPv4, 6 = IPv6
+;; -64  : padding (2 bytes)
+;; -68  : L4 header offset from data (4 bytes)
+;; -84  : new_src_ip (16 bytes) - from conntrack value
+;; -88  : new_src_port (2 bytes) + padding (2 bytes)
+;; -96  : scratch space (8 bytes)
 ;;
 ;; Conntrack value structure (64 bytes, from XDP):
 ;;   offset 0:  orig_dst_ip (4) - for SNAT to restore as source
@@ -475,6 +489,621 @@
 
       [(asm/label :pass)]
       (net/return-action net/TC-ACT-OK))))
+
+;;; =============================================================================
+;;; Unified TC Egress Program with IPv4/IPv6 Dual-Stack Support
+;;; =============================================================================
+
+(defn build-tc-snat-program-unified
+  "Build unified TC egress program that performs SNAT on both IPv4 and IPv6 reply packets.
+
+   This program supports dual-stack operation:
+   1. Parses EtherType and branches for IPv4 or IPv6
+   2. Builds reverse 5-tuple key using unified 16-byte addresses
+   3. Looks up conntrack map with 40-byte key
+   4. If found, performs SNAT (rewrites src IP and port)
+   5. Updates checksums (IP header for IPv4 only, L4 for both)
+   6. Returns TC_ACT_OK
+
+   Uses unified conntrack key format:
+   - 40 bytes: src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2) + proto(1) + pad(3)
+
+   Register allocation:
+   r6 = saved SKB context (callee-saved)
+   r7 = data pointer (callee-saved)
+   r8 = data_end pointer (callee-saved)
+   r9 = IP header pointer / map value ptr (callee-saved)
+   r0-r5 = scratch, clobbered by helpers"
+  [conntrack-map-fd]
+  (asm/assemble-with-labels
+    (concat
+      ;; =====================================================================
+      ;; PHASE 1: Context Setup and Ethernet Parsing
+      ;; =====================================================================
+
+      ;; Save SKB context to callee-saved register
+      [(dsl/mov-reg :r6 :r1)]
+
+      ;; Load data and data_end pointers from SKB context
+      (tc-load-data-ptrs-32 :r7 :r8 :r1)
+
+      ;; Check Ethernet header bounds
+      (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass_unified :r9)
+
+      ;; Load ethertype
+      (eth/load-ethertype :r9 :r7)
+
+      ;; Branch on EtherType: IPv4 or IPv6
+      [(asm/jmp-imm :jeq :r9 common/ETH-P-IP-BE :ipv4_tc_path)
+       (asm/jmp-imm :jeq :r9 common/ETH-P-IPV6-BE :ipv6_tc_path)
+       (asm/jmp :pass_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 Path: Parse IPv4 header and build unified conntrack key
+      ;; =====================================================================
+      [(asm/label :ipv4_tc_path)]
+
+      ;; Store address family (4 = IPv4)
+      [(dsl/mov :r0 4)
+       (dsl/stx :b :r10 :r0 -62)]
+
+      ;; Calculate IP header pointer: data + ETH_HLEN
+      (eth/get-ip-header-ptr :r9 :r7)
+
+      ;; Check IP header bounds (minimum 20 bytes)
+      (asm/check-bounds :r9 :r8 net/IPV4-MIN-HLEN :pass_unified :r0)
+
+      ;; Load and store protocol
+      [(dsl/ldx :b :r0 :r9 9)
+       (dsl/stx :b :r10 :r0 -61)]
+
+      ;; For reply packet from backend to client:
+      ;; - src_ip = backend, dst_ip = client
+      ;; - For conntrack lookup, we need REVERSE key: key.src = client, key.dst = backend
+
+      ;; Load source IP (backend) - store as old_src_ip (unified 16-byte) and key.dst_ip
+      ;; Zero-pad for unified format
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -56)        ; zero bytes 0-7 of old_src_ip
+       (dsl/stx :w :r10 :r0 -48)         ; zero bytes 8-11 of old_src_ip
+       (dsl/ldx :w :r0 :r9 12)           ; load src_ip (4 bytes)
+       (dsl/stx :w :r10 :r0 -44)]        ; store at bytes 12-15 of old_src_ip
+
+      ;; key.dst_ip = backend (16 bytes, zero-padded)
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -24)        ; zero bytes 0-7 of key.dst_ip at -40+16=-24
+       (dsl/stx :w :r10 :r0 -16)         ; zero bytes 8-11
+       (dsl/ldx :w :r0 :r9 12)           ; src_ip (backend)
+       (dsl/stx :w :r10 :r0 -12)]        ; store at bytes 12-15 of key.dst_ip
+
+      ;; Load destination IP (client) - store as key.src_ip
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -40)        ; zero bytes 0-7 of key.src_ip
+       (dsl/stx :w :r10 :r0 -32)         ; zero bytes 8-11
+       (dsl/ldx :w :r0 :r9 16)           ; dst_ip (client)
+       (dsl/stx :w :r10 :r0 -28)]        ; store at bytes 12-15 of key.src_ip
+
+      ;; Store L4 header offset
+      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :w :r10 :r0 -68)]
+
+      [(asm/jmp :protocol_tc_dispatch)]
+
+      ;; =====================================================================
+      ;; IPv6 Path: Parse IPv6 header and build unified conntrack key
+      ;; =====================================================================
+      [(asm/label :ipv6_tc_path)]
+
+      ;; Store address family (6 = IPv6)
+      [(dsl/mov :r0 6)
+       (dsl/stx :b :r10 :r0 -62)]
+
+      ;; Check IPv6 header bounds (fixed 40 bytes)
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (asm/jmp-reg :jgt :r0 :r8 :pass_unified)]
+
+      ;; Get IPv6 header pointer
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)]
+
+      ;; Load and store Next Header (protocol)
+      [(dsl/ldx :b :r0 :r9 common/IPV6-OFF-NEXT-HEADER)
+       (dsl/stx :b :r10 :r0 -61)]
+
+      ;; Load source IP (backend, 16 bytes) - store as old_src_ip
+      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
+       (dsl/stx :w :r10 :r0 -56)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
+       (dsl/stx :w :r10 :r0 -52)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
+       (dsl/stx :w :r10 :r0 -48)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
+       (dsl/stx :w :r10 :r0 -44)]
+
+      ;; key.dst_ip = backend (16 bytes)
+      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
+       (dsl/stx :w :r10 :r0 -24)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
+       (dsl/stx :w :r10 :r0 -20)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
+       (dsl/stx :w :r10 :r0 -16)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
+       (dsl/stx :w :r10 :r0 -12)]
+
+      ;; Load destination IP (client, 16 bytes) - store as key.src_ip
+      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
+       (dsl/stx :w :r10 :r0 -40)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
+       (dsl/stx :w :r10 :r0 -36)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
+       (dsl/stx :w :r10 :r0 -32)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
+       (dsl/stx :w :r10 :r0 -28)]
+
+      ;; Store L4 header offset
+      [(dsl/mov :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/stx :w :r10 :r0 -68)]
+
+      ;; Fall through to protocol dispatch
+
+      ;; =====================================================================
+      ;; PHASE 2: Protocol Dispatch
+      ;; =====================================================================
+      [(asm/label :protocol_tc_dispatch)]
+
+      [(dsl/ldx :b :r0 :r10 -61)         ; load protocol
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_tc_path_unified)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-UDP :udp_tc_path_unified)
+       (asm/jmp :pass_unified)]
+
+      ;; =====================================================================
+      ;; TCP Path: Extract ports and complete conntrack key
+      ;; =====================================================================
+      [(asm/label :tcp_tc_path_unified)]
+
+      ;; Get L4 header offset
+      [(dsl/ldx :w :r1 :r10 -68)]
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add-reg :r0 :r1)]
+
+      ;; Check TCP header bounds
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 4)
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      ;; Load ports and build reverse key
+      ;; Reply has: src=backend_port, dst=client_port
+      ;; Key needs: src_port=client_port, dst_port=backend_port
+      [(dsl/ldx :h :r1 :r0 0)            ; src_port (backend)
+       (dsl/stx :h :r10 :r1 -60)         ; old_src_port
+       (dsl/stx :h :r10 :r1 -6)]         ; key.dst_port at -40+32+2=-6
+
+      [(dsl/ldx :h :r1 :r0 2)            ; dst_port (client)
+       (dsl/stx :h :r10 :r1 -8)]         ; key.src_port at -40+32=-8
+
+      ;; Store protocol and padding
+      [(dsl/ldx :b :r0 :r10 -61)
+       (dsl/stx :b :r10 :r0 -4)          ; key.protocol
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -3)          ; pad[0]
+       (dsl/stx :h :r10 :r0 -2)]         ; pad[1-2]
+
+      [(asm/jmp :lookup_conntrack_unified)]
+
+      ;; =====================================================================
+      ;; UDP Path: Extract ports and complete conntrack key
+      ;; =====================================================================
+      [(asm/label :udp_tc_path_unified)]
+
+      [(dsl/ldx :w :r1 :r10 -68)]
+
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add-reg :r0 :r1)]
+
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 4)
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      [(dsl/ldx :h :r1 :r0 0)
+       (dsl/stx :h :r10 :r1 -60)
+       (dsl/stx :h :r10 :r1 -6)]
+
+      [(dsl/ldx :h :r1 :r0 2)
+       (dsl/stx :h :r10 :r1 -8)]
+
+      [(dsl/ldx :b :r0 :r10 -61)
+       (dsl/stx :b :r10 :r0 -4)
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -3)
+       (dsl/stx :h :r10 :r0 -2)]
+
+      ;; Fall through to lookup_conntrack_unified
+
+      ;; =====================================================================
+      ;; PHASE 3: Conntrack Lookup (40-byte key)
+      ;; =====================================================================
+      [(asm/label :lookup_conntrack_unified)]
+
+      (if conntrack-map-fd
+        (concat
+          [(dsl/ld-map-fd :r1 conntrack-map-fd)
+           (dsl/mov-reg :r2 :r10)
+           (dsl/add :r2 -40)              ; r2 = &key (40 bytes)
+           (dsl/call 1)]
+          [(asm/jmp-imm :jeq :r0 0 :pass_unified)
+           (dsl/mov-reg :r9 :r0)
+           (asm/jmp :do_snat_unified)])
+        [(asm/jmp :pass_unified)])
+
+      ;; =====================================================================
+      ;; PHASE 4: Update Stats and Load New Source Values
+      ;; =====================================================================
+      [(asm/label :do_snat_unified)]
+
+      ;; r9 = pointer to unified conntrack value (96 bytes)
+      ;; Layout: orig_dst_ip(16) + orig_dst_port(2) + pad(2) +
+      ;;         nat_dst_ip(16) + nat_dst_port(2) + pad(2) +
+      ;;         timestamps and counters
+
+      ;; Update last_seen_ns (at offset 40 in unified format)
+      [(dsl/call BPF-FUNC-ktime-get-ns)
+       (dsl/stx :dw :r9 :r0 40)]
+
+      ;; Increment packets_rev (at offset 56)
+      [(dsl/ldx :dw :r0 :r9 56)
+       (dsl/add :r0 1)
+       (dsl/stx :dw :r9 :r0 56)]
+
+      ;; Update bytes_rev (at offset 72)
+      [(dsl/ldx :w :r1 :r6 0)            ; skb->len
+       (dsl/ldx :dw :r0 :r9 72)
+       (dsl/add-reg :r0 :r1)
+       (dsl/stx :dw :r9 :r0 72)]
+
+      ;; Load new_src_ip (orig_dst_ip, 16 bytes at offset 0)
+      [(dsl/ldx :w :r0 :r9 0)
+       (dsl/stx :w :r10 :r0 -84)
+       (dsl/ldx :w :r0 :r9 4)
+       (dsl/stx :w :r10 :r0 -80)
+       (dsl/ldx :w :r0 :r9 8)
+       (dsl/stx :w :r10 :r0 -76)
+       (dsl/ldx :w :r0 :r9 12)
+       (dsl/stx :w :r10 :r0 -72)]
+
+      ;; Load new_src_port (at offset 16)
+      [(dsl/ldx :h :r0 :r9 16)
+       (dsl/stx :h :r10 :r0 -88)]
+
+      ;; Branch by address family for SNAT
+      [(dsl/ldx :b :r0 :r10 -62)
+       (asm/jmp-imm :jeq :r0 4 :ipv4_snat_unified)
+       (asm/jmp :ipv6_snat_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 SNAT: Update IP checksum, L4 checksum, write values
+      ;; =====================================================================
+      [(asm/label :ipv4_snat_unified)]
+
+      ;; Branch by protocol
+      [(dsl/ldx :b :r0 :r10 -61)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_snat_v4_unified)
+       (asm/jmp :udp_snat_v4_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 TCP SNAT
+      ;; =====================================================================
+      [(asm/label :tcp_snat_v4_unified)]
+
+      ;; For IPv4, the actual IP is at bytes 12-15 of the 16-byte field
+      ;; old_src_ip at [-44], new_src_ip at [-72]
+
+      ;; Update IP checksum for src_ip change
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN 10))
+       (dsl/ldx :w :r3 :r10 -44)         ; old_src_ip (4 bytes from unified)
+       (dsl/ldx :w :r4 :r10 -72)         ; new_src_ip (4 bytes from unified)
+       (dsl/mov :r5 4)
+       (dsl/call BPF-FUNC-l3-csum-replace)]
+
+      ;; Update TCP checksum for src_ip (pseudo-header)
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 16))
+       (dsl/ldx :w :r3 :r10 -44)
+       (dsl/ldx :w :r4 :r10 -72)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Update TCP checksum for src_port
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 16))
+       (dsl/ldx :h :r3 :r10 -60)
+       (dsl/ldx :h :r4 :r10 -88)
+       (dsl/mov :r5 2)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Write new values
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 54)
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -72)
+       (dsl/stx :w :r9 :r1 12)]          ; ip->saddr
+
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -88)
+       (dsl/stx :h :r0 :r1 0)]           ; tcp->sport
+
+      [(asm/jmp :done_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 UDP SNAT
+      ;; =====================================================================
+      [(asm/label :udp_snat_v4_unified)]
+
+      ;; Update IP checksum
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN 10))
+       (dsl/ldx :w :r3 :r10 -44)
+       (dsl/ldx :w :r4 :r10 -72)
+       (dsl/mov :r5 4)
+       (dsl/call BPF-FUNC-l3-csum-replace)]
+
+      ;; Check if UDP checksum is enabled
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r0 6)]
+      [(asm/jmp-imm :jeq :r1 0 :udp_write_v4_unified)]
+
+      ;; Update UDP checksum
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 6))
+       (dsl/ldx :w :r3 :r10 -44)
+       (dsl/ldx :w :r4 :r10 -72)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN net/IPV4-MIN-HLEN 6))
+       (dsl/ldx :h :r3 :r10 -60)
+       (dsl/ldx :h :r4 :r10 -88)
+       (dsl/mov :r5 2)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(asm/label :udp_write_v4_unified)]
+
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -72)
+       (dsl/stx :w :r9 :r1 12)]
+
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -88)
+       (dsl/stx :h :r0 :r1 0)]
+
+      [(asm/jmp :done_unified)]
+
+      ;; =====================================================================
+      ;; IPv6 SNAT: No IP checksum, only L4 checksum
+      ;; =====================================================================
+      [(asm/label :ipv6_snat_unified)]
+
+      [(dsl/ldx :b :r0 :r10 -61)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_snat_v6_unified)
+       (asm/jmp :udp_snat_v6_unified)]
+
+      ;; =====================================================================
+      ;; IPv6 TCP SNAT
+      ;; =====================================================================
+      [(asm/label :tcp_snat_v6_unified)]
+
+      ;; For IPv6, we need to update TCP checksum for 16-byte address change
+      ;; TC program can use l4_csum_replace, but we need multiple calls for 16-byte data
+      ;; old_src_ip at [-56..-41], new_src_ip at [-84..-69]
+
+      ;; Update TCP checksum for each 4-byte word of the 16-byte address
+      ;; Word 0
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 16))
+       (dsl/ldx :w :r3 :r10 -56)
+       (dsl/ldx :w :r4 :r10 -84)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Word 1
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 16))
+       (dsl/ldx :w :r3 :r10 -52)
+       (dsl/ldx :w :r4 :r10 -80)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Word 2
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 16))
+       (dsl/ldx :w :r3 :r10 -48)
+       (dsl/ldx :w :r4 :r10 -76)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Word 3
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 16))
+       (dsl/ldx :w :r3 :r10 -44)
+       (dsl/ldx :w :r4 :r10 -72)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Update TCP checksum for port change
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 16))
+       (dsl/ldx :h :r3 :r10 -60)
+       (dsl/ldx :h :r4 :r10 -88)
+       (dsl/mov :r5 2)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Write new values
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 20))
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      ;; Write new src_ip to IPv6 header
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -84)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 0))
+       (dsl/ldx :w :r1 :r10 -80)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 4))
+       (dsl/ldx :w :r1 :r10 -76)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 8))
+       (dsl/ldx :w :r1 :r10 -72)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 12))]
+
+      ;; Write new src_port to TCP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/ldx :h :r1 :r10 -88)
+       (dsl/stx :h :r0 :r1 0)]
+
+      [(asm/jmp :done_unified)]
+
+      ;; =====================================================================
+      ;; IPv6 UDP SNAT
+      ;; =====================================================================
+      [(asm/label :udp_snat_v6_unified)]
+
+      ;; Check UDP checksum (mandatory for IPv6, but check anyway)
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 8))
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/ldx :h :r1 :r0 6)]
+      [(asm/jmp-imm :jeq :r1 0 :udp_write_v6_unified)]
+
+      ;; Update UDP checksum for 16-byte address (4 words)
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 6))
+       (dsl/ldx :w :r3 :r10 -56)
+       (dsl/ldx :w :r4 :r10 -84)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 6))
+       (dsl/ldx :w :r3 :r10 -52)
+       (dsl/ldx :w :r4 :r10 -80)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 6))
+       (dsl/ldx :w :r3 :r10 -48)
+       (dsl/ldx :w :r4 :r10 -76)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 6))
+       (dsl/ldx :w :r3 :r10 -44)
+       (dsl/ldx :w :r4 :r10 -72)
+       (dsl/mov :r5 (bit-or BPF-F-PSEUDO-HDR 4))
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      ;; Update UDP checksum for port change
+      [(dsl/mov-reg :r1 :r6)
+       (dsl/mov :r2 (+ net/ETH-HLEN common/IPV6-HLEN 6))
+       (dsl/ldx :h :r3 :r10 -60)
+       (dsl/ldx :h :r4 :r10 -88)
+       (dsl/mov :r5 2)
+       (dsl/call BPF-FUNC-l4-csum-replace)]
+
+      [(asm/label :udp_write_v6_unified)]
+
+      (tc-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 8))
+       (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
+
+      ;; Write new src_ip
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -84)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 0))
+       (dsl/ldx :w :r1 :r10 -80)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 4))
+       (dsl/ldx :w :r1 :r10 -76)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 8))
+       (dsl/ldx :w :r1 :r10 -72)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 12))]
+
+      ;; Write new src_port
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/ldx :h :r1 :r10 -88)
+       (dsl/stx :h :r0 :r1 0)]
+
+      ;; Fall through to done_unified
+
+      ;; =====================================================================
+      ;; Return TC_ACT_OK
+      ;; =====================================================================
+      [(asm/label :done_unified)]
+      (net/return-action net/TC-ACT-OK)
+
+      [(asm/label :pass_unified)]
+      (net/return-action net/TC-ACT-OK))))
+
+(defn build-tc-egress-program-unified
+  "Build the unified TC egress program for IPv4/IPv6 dual-stack.
+
+   Performs SNAT on reply packets from backends:
+   1. Branches on EtherType (IPv4 or IPv6)
+   2. Builds reverse 5-tuple key with unified format
+   3. Looks up unified conntrack map
+   4. If found, rewrites source IP/port
+   5. Updates checksums
+   6. Returns TC_ACT_OK
+
+   map-fds: Map containing unified :conntrack-map"
+  [map-fds]
+  (let [conntrack-map-fd (when (and (map? map-fds) (:conntrack-map map-fds))
+                           (common/map-fd (:conntrack-map map-fds)))]
+    (build-tc-snat-program-unified conntrack-map-fd)))
+
+(defn load-program-unified
+  "Load the unified TC egress program for IPv4/IPv6 dual-stack.
+   Returns a BpfProgram record."
+  [maps]
+  (log/info "Loading unified TC egress program (IPv4/IPv6)")
+  (let [bytecode (build-tc-egress-program-unified maps)]
+    (require '[clj-ebpf.programs :as programs])
+    ((resolve 'clj-ebpf.programs/load-program)
+      {:insns bytecode
+       :prog-type :sched-cls
+       :prog-name "tc_egress_v6"
+       :license "GPL"
+       :log-level 1})))
 
 (defn build-tc-egress-program
   "Build the TC egress program.

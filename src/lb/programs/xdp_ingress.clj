@@ -26,7 +26,7 @@
 ;; r9 = IP header pointer / map value ptr (callee-saved)
 ;; r0-r5 = scratch, clobbered by helper calls
 
-;; Stack layout (negative offsets from r10):
+;; Stack layout for IPv4 (negative offsets from r10):
 ;; -8   : Listen map key (8 bytes: ifindex(4) + port(2) + pad(2))
 ;; -16  : LPM key (8 bytes: prefix_len(4) + ip(4))
 ;; -24  : old_dst_ip (4 bytes)
@@ -58,6 +58,31 @@
 ;;        offset 40: packets_rev (8) - reverse direction packet count
 ;;        offset 48: bytes_fwd (8) - forward direction byte count
 ;;        offset 56: bytes_rev (8) - reverse direction byte count
+;;
+;; ============================================================================
+;; Unified stack layout for IPv4/IPv6 dual-stack (used by build-xdp-dnat-program-unified):
+;; ============================================================================
+;; -8   : Listen map key (8 bytes: ifindex(4) + port(2) + af(1) + pad(1))
+;; -28  : LPM key (20 bytes: prefix_len(4) + ip(16))
+;; -44  : old_dst_ip (16 bytes)
+;; -48  : old_dst_port (2 bytes) + pad (2 bytes)
+;; -64  : nat_dst_ip (16 bytes) - SELECTED target IP
+;; -68  : nat_dst_port (2 bytes) + pad (2 bytes)
+;; -84  : src_ip (16 bytes)
+;; -100 : dst_ip original (16 bytes)
+;; -102 : src_port (2 bytes)
+;; -104 : dst_port original (2 bytes)
+;; -105 : protocol (1 byte)
+;; -106 : af (1 byte) - 4 = IPv4, 6 = IPv6
+;; -108 : pad (2 bytes)
+;; -112 : L4 header offset from data (4 bytes)
+;; -116 : target_count (4 bytes)
+;; -120 : random_value (4 bytes)
+;; -128 : checksum scratch (8 bytes)
+;; -136 : additional scratch (8 bytes)
+;; -144 : SNI key for map lookup (8 bytes: hostname_hash)
+;; -184 : Conntrack key (40 bytes: src_ip(16) + dst_ip(16) + ports(4) + proto(1) + pad(3))
+;; -280 : Conntrack value (96 bytes): see unified conntrack format in maps.clj
 
 ;;; =============================================================================
 ;;; Simple Pass-Through XDP Program
@@ -1036,6 +1061,840 @@
 
       [(asm/label :pass)]
       (net/return-action net/XDP-PASS))))
+
+;;; =============================================================================
+;;; Unified XDP Ingress Program with IPv4/IPv6 Dual-Stack Support
+;;; =============================================================================
+
+(defn build-xdp-dnat-program-unified
+  "Build unified XDP ingress program that performs DNAT on both IPv4 and IPv6 packets.
+
+   This program supports dual-stack operation:
+   1. Parses EtherType and branches for IPv4 or IPv6
+   2. For IPv4: Parses 20-byte min header, stores addresses in 16-byte unified format
+   3. For IPv6: Parses fixed 40-byte header
+   4. Applies NAT using unified maps
+   5. Updates checksums (IP header checksum for IPv4 only)
+   6. Creates unified conntrack entries
+
+   Uses unified map formats:
+   - Listen map key: 8 bytes (ifindex(4) + port(2) + af(1) + pad(1))
+   - LPM key: 20 bytes (prefix_len(4) + ip(16))
+   - Route value: 168 bytes (header(8) + 8 targets × 20 bytes each)
+   - Conntrack key: 40 bytes
+   - Conntrack value: 96 bytes
+
+   Register allocation:
+   r6 = saved XDP context (callee-saved)
+   r7 = data pointer (callee-saved)
+   r8 = data_end pointer (callee-saved)
+   r9 = IP header pointer / map value ptr (callee-saved)
+   r0-r5 = scratch, clobbered by helpers"
+  [listen-map-fd config-map-fd sni-map-fd conntrack-map-fd
+   rate-limit-config-fd rate-limit-src-fd rate-limit-backend-fd]
+  (asm/assemble-with-labels
+    (concat
+      ;; =====================================================================
+      ;; PHASE 1: Context Setup and Ethernet Parsing
+      ;; =====================================================================
+
+      ;; Save XDP context to callee-saved register
+      [(dsl/mov-reg :r6 :r1)]
+
+      ;; Load data and data_end pointers from XDP context
+      (xdp-load-data-ptrs-32 :r7 :r8 :r1)
+
+      ;; Check Ethernet header bounds
+      (asm/check-bounds :r7 :r8 net/ETH-HLEN :pass :r9)
+
+      ;; Load ethertype
+      (eth/load-ethertype :r9 :r7)
+
+      ;; Branch on EtherType: IPv4 or IPv6
+      [(asm/jmp-imm :jeq :r9 common/ETH-P-IP-BE :ipv4_path)
+       (asm/jmp-imm :jeq :r9 common/ETH-P-IPV6-BE :ipv6_path)
+       (asm/jmp :pass)]
+
+      ;; =====================================================================
+      ;; IPv4 Path: Parse IPv4 header and store in unified format
+      ;; =====================================================================
+      [(asm/label :ipv4_path)]
+
+      ;; Store address family (4 = IPv4)
+      [(dsl/mov :r0 4)
+       (dsl/stx :b :r10 :r0 -106)]
+
+      ;; Calculate IP header pointer: data + ETH_HLEN
+      (eth/get-ip-header-ptr :r9 :r7)
+
+      ;; Check IP header bounds (minimum 20 bytes)
+      (asm/check-bounds :r9 :r8 net/IPV4-MIN-HLEN :pass :r0)
+
+      ;; Load and store protocol
+      [(dsl/ldx :b :r0 :r9 9)           ; protocol at offset 9
+       (dsl/stx :b :r10 :r0 -105)]      ; store at stack[-105]
+
+      ;; Load source IP (4 bytes) and store in unified format (16 bytes)
+      ;; Zero first 12 bytes, then store 4-byte IP
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -84)       ; zero bytes 0-7 of src_ip
+       (dsl/stx :w :r10 :r0 -76)        ; zero bytes 8-11 of src_ip
+       (dsl/ldx :w :r0 :r9 12)          ; load src_ip (4 bytes)
+       (dsl/stx :w :r10 :r0 -72)]       ; store at bytes 12-15 (offset -84+12 = -72)
+
+      ;; Load destination IP and store in unified format
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -44)       ; zero bytes 0-7 of old_dst_ip
+       (dsl/stx :w :r10 :r0 -36)        ; zero bytes 8-11 of old_dst_ip
+       (dsl/ldx :w :r0 :r9 16)          ; load dst_ip (4 bytes)
+       (dsl/stx :w :r10 :r0 -32)]       ; store at bytes 12-15 of old_dst_ip
+
+      ;; Also store original dst_ip for conntrack
+      [(dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -100)      ; zero bytes 0-7 of dst_ip_orig
+       (dsl/stx :w :r10 :r0 -92)        ; zero bytes 8-11 of dst_ip_orig
+       (dsl/ldx :w :r0 :r9 16)          ; load dst_ip again
+       (dsl/stx :w :r10 :r0 -88)]       ; store at bytes 12-15 of dst_ip_orig
+
+      ;; Calculate L4 header offset (ETH_HLEN + 20 for min IP header)
+      [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :w :r10 :r0 -112)]
+
+      [(asm/jmp :protocol_dispatch)]
+
+      ;; =====================================================================
+      ;; IPv6 Path: Parse IPv6 header (fixed 40 bytes)
+      ;; =====================================================================
+      [(asm/label :ipv6_path)]
+
+      ;; Store address family (6 = IPv6)
+      [(dsl/mov :r0 6)
+       (dsl/stx :b :r10 :r0 -106)]
+
+      ;; Check IPv6 header bounds (fixed 40 bytes)
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (asm/jmp-reg :jgt :r0 :r8 :pass)]
+
+      ;; Get IPv6 header pointer
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)]
+
+      ;; Load and store Next Header (protocol) at offset 6
+      [(dsl/ldx :b :r0 :r9 common/IPV6-OFF-NEXT-HEADER)
+       (dsl/stx :b :r10 :r0 -105)]
+
+      ;; Load source IP (16 bytes) at offset 8
+      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
+       (dsl/stx :w :r10 :r0 -84)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
+       (dsl/stx :w :r10 :r0 -80)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
+       (dsl/stx :w :r10 :r0 -76)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
+       (dsl/stx :w :r10 :r0 -72)]
+
+      ;; Load destination IP (16 bytes) at offset 24 - store as old_dst_ip
+      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
+       (dsl/stx :w :r10 :r0 -44)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
+       (dsl/stx :w :r10 :r0 -40)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
+       (dsl/stx :w :r10 :r0 -36)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
+       (dsl/stx :w :r10 :r0 -32)]
+
+      ;; Also store as dst_ip_orig for conntrack
+      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
+       (dsl/stx :w :r10 :r0 -100)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
+       (dsl/stx :w :r10 :r0 -96)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
+       (dsl/stx :w :r10 :r0 -92)
+       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
+       (dsl/stx :w :r10 :r0 -88)]
+
+      ;; Calculate L4 header offset (ETH_HLEN + 40 for IPv6 header)
+      [(dsl/mov :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/stx :w :r10 :r0 -112)]
+
+      ;; Fall through to protocol dispatch
+
+      ;; =====================================================================
+      ;; PHASE 2: Protocol Dispatch (TCP/UDP)
+      ;; =====================================================================
+      [(asm/label :protocol_dispatch)]
+
+      [(dsl/ldx :b :r0 :r10 -105)       ; load protocol
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_path_unified)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-UDP :udp_path_unified)
+       (asm/jmp :pass)]
+
+      ;; =====================================================================
+      ;; TCP Path: Parse TCP header and extract ports
+      ;; =====================================================================
+      [(asm/label :tcp_path_unified)]
+
+      ;; Get L4 header offset from stack
+      [(dsl/ldx :w :r1 :r10 -112)]      ; r1 = L4 offset
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add-reg :r0 :r1)]           ; r0 = data + L4 offset
+
+      ;; Check TCP header bounds (need at least 20 bytes)
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 20)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Load TCP ports
+      [(dsl/ldx :h :r1 :r0 0)           ; src_port at offset 0
+       (dsl/stx :h :r10 :r1 -102)       ; store at stack[-102]
+       (dsl/ldx :h :r1 :r0 2)           ; dst_port at offset 2
+       (dsl/stx :h :r10 :r1 -48)        ; store at stack[-48] (old_dst_port)
+       (dsl/stx :h :r10 :r1 -104)]      ; store at stack[-104] (for conntrack)
+
+      [(asm/jmp :lookup_listen_unified)]
+
+      ;; =====================================================================
+      ;; UDP Path: Parse UDP header and extract ports
+      ;; =====================================================================
+      [(asm/label :udp_path_unified)]
+
+      ;; Get L4 header offset from stack
+      [(dsl/ldx :w :r1 :r10 -112)]
+
+      ;; Calculate L4 header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add-reg :r0 :r1)]
+
+      ;; Check UDP header bounds (need at least 8 bytes)
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/add :r1 8)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Load UDP ports
+      [(dsl/ldx :h :r1 :r0 0)           ; src_port
+       (dsl/stx :h :r10 :r1 -102)
+       (dsl/ldx :h :r1 :r0 2)           ; dst_port
+       (dsl/stx :h :r10 :r1 -48)        ; old_dst_port
+       (dsl/stx :h :r10 :r1 -104)]
+
+      ;; Fall through to lookup_listen_unified
+
+      ;; =====================================================================
+      ;; PHASE 3: Listen Map Lookup (Unified)
+      ;; =====================================================================
+      [(asm/label :lookup_listen_unified)]
+
+      ;; Build listen map key at stack[-8]: {ifindex(4) + port(2) + af(1) + pad(1)}
+      [(dsl/ldx :w :r0 :r6 12)          ; r0 = ifindex from xdp_md
+       (dsl/stx :w :r10 :r0 -8)         ; key.ifindex
+       (dsl/ldx :h :r0 :r10 -48)        ; r0 = dst_port (old)
+       (dsl/stx :h :r10 :r0 -4)         ; key.port
+       (dsl/ldx :b :r0 :r10 -106)       ; r0 = af
+       (dsl/stx :b :r10 :r0 -2)         ; key.af
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -1)]        ; key.pad
+
+      ;; Call bpf_map_lookup_elem(listen_map, &key)
+      (if listen-map-fd
+        (concat
+          [(dsl/ld-map-fd :r1 listen-map-fd)
+           (dsl/mov-reg :r2 :r10)
+           (dsl/add :r2 -8)
+           (dsl/call 1)]                 ; bpf_map_lookup_elem
+          [(asm/jmp-imm :jeq :r0 0 :pass)
+           (dsl/mov-reg :r9 :r0)         ; r9 = map value ptr
+           (asm/jmp :do_nat_unified)])
+        [(asm/jmp :pass)])
+
+      ;; =====================================================================
+      ;; PHASE 4: Weighted Target Selection (Unified - 20-byte targets)
+      ;; =====================================================================
+      [(asm/label :do_nat_unified)]
+
+      ;; r9 = pointer to map value (unified weighted route format, 168 bytes):
+      ;; Header (8 bytes): target_count(1) + reserved(3) + flags(2) + reserved(2)
+      ;; Per target (20 bytes each): ip(16) + port(2) + cumulative_weight(2)
+
+      ;; Load target_count from header byte 0
+      [(dsl/ldx :b :r0 :r9 0)           ; r0 = target_count (1-8)
+       (dsl/stx :w :r10 :r0 -116)]      ; store at stack[-116]
+
+      ;; If target_count == 1, skip weighted selection
+      [(asm/jmp-imm :jeq :r0 1 :single_target_unified)]
+
+      ;; Multiple targets: use random selection (simplified for now)
+      [(dsl/call common/BPF-FUNC-get-prandom-u32)]
+      [(dsl/mod :r0 100)
+       (dsl/stx :w :r10 :r0 -120)]      ; store random value
+
+      ;; Loop through targets comparing with cumulative weights
+      ;; Target entries start at offset 8, each is 20 bytes
+      [(dsl/mov :r0 0)                  ; loop counter
+       (dsl/mov :r1 8)]                 ; first target at offset 8
+
+      [(asm/label :weight_loop_unified)]
+
+      ;; Check loop bound
+      [(asm/jmp-imm :jge :r0 8 :single_target_unified)]
+
+      ;; Check against actual target_count
+      [(dsl/ldx :w :r3 :r10 -116)
+       (asm/jmp-reg :jge :r0 :r3 :single_target_unified)]
+
+      ;; Calculate target offset: 8 + (counter * 20)
+      ;; Using multiply: counter * 20 = counter * 4 * 5 = (counter << 2) * 5
+      ;; Or simpler: counter * 16 + counter * 4 = counter * 20
+      [(dsl/mov-reg :r1 :r0)
+       (dsl/lsh :r1 4)                  ; r1 = counter * 16
+       (dsl/mov-reg :r2 :r0)
+       (dsl/lsh :r2 2)                  ; r2 = counter * 4
+       (dsl/add-reg :r1 :r2)            ; r1 = counter * 20
+       (dsl/add :r1 8)]                 ; r1 = 8 + counter * 20
+
+      ;; Load cumulative_weight for this target (at offset 18 within target entry)
+      [(dsl/mov-reg :r2 :r9)
+       (dsl/add-reg :r2 :r1)            ; r2 = &target[i]
+       (dsl/ldx :h :r3 :r2 18)          ; r3 = cumulative_weight (at offset 18)
+       (dsl/ldx :w :r4 :r10 -120)]      ; r4 = random value
+
+      ;; If random < cumulative_weight, select this target
+      [(asm/jmp-reg :jlt :r4 :r3 :select_target_unified)]
+
+      ;; Otherwise, continue loop
+      [(dsl/add :r0 1)
+       (asm/jmp :weight_loop_unified)]
+
+      ;; =====================================================================
+      ;; Select current target (r1 = offset within map value)
+      ;; =====================================================================
+      [(asm/label :select_target_unified)]
+
+      ;; Load selected target IP (16 bytes at offset r1+0)
+      [(dsl/mov-reg :r2 :r9)
+       (dsl/add-reg :r2 :r1)]           ; r2 = &target[selected]
+
+      ;; Copy 16-byte IP to nat_dst_ip at stack[-64]
+      [(dsl/ldx :w :r3 :r2 0)
+       (dsl/stx :w :r10 :r3 -64)
+       (dsl/ldx :w :r3 :r2 4)
+       (dsl/stx :w :r10 :r3 -60)
+       (dsl/ldx :w :r3 :r2 8)
+       (dsl/stx :w :r10 :r3 -56)
+       (dsl/ldx :w :r3 :r2 12)
+       (dsl/stx :w :r10 :r3 -52)]
+
+      ;; Load port at offset 16
+      [(dsl/ldx :h :r3 :r2 16)
+       (dsl/stx :h :r10 :r3 -68)]       ; nat_dst_port
+
+      [(asm/jmp :do_checksum_unified)]
+
+      ;; =====================================================================
+      ;; Single target: use first target at offset 8
+      ;; =====================================================================
+      [(asm/label :single_target_unified)]
+
+      ;; Load first target IP (16 bytes)
+      [(dsl/ldx :w :r1 :r9 8)
+       (dsl/stx :w :r10 :r1 -64)
+       (dsl/ldx :w :r1 :r9 12)
+       (dsl/stx :w :r10 :r1 -60)
+       (dsl/ldx :w :r1 :r9 16)
+       (dsl/stx :w :r10 :r1 -56)
+       (dsl/ldx :w :r1 :r9 20)
+       (dsl/stx :w :r10 :r1 -52)]
+
+      ;; Load port at offset 24 (8 + 16)
+      [(dsl/ldx :h :r2 :r9 24)
+       (dsl/stx :h :r10 :r2 -68)]
+
+      ;; Fall through to do_checksum_unified
+
+      ;; =====================================================================
+      ;; PHASE 5: Checksum Update and NAT
+      ;; =====================================================================
+      [(asm/label :do_checksum_unified)]
+
+      ;; Branch by address family for checksum
+      [(dsl/ldx :b :r0 :r10 -106)       ; load af
+       (asm/jmp-imm :jeq :r0 4 :ipv4_nat_unified)
+       (asm/jmp :ipv6_nat_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 NAT: Update IP checksum, L4 checksum, write values
+      ;; =====================================================================
+      [(asm/label :ipv4_nat_unified)]
+
+      ;; Branch by protocol
+      [(dsl/ldx :b :r0 :r10 -105)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_nat_unified)
+       (asm/jmp :udp_nat_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 TCP NAT
+      ;; =====================================================================
+      [(asm/label :tcp_nat_unified)]
+
+      ;; Re-validate packet bounds
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 54)                 ; ETH(14) + IP(20) + TCP(20)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Get IP header pointer
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)]
+
+      ;; For IPv4, we store the 4-byte IP at offset 12 in the 16-byte field
+      ;; old_dst_ip at stack[-44..-29]: actual IP at [-32] (offset 12)
+      ;; nat_dst_ip at stack[-64..-49]: actual IP at [-52] (offset 12)
+
+      ;; Update IP checksum using bpf_csum_diff
+      ;; old value at stack[-32] (4 bytes), new value at stack[-52] (4 bytes)
+      [(dsl/mov-reg :r1 :r10)
+       (dsl/add :r1 -32)                ; r1 = &old_dst_ip (4 bytes)
+       (dsl/mov :r2 4)
+       (dsl/mov-reg :r3 :r10)
+       (dsl/add :r3 -52)                ; r3 = &new_dst_ip (4 bytes)
+       (dsl/mov :r4 4)
+       (dsl/mov :r5 0)
+       (dsl/call BPF-FUNC-csum-diff)]
+
+      ;; Save diff for L4 checksum
+      [(dsl/stx :w :r10 :r0 -128)]
+
+      ;; Re-validate bounds
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 54)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Apply diff to IP checksum
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :h :r1 :r9 10)          ; old IP checksum
+       (dsl/ldx :w :r2 :r10 -128)]      ; diff
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+      [(dsl/stx :h :r9 :r1 10)]         ; store new IP checksum
+
+      ;; Update TCP checksum
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r0 16)]         ; old TCP checksum
+
+      ;; Apply IP diff
+      [(dsl/ldx :w :r2 :r10 -128)]
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+
+      ;; Apply port diff
+      [(dsl/ldx :h :r2 :r10 -48)        ; old_dst_port
+       (dsl/ldx :h :r3 :r10 -68)]       ; new_dst_port
+      (xdp-update-csum-for-port-change :r1 :r2 :r3 :r4)
+
+      ;; Store new TCP checksum
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :h :r0 :r1 16)]
+
+      ;; Write new dst_ip to IP header (4 bytes from stack[-52])
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -52)        ; new_dst_ip (4 bytes)
+       (dsl/stx :w :r9 :r1 16)]         ; ip->daddr
+
+      ;; Write new dst_port to TCP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -68)
+       (dsl/stx :h :r0 :r1 2)]
+
+      [(asm/jmp :create_conntrack_unified)]
+
+      ;; =====================================================================
+      ;; IPv4 UDP NAT
+      ;; =====================================================================
+      [(asm/label :udp_nat_unified)]
+
+      ;; Re-validate packet bounds
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)                 ; ETH(14) + IP(20) + UDP(8)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Get IP header pointer
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)]
+
+      ;; Update IP checksum
+      [(dsl/mov-reg :r1 :r10)
+       (dsl/add :r1 -32)
+       (dsl/mov :r2 4)
+       (dsl/mov-reg :r3 :r10)
+       (dsl/add :r3 -52)
+       (dsl/mov :r4 4)
+       (dsl/mov :r5 0)
+       (dsl/call BPF-FUNC-csum-diff)]
+      [(dsl/stx :w :r10 :r0 -128)]
+
+      ;; Re-validate and apply
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 42)
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :h :r1 :r9 10)
+       (dsl/ldx :w :r2 :r10 -128)]
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+      [(dsl/stx :h :r9 :r1 10)]
+
+      ;; Update UDP checksum if non-zero
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r0 6)]
+      [(asm/jmp-imm :jeq :r1 0 :udp_write_values_unified)]
+
+      [(dsl/ldx :w :r2 :r10 -128)]
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+      [(dsl/ldx :h :r2 :r10 -48)
+       (dsl/ldx :h :r3 :r10 -68)]
+      (xdp-update-csum-for-port-change :r1 :r2 :r3 :r4)
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/stx :h :r0 :r1 6)]
+
+      [(asm/label :udp_write_values_unified)]
+
+      ;; Write new dst_ip to IP header
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -52)
+       (dsl/stx :w :r9 :r1 16)]
+
+      ;; Write new dst_port to UDP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
+       (dsl/ldx :h :r1 :r10 -68)
+       (dsl/stx :h :r0 :r1 2)]
+
+      [(asm/jmp :create_conntrack_unified)]
+
+      ;; =====================================================================
+      ;; IPv6 NAT: No IP checksum, only L4 checksum update
+      ;; =====================================================================
+      [(asm/label :ipv6_nat_unified)]
+
+      ;; Branch by protocol
+      [(dsl/ldx :b :r0 :r10 -105)
+       (asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :tcp_nat_ipv6)
+       (asm/jmp :udp_nat_ipv6)]
+
+      ;; =====================================================================
+      ;; IPv6 TCP NAT
+      ;; =====================================================================
+      [(asm/label :tcp_nat_ipv6)]
+
+      ;; Re-validate packet bounds
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 20)) ; ETH + IPv6 + TCP min
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; For IPv6, we need to update TCP checksum for:
+      ;; 1. Destination address change (16 bytes)
+      ;; 2. Destination port change (2 bytes)
+
+      ;; Calculate checksum diff for 16-byte IP address
+      ;; old_dst_ip at stack[-44..-29], new at stack[-64..-49]
+      [(dsl/mov-reg :r1 :r10)
+       (dsl/add :r1 -44)                ; old dst IP (16 bytes)
+       (dsl/mov :r2 16)
+       (dsl/mov-reg :r3 :r10)
+       (dsl/add :r3 -64)                ; new dst IP (16 bytes)
+       (dsl/mov :r4 16)
+       (dsl/mov :r5 0)
+       (dsl/call BPF-FUNC-csum-diff)]
+      [(dsl/stx :w :r10 :r0 -128)]      ; save diff
+
+      ;; Re-validate bounds
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 20))
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Get TCP header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))]
+
+      ;; Load old TCP checksum
+      [(dsl/ldx :h :r1 :r0 16)]
+
+      ;; Apply IP diff
+      [(dsl/ldx :w :r2 :r10 -128)]
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+
+      ;; Apply port diff
+      [(dsl/ldx :h :r2 :r10 -48)        ; old_dst_port
+       (dsl/ldx :h :r3 :r10 -68)]       ; new_dst_port
+      (xdp-update-csum-for-port-change :r1 :r2 :r3 :r4)
+
+      ;; Store new TCP checksum
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/stx :h :r0 :r1 16)]
+
+      ;; Write new destination IP to IPv6 header (16 bytes at offset 24)
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -64)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 0))
+       (dsl/ldx :w :r1 :r10 -60)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 4))
+       (dsl/ldx :w :r1 :r10 -56)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 8))
+       (dsl/ldx :w :r1 :r10 -52)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 12))]
+
+      ;; Write new dst_port to TCP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/ldx :h :r1 :r10 -68)
+       (dsl/stx :h :r0 :r1 2)]
+
+      [(asm/jmp :create_conntrack_unified)]
+
+      ;; =====================================================================
+      ;; IPv6 UDP NAT
+      ;; =====================================================================
+      [(asm/label :udp_nat_ipv6)]
+
+      ;; Re-validate packet bounds
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 8)) ; ETH + IPv6 + UDP
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Calculate checksum diff for 16-byte IP
+      [(dsl/mov-reg :r1 :r10)
+       (dsl/add :r1 -44)
+       (dsl/mov :r2 16)
+       (dsl/mov-reg :r3 :r10)
+       (dsl/add :r3 -64)
+       (dsl/mov :r4 16)
+       (dsl/mov :r5 0)
+       (dsl/call BPF-FUNC-csum-diff)]
+      [(dsl/stx :w :r10 :r0 -128)]
+
+      ;; Re-validate
+      (xdp-load-data-ptrs-32 :r7 :r8 :r6)
+      [(dsl/mov-reg :r1 :r7)
+       (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 8))
+       (asm/jmp-reg :jgt :r1 :r8 :pass)]
+
+      ;; Get UDP header pointer
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))]
+
+      ;; Load UDP checksum - for IPv6 UDP checksum is mandatory (non-zero)
+      [(dsl/ldx :h :r1 :r0 6)]
+      [(asm/jmp-imm :jeq :r1 0 :udp_write_values_ipv6)]
+
+      ;; Apply IP diff
+      [(dsl/ldx :w :r2 :r10 -128)]
+      (xdp-apply-csum-diff :r1 :r2 :r3)
+
+      ;; Apply port diff
+      [(dsl/ldx :h :r2 :r10 -48)
+       (dsl/ldx :h :r3 :r10 -68)]
+      (xdp-update-csum-for-port-change :r1 :r2 :r3 :r4)
+
+      ;; Store new UDP checksum
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/stx :h :r0 :r1 6)]
+
+      [(asm/label :udp_write_values_ipv6)]
+
+      ;; Write new destination IP to IPv6 header
+      [(dsl/mov-reg :r9 :r7)
+       (dsl/add :r9 net/ETH-HLEN)
+       (dsl/ldx :w :r1 :r10 -64)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 0))
+       (dsl/ldx :w :r1 :r10 -60)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 4))
+       (dsl/ldx :w :r1 :r10 -56)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 8))
+       (dsl/ldx :w :r1 :r10 -52)
+       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-DST 12))]
+
+      ;; Write new dst_port to UDP header
+      [(dsl/mov-reg :r0 :r7)
+       (dsl/add :r0 (+ net/ETH-HLEN common/IPV6-HLEN))
+       (dsl/ldx :h :r1 :r10 -68)
+       (dsl/stx :h :r0 :r1 2)]
+
+      ;; Fall through to create_conntrack_unified
+
+      ;; =====================================================================
+      ;; PHASE 6: Create Unified Conntrack Entry (40-byte key, 96-byte value)
+      ;; =====================================================================
+      [(asm/label :create_conntrack_unified)]
+
+      ;; Build conntrack key at stack[-184] (40 bytes)
+      ;; Layout: src_ip(16) + dst_ip(16) + src_port(2) + dst_port(2) + proto(1) + pad(3)
+
+      ;; Copy src_ip (16 bytes) from stack[-84..-69]
+      [(dsl/ldx :w :r0 :r10 -84)
+       (dsl/stx :w :r10 :r0 -184)
+       (dsl/ldx :w :r0 :r10 -80)
+       (dsl/stx :w :r10 :r0 -180)
+       (dsl/ldx :w :r0 :r10 -76)
+       (dsl/stx :w :r10 :r0 -176)
+       (dsl/ldx :w :r0 :r10 -72)
+       (dsl/stx :w :r10 :r0 -172)]
+
+      ;; Copy nat_dst_ip (16 bytes) from stack[-64..-49]
+      [(dsl/ldx :w :r0 :r10 -64)
+       (dsl/stx :w :r10 :r0 -168)
+       (dsl/ldx :w :r0 :r10 -60)
+       (dsl/stx :w :r10 :r0 -164)
+       (dsl/ldx :w :r0 :r10 -56)
+       (dsl/stx :w :r10 :r0 -160)
+       (dsl/ldx :w :r0 :r10 -52)
+       (dsl/stx :w :r10 :r0 -156)]
+
+      ;; Copy ports and protocol
+      [(dsl/ldx :h :r0 :r10 -102)       ; src_port
+       (dsl/stx :h :r10 :r0 -152)
+       (dsl/ldx :h :r0 :r10 -68)        ; nat_dst_port
+       (dsl/stx :h :r10 :r0 -150)
+       (dsl/ldx :b :r0 :r10 -105)       ; protocol
+       (dsl/stx :b :r10 :r0 -148)
+       (dsl/mov :r0 0)
+       (dsl/stx :b :r10 :r0 -147)       ; pad[0]
+       (dsl/stx :h :r10 :r0 -146)]      ; pad[1-2]
+
+      ;; Build conntrack value at stack[-280] (96 bytes)
+      ;; Layout: orig_dst_ip(16) + orig_dst_port(2) + pad(2) +
+      ;;         nat_dst_ip(16) + nat_dst_port(2) + pad(2) +
+      ;;         created_ns(8) + last_seen_ns(8) +
+      ;;         packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8)
+
+      ;; Copy orig_dst_ip (old_dst_ip from stack[-44..-29])
+      [(dsl/ldx :w :r0 :r10 -44)
+       (dsl/stx :w :r10 :r0 -280)
+       (dsl/ldx :w :r0 :r10 -40)
+       (dsl/stx :w :r10 :r0 -276)
+       (dsl/ldx :w :r0 :r10 -36)
+       (dsl/stx :w :r10 :r0 -272)
+       (dsl/ldx :w :r0 :r10 -32)
+       (dsl/stx :w :r10 :r0 -268)]
+
+      ;; orig_dst_port and pad
+      [(dsl/ldx :h :r0 :r10 -48)        ; old_dst_port
+       (dsl/stx :h :r10 :r0 -264)
+       (dsl/mov :r0 0)
+       (dsl/stx :h :r10 :r0 -262)]      ; pad
+
+      ;; Copy nat_dst_ip
+      [(dsl/ldx :w :r0 :r10 -64)
+       (dsl/stx :w :r10 :r0 -260)
+       (dsl/ldx :w :r0 :r10 -60)
+       (dsl/stx :w :r10 :r0 -256)
+       (dsl/ldx :w :r0 :r10 -56)
+       (dsl/stx :w :r10 :r0 -252)
+       (dsl/ldx :w :r0 :r10 -52)
+       (dsl/stx :w :r10 :r0 -248)]
+
+      ;; nat_dst_port and pad
+      [(dsl/ldx :h :r0 :r10 -68)
+       (dsl/stx :h :r10 :r0 -244)
+       (dsl/mov :r0 0)
+       (dsl/stx :h :r10 :r0 -242)]
+
+      ;; Get timestamp
+      [(dsl/call BPF-FUNC-ktime-get-ns)
+       (dsl/stx :dw :r10 :r0 -240)      ; created_ns
+       (dsl/stx :dw :r10 :r0 -232)]     ; last_seen_ns
+
+      ;; Initialize counters
+      [(dsl/mov :r0 1)
+       (dsl/stx :dw :r10 :r0 -224)      ; packets_fwd = 1
+       (dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -216)]     ; packets_rev = 0
+
+      ;; Calculate packet length
+      [(dsl/mov-reg :r0 :r8)
+       (dsl/sub-reg :r0 :r7)
+       (dsl/stx :dw :r10 :r0 -208)      ; bytes_fwd
+       (dsl/mov :r0 0)
+       (dsl/stx :dw :r10 :r0 -200)]     ; bytes_rev = 0
+
+      ;; Update conntrack map
+      (if conntrack-map-fd
+        [(dsl/ld-map-fd :r1 conntrack-map-fd)
+         (dsl/mov-reg :r2 :r10)
+         (dsl/add :r2 -184)             ; &key
+         (dsl/mov-reg :r3 :r10)
+         (dsl/add :r3 -280)             ; &value
+         (dsl/mov :r4 0)                ; BPF_ANY
+         (dsl/call 2)]                  ; bpf_map_update_elem
+        [])
+
+      ;; Return XDP_PASS
+      [(asm/label :done_unified)]
+      (net/return-action net/XDP-PASS)
+
+      [(asm/label :pass)]
+      (net/return-action net/XDP-PASS))))
+
+(defn build-xdp-ingress-program-unified
+  "Build the unified XDP ingress program for IPv4/IPv6 dual-stack.
+
+   Performs DNAT on incoming packets:
+   1. Branches on EtherType (IPv4 or IPv6)
+   2. Looks up listen map by (ifindex, dst_port, af)
+   3. If match found, rewrites destination IP/port
+   4. Updates checksums (IP header for IPv4 only, L4 for both)
+   5. Creates unified conntrack entry
+   6. Returns XDP_PASS
+
+   map-fds: Map containing unified maps from create-all-maps-unified"
+  [map-fds]
+  (let [listen-map-fd (when (and (map? map-fds) (:listen-map map-fds))
+                        (common/map-fd (:listen-map map-fds)))
+        config-map-fd (when (and (map? map-fds) (:config-map map-fds))
+                        (common/map-fd (:config-map map-fds)))
+        sni-map-fd (when (and (map? map-fds) (:sni-map map-fds))
+                     (common/map-fd (:sni-map map-fds)))
+        conntrack-map-fd (when (and (map? map-fds) (:conntrack-map map-fds))
+                           (common/map-fd (:conntrack-map map-fds)))
+        rate-limit-config-fd (when (and (map? map-fds) (:rate-limit-config-map map-fds))
+                               (common/map-fd (:rate-limit-config-map map-fds)))
+        rate-limit-src-fd (when (and (map? map-fds) (:rate-limit-src-map map-fds))
+                            (common/map-fd (:rate-limit-src-map map-fds)))
+        rate-limit-backend-fd (when (and (map? map-fds) (:rate-limit-backend-map map-fds))
+                                (common/map-fd (:rate-limit-backend-map map-fds)))]
+    (build-xdp-dnat-program-unified listen-map-fd config-map-fd sni-map-fd conntrack-map-fd
+                                     rate-limit-config-fd rate-limit-src-fd rate-limit-backend-fd)))
+
+(defn load-program-unified
+  "Load the unified XDP ingress program for IPv4/IPv6 dual-stack.
+   Returns a BpfProgram record."
+  [maps]
+  (log/info "Loading unified XDP ingress program (IPv4/IPv6)")
+  (let [bytecode (build-xdp-ingress-program-unified maps)]
+    (require '[clj-ebpf.programs :as programs])
+    ((resolve 'clj-ebpf.programs/load-program)
+      {:insns bytecode
+       :prog-type :xdp
+       :prog-name "xdp_ingress_v6"
+       :license "GPL"
+       :log-level 1})))
 
 (defn build-xdp-ingress-program
   "Build the XDP ingress program.

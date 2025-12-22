@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2025-12-22
+
+### Added
+- IPv6 dual-stack support for full IPv4/IPv6 operation
+  - Same proxy handles both IPv4 and IPv6 traffic simultaneously
+  - Unified 16-byte address format (IPv4 addresses zero-padded)
+  - XDP ingress program with EtherType branching for IPv4/IPv6
+  - TC egress program with IPv4/IPv6 SNAT handling
+  - Unified BPF maps with larger key/value sizes:
+    - LPM key: 20 bytes (prefix_len(4) + ip(16))
+    - Route value: 168 bytes (header(8) + 8 targets × 20 bytes each)
+    - Conntrack key: 40 bytes (src_ip(16) + dst_ip(16) + ports(4) + proto(1) + pad(3))
+    - Conntrack value: 96 bytes
+  - IPv6-specific checksum handling (no IP header checksum)
+  - Full address parsing for IPv6 formats (full, compressed, zone IDs)
+  - New utility functions: `ipv6-string->bytes`, `bytes->ipv6-string`
+  - New unified functions: `ip-string->bytes16`, `bytes16->ip-string`
+  - New unified CIDR parsing: `parse-cidr-unified`
+  - New unified key encoding: `encode-lpm-key-unified`, `encode-conntrack-key-unified`
+  - New unified map creation: `create-all-maps-unified`
+  - New unified program builders: `build-xdp-ingress-program-unified`, `build-tc-egress-program-unified`
+  - IPv6 addresses supported in targets: `{:ip "2001:db8::1" :port 8080}`
+  - IPv6 source routes: `{:source "2001:db8:cafe::/48" :target ...}`
+  - Comprehensive IPv6 test coverage
+  - IPv6 constants: `ETH-P-IPV6-BE`, `IPV6-HLEN`, `IPV6-OFF-*`
+
+### Changed
+- Stack layout updated for unified 16-byte addresses
+- Conntrack value format extended for 16-byte IP storage
+
 ## [0.9.0] - 2025-12-21
 
 ### Added
@@ -208,6 +238,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
+[0.10.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.6.0...v0.7.0
