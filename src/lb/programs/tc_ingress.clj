@@ -249,7 +249,10 @@
          (dsl/stx :b :r10 :r0 -51)]
 
         ;; Check for TCP only (PROXY protocol is TCP-only)
-        [(asm/jmp-imm :jne :r0 net/IPPROTO-TCP :pass)]
+        ;; Use explicit jeq + jmp to avoid assembler issues with jne to far labels
+        [(asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :ipv4_is_tcp)]
+        [(asm/jmp :pass)]
+        [(asm/label :ipv4_is_tcp)]
 
         ;; Build conntrack key: src_ip (16 bytes, zero-padded)
         [(dsl/mov :r0 0)
@@ -298,7 +301,10 @@
          (dsl/stx :b :r10 :r0 -51)]
 
         ;; Check for TCP only
-        [(asm/jmp-imm :jne :r0 net/IPPROTO-TCP :pass)]
+        ;; Use explicit jeq + jmp to avoid assembler issues with jne to far labels
+        [(asm/jmp-imm :jeq :r0 net/IPPROTO-TCP :ipv6_is_tcp)]
+        [(asm/jmp :pass)]
+        [(asm/label :ipv6_is_tcp)]
 
         ;; Build conntrack key: src_ip (16 bytes)
         [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
