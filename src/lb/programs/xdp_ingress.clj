@@ -424,14 +424,15 @@
            (dsl/add-reg :r3 :r2)]              ; r3 = offset to cipher_suites_length
 
           ;; Bounds check for cipher_suites_length (2 bytes)
+          ;; After check, subtract 2 to reuse validated pointer
           [(dsl/mov-reg :r2 :r1)
            (dsl/add-reg :r2 :r3)
            (dsl/add :r2 2)
            (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
 
           ;; Load cipher_suites_length (2 bytes big-endian)
-          [(dsl/mov-reg :r2 :r1)
-           (dsl/add-reg :r2 :r3)               ; r2 = ptr to cipher_suites_length
+          ;; Reuse r2 by subtracting the 2 we added for bounds check
+          [(dsl/sub :r2 2)                     ; r2 = ptr to cipher_suites_length (validated)
            (dsl/ldx :h :r4 :r2 0)              ; r4 = cipher_suites_length
            ;; Calculate offset after cipher_suites
            (dsl/add-reg :r3 :r4)
@@ -441,14 +442,15 @@
           [(asm/jmp-imm :jgt :r3 300 :lookup_listen)]
 
           ;; Bounds check for compression_methods_length (1 byte)
+          ;; After check, subtract 1 to reuse validated pointer
           [(dsl/mov-reg :r2 :r1)
            (dsl/add-reg :r2 :r3)
            (dsl/add :r2 1)
            (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
 
           ;; Load compression_methods_length
-          [(dsl/mov-reg :r2 :r1)
-           (dsl/add-reg :r2 :r3)
+          ;; Reuse r2 by subtracting the 1 we added for bounds check
+          [(dsl/sub :r2 1)                     ; r2 = ptr to compression_methods_length (validated)
            (dsl/ldx :b :r4 :r2 0)              ; r4 = compression_methods_length
            ;; Calculate offset to extensions_length
            (dsl/add-reg :r3 :r4)
@@ -458,14 +460,15 @@
           [(asm/jmp-imm :jgt :r3 400 :lookup_listen)]
 
           ;; Bounds check for extensions_length (2 bytes)
+          ;; After check, subtract 2 to reuse validated pointer
           [(dsl/mov-reg :r2 :r1)
            (dsl/add-reg :r2 :r3)
            (dsl/add :r2 2)
            (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
 
           ;; Load extensions_length
-          [(dsl/mov-reg :r2 :r1)
-           (dsl/add-reg :r2 :r3)
+          ;; Reuse r2 by subtracting the 2 we added for bounds check
+          [(dsl/sub :r2 2)                     ; r2 = ptr to extensions_length (validated)
            (dsl/ldx :h :r4 :r2 0)              ; r4 = extensions_length
            ;; r3 + 2 = offset to first extension
            (dsl/add :r3 2)]
@@ -496,19 +499,22 @@
           [(asm/jmp-imm :jge :r0 common/MAX-TLS-EXTENSIONS :lookup_listen)]
 
           ;; Load current offset and check against end
+          ;; Add bounds check on r3 after loading from stack to help verifier
           [(dsl/ldx :w :r3 :r10 -72)           ; r3 = current offset
+           (asm/jmp-imm :jgt :r3 600 :lookup_listen) ; bound r3 for verifier (max extension area)
            (dsl/ldx :w :r5 :r10 -76)           ; r5 = end offset
            (asm/jmp-reg :jge :r3 :r5 :lookup_listen)] ; no more extensions
 
           ;; Bounds check for extension header (4 bytes: type + length)
+          ;; After check, subtract 4 to reuse validated pointer
           [(dsl/mov-reg :r2 :r1)
            (dsl/add-reg :r2 :r3)
            (dsl/add :r2 4)
            (asm/jmp-reg :jgt :r2 :r8 :lookup_listen)]
 
           ;; Load extension type (2 bytes)
-          [(dsl/mov-reg :r2 :r1)
-           (dsl/add-reg :r2 :r3)
+          ;; Reuse r2 by subtracting the 4 we added for bounds check
+          [(dsl/sub :r2 4)                     ; r2 = ptr to extension header (validated)
            (dsl/ldx :h :r4 :r2 0)]             ; r4 = extension type
 
           ;; Check if SNI extension (type 0x0000)
