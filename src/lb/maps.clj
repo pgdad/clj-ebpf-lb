@@ -510,6 +510,18 @@
   (let [key-bytes (util/encode-conntrack-key five-tuple)]
     (bpf/map-delete conntrack-map key-bytes)))
 
+(defn insert-connection
+  "Insert or update a connection in the tracking map.
+   Used for cluster failover - promotes shadow connections to active.
+
+   five-tuple: {:src-ip :dst-ip :src-port :dst-port :protocol}
+   value: {:orig-dst-ip :orig-dst-port :nat-dst-ip :nat-dst-port
+           :created-ns :last-seen :packets-fwd :packets-rev :bytes-fwd :bytes-rev}"
+  [conntrack-map five-tuple value]
+  (let [key-bytes (util/encode-conntrack-key five-tuple)
+        value-bytes (util/encode-conntrack-value value)]
+    (bpf/map-update conntrack-map key-bytes value-bytes)))
+
 (defn list-connections
   "List all active connections."
   [conntrack-map]
