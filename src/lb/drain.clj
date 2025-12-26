@@ -7,6 +7,8 @@
             [lb.util :as util]
             [lb.maps :as maps]
             [lb.config :as config]
+            [lb.cluster :as cluster]
+            [lb.cluster.sync :as cluster-sync]
             [clojure.tools.logging :as log]
             [clojure.core.async :as async :refer [go-loop <! >! chan timeout close!]])
   (:import [lb.config TargetGroup WeightedTarget]))
@@ -34,13 +36,20 @@
 ;;  :callbacks {}      ; Map of target-id -> completion callback fn
 ;;  :conntrack-map nil ; Reference to conntrack map for connection counting
 ;;  :update-weights-fn nil ; Function to update BPF map weights
+;;  :cluster-provider nil ; Cluster state provider for drain sync
 ;; }
 (defonce drain-state
   (atom {:draining {}
          :watcher nil
          :callbacks {}
          :conntrack-map nil
-         :update-weights-fn nil}))
+         :update-weights-fn nil
+         :cluster-provider nil}))
+
+;; Forward declarations for cluster integration (defined at end of file)
+(declare register-cluster-provider! unregister-cluster-provider!
+         broadcast-drain-change! broadcast-drain-complete-change!
+         broadcast-undrain-change!)
 
 ;;; =============================================================================
 ;;; Target ID Helpers
@@ -120,6 +129,8 @@
     ;; Update status
     (swap! drain-state update :draining dissoc target-id)
     (swap! drain-state update :callbacks dissoc target-id)
+    ;; Broadcast drain complete to cluster
+    (broadcast-drain-complete-change! target-id)
     ;; Invoke callback
     (when callback
       (try
@@ -206,11 +217,15 @@
          :conntrack-map conntrack-map
          :update-weights-fn update-weights-fn)
   (ensure-watcher-running! conntrack-map check-interval-ms)
+  ;; Register cluster provider (defined later in file)
+  (register-cluster-provider!)
   (log/info "Drain module initialized"))
 
 (defn shutdown!
   "Shutdown the drain module."
   []
+  ;; Unregister cluster provider first
+  (unregister-cluster-provider!)
   (stop-drain-watcher!)
   ;; Complete any in-progress drains as cancelled
   (doseq [[target-id _] (:draining @drain-state)]
@@ -219,7 +234,8 @@
                        :watcher nil
                        :callbacks {}
                        :conntrack-map nil
-                       :update-weights-fn nil})
+                       :update-weights-fn nil
+                       :cluster-provider nil})
   (log/info "Drain module shutdown"))
 
 (defn draining?
@@ -280,6 +296,9 @@
         (when on-complete
           (swap! drain-state assoc-in [:callbacks tid] on-complete))
 
+        ;; Broadcast drain start to cluster
+        (broadcast-drain-change! tid :draining proxy-name)
+
         ;; Update weights - draining targets get weight 0
         (when update-weights-fn
           (let [health-statuses (vec (repeat (count (:targets target-group)) true))
@@ -321,6 +340,9 @@
         ;; Remove from draining state
         (swap! drain-state update :draining dissoc tid)
         (swap! drain-state update :callbacks dissoc tid)
+
+        ;; Broadcast undrain to cluster
+        (broadcast-undrain-change! tid)
 
         ;; Restore weights
         (when update-weights-fn
@@ -404,6 +426,112 @@
                      (existing-cb status)))))
         ;; Wait for result
         @result-promise))))
+
+;;; =============================================================================
+;;; Cluster Integration
+;;; =============================================================================
+
+(defn get-all-drain-states
+  "Get all drain states for cluster sync.
+   Returns map of target-id -> {:status :start-time :proxy-name}."
+  []
+  (into {}
+    (for [[tid drain-info] (:draining @drain-state)]
+      [tid {:status (:status drain-info)
+            :start-time (:started-at drain-info)
+            :proxy-name (:proxy-name drain-info)}])))
+
+(defn apply-remote-drain!
+  "Apply a drain state received from another cluster node.
+   This is called when a remote node initiates or completes a drain."
+  [target-id remote-state]
+  (let [{:keys [status start-time proxy-name]} remote-state
+        current-drain (get-in @drain-state [:draining target-id])]
+    (case status
+      :draining
+      ;; Remote node started draining - apply locally if not already draining
+      (when-not current-drain
+        (log/info "Applying remote drain for" target-id "from cluster (started by" proxy-name ")")
+        ;; Create a minimal drain state - we don't have full context but track it
+        (let [drain-info (->DrainState
+                           target-id
+                           proxy-name
+                           (or start-time (System/currentTimeMillis))
+                           60000  ; Default timeout for remote drains
+                           0      ; Unknown original weight
+                           0      ; Unknown initial connections
+                           :draining)]
+          (swap! drain-state assoc-in [:draining target-id] drain-info)))
+
+      :drained
+      ;; Remote node completed drain - mark locally as well
+      (when current-drain
+        (log/info "Remote drain completed for" target-id)
+        (swap! drain-state update :draining dissoc target-id))
+
+      :active
+      ;; Remote node undrained - remove from local tracking
+      (when current-drain
+        (log/info "Remote undrain for" target-id)
+        (swap! drain-state update :draining dissoc target-id))
+
+      ;; Unknown status - log and ignore
+      (log/warn "Unknown remote drain status" status "for" target-id))))
+
+(defn- broadcast-drain-change!
+  "Broadcast drain state change to cluster."
+  [target-id status proxy-name]
+  (when (cluster/running?)
+    (try
+      (cluster-sync/broadcast-drain-start! target-id proxy-name)
+      (catch Exception e
+        (log/debug "Could not broadcast drain change:" (.getMessage e))))))
+
+(defn- broadcast-drain-complete-change!
+  "Broadcast drain completion to cluster."
+  [target-id]
+  (when (cluster/running?)
+    (try
+      (cluster-sync/broadcast-drain-complete! target-id)
+      (catch Exception e
+        (log/debug "Could not broadcast drain complete:" (.getMessage e))))))
+
+(defn- broadcast-undrain-change!
+  "Broadcast undrain (restore to active) to cluster."
+  [target-id]
+  (when (cluster/running?)
+    (try
+      ;; Broadcast an :active status to tell other nodes to undrain
+      (cluster/broadcast! :drain target-id {:status :active
+                                             :start-time nil
+                                             :proxy-name nil})
+      (catch Exception e
+        (log/debug "Could not broadcast undrain:" (.getMessage e))))))
+
+(defn- register-cluster-provider!
+  "Register the drain state provider with cluster sync."
+  []
+  (when (cluster/running?)
+    (try
+      (let [provider (cluster-sync/create-drain-provider
+                       get-all-drain-states
+                       apply-remote-drain!)]
+        (cluster/register-provider! provider)
+        (swap! drain-state assoc :cluster-provider provider)
+        (log/info "Drain cluster provider registered"))
+      (catch Exception e
+        (log/debug "Could not register drain cluster provider:" (.getMessage e))))))
+
+(defn- unregister-cluster-provider!
+  "Unregister the drain state provider from cluster sync."
+  []
+  (when (:cluster-provider @drain-state)
+    (try
+      (cluster/unregister-provider! :drain)
+      (swap! drain-state assoc :cluster-provider nil)
+      (log/info "Drain cluster provider unregistered")
+      (catch Exception e
+        (log/debug "Could not unregister drain cluster provider:" (.getMessage e))))))
 
 ;;; =============================================================================
 ;;; Display
