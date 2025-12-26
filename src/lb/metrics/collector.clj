@@ -5,9 +5,12 @@
    - Connection tracking (active connections, bytes, packets)
    - Health checking (backend health status, latency)
    - DNS resolution (resolution status)
-   - Stats aggregator (totals)"
+   - Stats aggregator (totals)
+   - Cluster (nodes, gossip messages, sync lag)"
   (:require [lb.metrics.histograms :as histograms]
             [lb.util :as util]
+            [lb.cluster :as cluster]
+            [lb.cluster.conntrack :as cluster-conntrack]
             [clojure.string :as str]
             [clojure.tools.logging :as log]))
 
@@ -383,6 +386,60 @@
     [(format-metric-line "lb_up" {} 1)]))
 
 ;;; =============================================================================
+;;; Cluster Metrics
+;;; =============================================================================
+
+(defn- collect-cluster-nodes
+  "Collect lb_cluster_nodes_total gauge - cluster node counts by state."
+  []
+  (when (cluster/running?)
+    (try
+      (let [stats (cluster/stats)
+            membership (get stats :membership {})
+            alive (get membership :alive-count 0)
+            suspected (get membership :suspected-count 0)
+            dead (get membership :dead-count 0)]
+        (format-metric-family
+          "lb_cluster_nodes_total"
+          "gauge"
+          "Number of cluster nodes by state"
+          [(format-metric-line "lb_cluster_nodes_total" {:state "alive"} alive)
+           (format-metric-line "lb_cluster_nodes_total" {:state "suspected"} suspected)
+           (format-metric-line "lb_cluster_nodes_total" {:state "dead"} dead)]))
+      (catch Exception e
+        (log/warn e "Error collecting lb_cluster_nodes_total")
+        nil))))
+
+(defn- collect-cluster-conntrack-sync
+  "Collect lb_cluster_conntrack_sync gauge - conntrack sync state."
+  []
+  (when (cluster/running?)
+    (try
+      (let [stats (cluster-conntrack/sync-stats)
+            local (:local-connections stats)
+            shadow (:shadow-connections stats)
+            pending (:pending-updates stats)]
+        (format-metric-family
+          "lb_cluster_conntrack_sync"
+          "gauge"
+          "Connection tracking sync statistics"
+          [(format-metric-line "lb_cluster_conntrack_sync" {:type "local"} (or local 0))
+           (format-metric-line "lb_cluster_conntrack_sync" {:type "shadow"} (or shadow 0))
+           (format-metric-line "lb_cluster_conntrack_sync" {:type "pending"} (or pending 0))]))
+      (catch Exception e
+        (log/warn e "Error collecting lb_cluster_conntrack_sync")
+        nil))))
+
+(defn- collect-cluster-up
+  "Collect lb_cluster_up gauge - whether cluster is running."
+  []
+  (format-metric-family
+    "lb_cluster_up"
+    "gauge"
+    "Whether the cluster is running (1=up, 0=down)"
+    [(format-metric-line "lb_cluster_up" {} (if (cluster/running?) 1 0))]))
+
+;;; =============================================================================
 ;;; Main Collection Function
 ;;; =============================================================================
 
@@ -403,5 +460,9 @@
                  (collect-health-latency-histogram)
                  (collect-backend-latency-histogram)
                  (collect-circuit-breaker-state)
-                 (collect-circuit-breaker-error-rate)]]
+                 (collect-circuit-breaker-error-rate)
+                 ;; Cluster metrics
+                 (collect-cluster-up)
+                 (collect-cluster-nodes)
+                 (collect-cluster-conntrack-sync)]]
     (str (str/join "\n\n" (filter some? metrics)) "\n")))

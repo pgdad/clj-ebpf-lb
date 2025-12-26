@@ -12,6 +12,8 @@
   (:require [lb.core :as lb]
             [lb.config :as config]
             [lb.util :as util]
+            [lb.cluster :as cluster]
+            [lb.cluster.conntrack :as cluster-conntrack]
             [clojure.tools.logging :as log]))
 
 ;;; =============================================================================
@@ -386,6 +388,51 @@
   (safe-call lb/clear-rate-limits!))
 
 ;;; =============================================================================
+;;; Cluster Handlers
+;;; =============================================================================
+
+(defn handle-get-cluster-status
+  "GET /api/v1/cluster/status - Get cluster status"
+  [_request]
+  (if (cluster/running?)
+    {:data {:running true
+            :node-id (cluster/node-id)
+            :alive-nodes (vec (cluster/alive-nodes))
+            :cluster-size (cluster/cluster-size)
+            :local-node (cluster/local-node)
+            :stats (cluster/stats)}}
+    {:data {:running false}}))
+
+(defn handle-get-cluster-sync-status
+  "GET /api/v1/cluster/sync - Get cluster sync status"
+  [_request]
+  (if (cluster/running?)
+    {:data {:conntrack (cluster-conntrack/sync-stats)
+            :node-id (cluster/node-id)
+            :running true}}
+    {:data {:running false}}))
+
+(defn handle-force-cluster-sync
+  "POST /api/v1/cluster/sync - Force full cluster sync"
+  [_request]
+  (if (cluster/running?)
+    (let [count (cluster-conntrack/force-full-sync!)]
+      {:data {:synced-connections count
+              :message (str "Forced sync of " count " connections")}})
+    {:error "Cluster not running"
+     :code "CLUSTER_NOT_RUNNING"
+     :status 503}))
+
+(defn handle-get-cluster-nodes
+  "GET /api/v1/cluster/nodes - Get all cluster nodes"
+  [_request]
+  (if (cluster/running?)
+    {:data {:nodes (cluster/all-nodes)
+            :alive (vec (cluster/alive-nodes))
+            :local-node-id (cluster/node-id)}}
+    {:data {:nodes []}}))
+
+;;; =============================================================================
 ;;; Route Definitions
 ;;; =============================================================================
 
@@ -447,4 +494,10 @@
    {:method :delete :pattern "/api/v1/rate-limits" :handler handle-clear-rate-limits}
 
    ;; Configuration
-   {:method :post :pattern "/api/v1/reload" :handler handle-reload-config}])
+   {:method :post :pattern "/api/v1/reload" :handler handle-reload-config}
+
+   ;; Cluster
+   {:method :get :pattern "/api/v1/cluster/status" :handler handle-get-cluster-status}
+   {:method :get :pattern "/api/v1/cluster/sync" :handler handle-get-cluster-sync-status}
+   {:method :post :pattern "/api/v1/cluster/sync" :handler handle-force-cluster-sync}
+   {:method :get :pattern "/api/v1/cluster/nodes" :handler handle-get-cluster-nodes}])
