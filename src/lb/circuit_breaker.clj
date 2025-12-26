@@ -16,7 +16,10 @@
    - HALF-OPEN -> OPEN: On any failure"
   (:require [clojure.tools.logging :as log]
             [lb.health :as health]
-            [lb.util :as util])
+            [lb.util :as util]
+            [lb.cluster.sync :as cluster-sync]
+            [lb.cluster.gossip :as gossip]
+            [lb.cluster.manager :as cluster-manager])
   (:import [lb.config CircuitBreakerConfig]))
 
 ;;; =============================================================================
@@ -53,6 +56,87 @@
          :watcher nil
          :update-weights-fn nil
          :subscribers []}))
+
+;;; =============================================================================
+;;; Cluster Integration
+;;; =============================================================================
+
+;; Forward declarations
+(declare get-circuit update-weights!)
+
+;; Cluster provider reference
+(defonce ^:private cluster-provider (atom nil))
+
+(defn- get-all-cb-states
+  "Get all circuit breaker states for cluster sync."
+  []
+  (into {}
+    (for [[target-id cb] (:circuits @circuit-breaker-state)]
+      [target-id {:state (:state cb)
+                  :error-rate (let [total (+ (:success-count cb) (:error-count cb))]
+                                (if (pos? total)
+                                  (double (/ (:error-count cb) total))
+                                  0.0))
+                  :last-transition (:last-state-change cb)}])))
+
+(defn- apply-remote-cb!
+  "Apply circuit breaker state received from cluster peer."
+  [target-id remote-state]
+  (when-let [cb (get-circuit target-id)]
+    (let [local-state (:state cb)
+          remote-state-val (:state remote-state)]
+      (cond
+        ;; Remote OPEN always wins - prevent thundering herd
+        (and (= remote-state-val :open) (not= local-state :open))
+        (do
+          (log/info "Circuit" target-id "opened by remote node")
+          (let [now (System/currentTimeMillis)
+                open-duration (get-in cb [:config :open-duration-ms])]
+            (swap! circuit-breaker-state assoc-in [:circuits target-id]
+                   (assoc cb
+                          :state :open
+                          :last-state-change now
+                          :open-until (+ now open-duration)
+                          :error-count 0
+                          :success-count 0
+                          :window-start now))
+            (update-weights! (:proxy-name cb))))
+
+        ;; Remote HALF-OPEN beats local CLOSED
+        (and (= remote-state-val :half-open) (= local-state :closed))
+        (do
+          (log/debug "Circuit" target-id "half-opened by remote node")
+          (swap! circuit-breaker-state assoc-in [:circuits target-id]
+                 (assoc cb
+                        :state :half-open
+                        :last-state-change (System/currentTimeMillis)
+                        :half-open-successes 0))
+          (update-weights! (:proxy-name cb)))
+
+        ;; Remote CLOSED - only apply if we're not already closed
+        (and (= remote-state-val :closed) (not= local-state :closed))
+        (do
+          (log/debug "Circuit" target-id "closed by remote node")
+          (let [now (System/currentTimeMillis)]
+            (swap! circuit-breaker-state assoc-in [:circuits target-id]
+                   (assoc cb
+                          :state :closed
+                          :last-state-change now
+                          :window-start now
+                          :error-count 0
+                          :success-count 0
+                          :half-open-successes 0))
+            (update-weights! (:proxy-name cb))))))))
+
+(defn- broadcast-cb-change!
+  "Broadcast circuit breaker state change to cluster."
+  [target-id cb-state]
+  (when (cluster-manager/running?)
+    (if (= (:state cb-state) :open)
+      ;; OPEN is critical - broadcast to all immediately
+      (cluster-sync/broadcast-circuit-open! target-id cb-state)
+      ;; Other states use normal gossip
+      (cluster-sync/broadcast-circuit-change! target-id cb-state))))
 
 ;;; =============================================================================
 ;;; Target ID Helpers
@@ -173,48 +257,54 @@
   [target-id error-rate]
   (let [cb (get-circuit target-id)
         now (System/currentTimeMillis)
-        open-duration (get-in cb [:config :open-duration-ms])]
-    (update-circuit! target-id
-      (assoc cb
-             :state :open
-             :last-state-change now
-             :open-until (+ now open-duration)
-             :error-count 0
-             :success-count 0
-             :window-start now))
+        open-duration (get-in cb [:config :open-duration-ms])
+        updated-cb (assoc cb
+                          :state :open
+                          :last-state-change now
+                          :open-until (+ now open-duration)
+                          :error-count 0
+                          :success-count 0
+                          :window-start now)]
+    (update-circuit! target-id updated-cb)
     (emit-event! :circuit-opened (:proxy-name cb) target-id
                  {:error-rate error-rate
                   :open-until (+ now open-duration)})
-    (update-weights! (:proxy-name cb))))
+    (update-weights! (:proxy-name cb))
+    ;; Broadcast to cluster - OPEN is critical
+    (broadcast-cb-change! target-id updated-cb)))
 
 (defn- transition-to-half-open!
   "Transition a circuit to HALF-OPEN state."
   [target-id]
   (let [cb (get-circuit target-id)
-        now (System/currentTimeMillis)]
-    (update-circuit! target-id
-      (assoc cb
-             :state :half-open
-             :last-state-change now
-             :half-open-successes 0))
+        now (System/currentTimeMillis)
+        updated-cb (assoc cb
+                          :state :half-open
+                          :last-state-change now
+                          :half-open-successes 0)]
+    (update-circuit! target-id updated-cb)
     (emit-event! :circuit-half-opened (:proxy-name cb) target-id {})
-    (update-weights! (:proxy-name cb))))
+    (update-weights! (:proxy-name cb))
+    ;; Broadcast to cluster
+    (broadcast-cb-change! target-id updated-cb)))
 
 (defn- transition-to-closed!
   "Transition a circuit to CLOSED state."
   [target-id]
   (let [cb (get-circuit target-id)
-        now (System/currentTimeMillis)]
-    (update-circuit! target-id
-      (assoc cb
-             :state :closed
-             :last-state-change now
-             :window-start now
-             :error-count 0
-             :success-count 0
-             :half-open-successes 0))
+        now (System/currentTimeMillis)
+        updated-cb (assoc cb
+                          :state :closed
+                          :last-state-change now
+                          :window-start now
+                          :error-count 0
+                          :success-count 0
+                          :half-open-successes 0)]
+    (update-circuit! target-id updated-cb)
     (emit-event! :circuit-closed (:proxy-name cb) target-id {})
-    (update-weights! (:proxy-name cb))))
+    (update-weights! (:proxy-name cb))
+    ;; Broadcast to cluster
+    (broadcast-cb-change! target-id updated-cb)))
 
 ;;; =============================================================================
 ;;; Error Rate Calculation
@@ -409,6 +499,14 @@
      ;; Start timeout watcher
      (let [watcher (start-timeout-watcher! check-interval-ms)]
        (swap! circuit-breaker-state assoc :watcher watcher))
+     ;; Register cluster provider if cluster is running
+     (when (cluster-manager/running?)
+       (let [provider (cluster-sync/create-circuit-breaker-provider
+                        get-all-cb-states
+                        apply-remote-cb!)]
+         (reset! cluster-provider provider)
+         (gossip/register-state-provider! provider)
+         (log/info "Registered circuit breaker cluster provider")))
      (log/info "Circuit breaker system started"))))
 
 (defn stop!
@@ -416,6 +514,10 @@
   []
   (when (running?)
     (log/info "Stopping circuit breaker system")
+    ;; Unregister cluster provider
+    (when @cluster-provider
+      (gossip/unregister-state-provider! :circuit-breaker)
+      (reset! cluster-provider nil))
     ;; Stop timeout watcher
     (stop-timeout-watcher!)
     ;; Unsubscribe from health events

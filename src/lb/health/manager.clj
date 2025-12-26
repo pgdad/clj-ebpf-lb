@@ -6,7 +6,10 @@
             [lb.health.weights :as weights]
             [lb.metrics :as metrics]
             [lb.util :as util]
-            [lb.config :as config])
+            [lb.config :as config]
+            [lb.cluster.sync :as cluster-sync]
+            [lb.cluster.gossip :as gossip]
+            [lb.cluster.manager :as cluster-manager])
   (:import [java.util.concurrent Executors ScheduledExecutorService TimeUnit]
            [java.util.concurrent.locks ReentrantLock]))
 
@@ -84,6 +87,64 @@
     (f)
     (finally
       (.unlock state-lock))))
+
+;;; =============================================================================
+;;; Cluster Integration
+;;; =============================================================================
+
+;; Forward declarations for functions used in cluster integration
+(declare should-update-weights? update-proxy-weights!)
+
+;; Cluster health provider reference (set during start!)
+(defonce ^:private cluster-provider (atom nil))
+
+(defn- get-all-health-states
+  "Get all health states for cluster sync."
+  []
+  (into {}
+    (for [[_ proxy-health] (:proxies @manager-state)
+          [target-id target-health] (:target-healths proxy-health)]
+      [target-id {:status (:status target-health)
+                  :last-check-time (:last-check-time target-health)
+                  :consecutive-successes (:consecutive-successes target-health)
+                  :consecutive-failures (:consecutive-failures target-health)}])))
+
+(defn- apply-remote-health!
+  "Apply health state received from cluster peer."
+  [target-id remote-state]
+  (with-lock
+    (fn []
+      ;; Find which proxy owns this target
+      (doseq [[proxy-name proxy-health] (:proxies @manager-state)]
+        (when (get-in proxy-health [:target-healths target-id])
+          (let [old-status (get-in proxy-health [:target-healths target-id :status])
+                new-status (:status remote-state)]
+            ;; Update health state from remote
+            (swap! manager-state update-in [:proxies proxy-name :target-healths target-id]
+                   merge {:status new-status
+                          :last-check-time (:last-check-time remote-state)
+                          :consecutive-successes (:consecutive-successes remote-state)
+                          :consecutive-failures (:consecutive-failures remote-state)})
+            ;; Log if status changed
+            (when (and old-status (not= old-status new-status))
+              (log/info "Remote health update for" target-id ":" old-status "->" new-status))
+            ;; Check if weights need updating
+            (let [proxy-health' (get-in @manager-state [:proxies proxy-name])
+                  target-healths (:target-healths proxy-health')
+                  target-order (vec (keys target-healths))]
+              (when-let [new-weights (should-update-weights?
+                                       proxy-health' target-healths target-order)]
+                (update-proxy-weights! proxy-name new-weights)))))))))
+
+(defn- broadcast-health-change!
+  "Broadcast health state change to cluster if running."
+  [target-id target-health]
+  (when (cluster-manager/running?)
+    (cluster-sync/broadcast-health-change! target-id
+      {:status (:status target-health)
+       :last-check-time (:last-check-time target-health)
+       :consecutive-successes (:consecutive-successes target-health)
+       :consecutive-failures (:consecutive-failures target-health)})))
 
 ;;; =============================================================================
 ;;; Health Status Transitions
@@ -253,7 +314,9 @@
               target-id
               {:old-status status
                :new-status (:status updated)
-               :error (:error result)}))
+               :error (:error result)})
+            ;; Broadcast to cluster
+            (broadcast-health-change! target-id updated))
           ;; Check if weights need updating
           (let [proxy-health' (get-in @manager-state [:proxies proxy-name])
                 target-healths (:target-healths proxy-health')
@@ -308,6 +371,14 @@
           (swap! manager-state assoc
                  :running? true
                  :executor executor))
+        ;; Register cluster provider if cluster is running
+        (when (cluster-manager/running?)
+          (let [provider (cluster-sync/create-health-provider
+                           get-all-health-states
+                           apply-remote-health!)]
+            (reset! cluster-provider provider)
+            (gossip/register-state-provider! provider)
+            (log/info "Registered health cluster provider")))
         (log/info "Health check manager started")))))
 
 (defn stop!
@@ -317,6 +388,10 @@
     (fn []
       (when (:running? @manager-state)
         (log/info "Stopping health check manager")
+        ;; Unregister cluster provider
+        (when @cluster-provider
+          (gossip/unregister-state-provider! :health)
+          (reset! cluster-provider nil))
         (when-let [^ScheduledExecutorService executor (:executor @manager-state)]
           (.shutdownNow executor)
           (.awaitTermination executor 2 TimeUnit/SECONDS))
