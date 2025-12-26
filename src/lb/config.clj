@@ -218,12 +218,35 @@
   (s/keys :opt-un [::enabled ::admin-api-port ::admin-api-key
                    ::admin-api-allowed-origins]))
 
+;; Cluster configuration specs
+(s/def ::node-id (s/or :auto #{"auto"} :string (s/and string? #(not (empty? %)))))
+(s/def ::bind-address ::ip-string)
+(s/def ::bind-port ::port)
+(s/def ::seeds (s/coll-of string?))  ; List of "ip:port" strings
+(s/def ::gossip-interval-ms (s/and int? #(>= % 50) #(<= % 10000)))
+(s/def ::gossip-fanout (s/and int? #(>= % 1) #(<= % 10)))
+(s/def ::push-pull-interval-ms (s/and int? #(>= % 1000) #(<= % 60000)))
+(s/def ::ping-interval-ms (s/and int? #(>= % 100) #(<= % 30000)))
+(s/def ::ping-timeout-ms (s/and int? #(>= % 50) #(<= % 10000)))
+(s/def ::ping-req-count (s/and int? #(>= % 1) #(<= % 10)))
+(s/def ::suspicion-mult (s/and int? #(>= % 1) #(<= % 10)))
+(s/def ::sync-health boolean?)
+(s/def ::sync-circuit-breaker boolean?)
+(s/def ::sync-drain boolean?)
+(s/def ::sync-conntrack boolean?)
+
+(s/def ::cluster
+  (s/keys :opt-un [::enabled ::node-id ::bind-address ::bind-port ::seeds
+                   ::gossip-interval-ms ::gossip-fanout ::push-pull-interval-ms
+                   ::ping-interval-ms ::ping-timeout-ms ::ping-req-count ::suspicion-mult
+                   ::sync-health ::sync-circuit-breaker ::sync-drain ::sync-conntrack]))
+
 (s/def ::settings
   (s/keys :opt-un [::stats-enabled ::connection-timeout-sec ::max-connections
                    ::health-check-enabled ::health-check-defaults
                    ::default-drain-timeout-ms ::drain-check-interval-ms
                    ::rate-limits ::metrics ::circuit-breaker ::load-balancing
-                   ::access-log ::admin-api]))
+                   ::access-log ::admin-api ::cluster]))
 
 ;; Full configuration
 (s/def ::proxies (s/coll-of ::proxy-config :min-count 1))
@@ -345,6 +368,44 @@
    :api-key nil
    :allowed-origins nil})
 
+;; Cluster configuration
+;; enabled: whether cluster mode is active
+;; node-id: unique node identifier ("auto" generates UUID-based ID)
+;; bind-address: IP to bind for cluster communication
+;; bind-port: UDP/TCP port for gossip protocol
+;; seeds: list of "ip:port" strings for initial cluster members
+;; gossip-interval-ms: how often to gossip state to peers
+;; gossip-fanout: number of peers to gossip to each round
+;; push-pull-interval-ms: full state sync interval
+;; ping-interval-ms: SWIM ping interval for failure detection
+;; ping-timeout-ms: timeout for ping responses
+;; ping-req-count: indirect pings for failed direct pings
+;; suspicion-mult: multiplier for suspicion timeout
+;; sync-*: which state types to synchronize
+(defrecord ClusterConfig [enabled node-id bind-address bind-port seeds
+                          gossip-interval-ms gossip-fanout push-pull-interval-ms
+                          ping-interval-ms ping-timeout-ms ping-req-count suspicion-mult
+                          sync-health sync-circuit-breaker sync-drain sync-conntrack])
+
+;; Default cluster configuration values
+(def default-cluster-config
+  {:enabled false
+   :node-id "auto"
+   :bind-address "0.0.0.0"
+   :bind-port 7946
+   :seeds []
+   :gossip-interval-ms 200
+   :gossip-fanout 2
+   :push-pull-interval-ms 10000
+   :ping-interval-ms 1000
+   :ping-timeout-ms 500
+   :ping-req-count 3
+   :suspicion-mult 3
+   :sync-health true
+   :sync-circuit-breaker true
+   :sync-drain true
+   :sync-conntrack true})
+
 ;; Source route now holds a TargetGroup instead of single Target
 ;; session-persistence: optional boolean for sticky sessions
 (defrecord SourceRoute [source prefix-len target-group session-persistence])
@@ -366,7 +427,7 @@
 (defrecord Settings [stats-enabled connection-timeout-sec max-connections
                      health-check-enabled health-check-defaults
                      default-drain-timeout-ms drain-check-interval-ms
-                     load-balancing access-log admin-api])
+                     load-balancing access-log admin-api cluster])
 (defrecord Config [proxies settings])
 
 ;;; =============================================================================
@@ -491,6 +552,28 @@
       (:port merged)
       (:api-key merged)
       (:allowed-origins merged))))
+
+(defn parse-cluster-config
+  "Parse cluster configuration, merging with defaults."
+  [cluster-map]
+  (let [merged (merge default-cluster-config (or cluster-map {}))]
+    (->ClusterConfig
+      (:enabled merged)
+      (:node-id merged)
+      (:bind-address merged)
+      (:bind-port merged)
+      (:seeds merged)
+      (:gossip-interval-ms merged)
+      (:gossip-fanout merged)
+      (:push-pull-interval-ms merged)
+      (:ping-interval-ms merged)
+      (:ping-timeout-ms merged)
+      (:ping-req-count merged)
+      (:suspicion-mult merged)
+      (:sync-health merged)
+      (:sync-circuit-breaker merged)
+      (:sync-drain merged)
+      (:sync-conntrack merged))))
 
 (defn dns-target?
   "Check if a target specification uses DNS (has :host instead of :ip)."
@@ -621,7 +704,8 @@
     (get settings :drain-check-interval-ms 1000)
     (parse-load-balancing-config (get settings :load-balancing))
     (parse-access-log-config (get settings :access-log))
-    (parse-admin-api-config (get settings :admin-api))))
+    (parse-admin-api-config (get settings :admin-api))
+    (parse-cluster-config (get settings :cluster))))
 
 (defn parse-config
   "Parse full configuration from EDN map."
@@ -765,7 +849,24 @@
                  {:enabled (:enabled aa)
                   :port (:port aa)
                   :api-key (:api-key aa)
-                  :allowed-origins (:allowed-origins aa)})}})
+                  :allowed-origins (:allowed-origins aa)})
+    :cluster (let [cl (get-in config [:settings :cluster])]
+               {:enabled (:enabled cl)
+                :node-id (:node-id cl)
+                :bind-address (:bind-address cl)
+                :bind-port (:bind-port cl)
+                :seeds (:seeds cl)
+                :gossip-interval-ms (:gossip-interval-ms cl)
+                :gossip-fanout (:gossip-fanout cl)
+                :push-pull-interval-ms (:push-pull-interval-ms cl)
+                :ping-interval-ms (:ping-interval-ms cl)
+                :ping-timeout-ms (:ping-timeout-ms cl)
+                :ping-req-count (:ping-req-count cl)
+                :suspicion-mult (:suspicion-mult cl)
+                :sync-health (:sync-health cl)
+                :sync-circuit-breaker (:sync-circuit-breaker cl)
+                :sync-drain (:sync-drain cl)
+                :sync-conntrack (:sync-conntrack cl)})}})
 
 (defn save-config-file
   "Save configuration to an EDN file."
@@ -783,7 +884,8 @@
   (->Settings false 300 100000 false default-health-check-config 30000 1000
               (parse-load-balancing-config nil)
               (parse-access-log-config nil)
-              (parse-admin-api-config nil)))
+              (parse-admin-api-config nil)
+              (parse-cluster-config nil)))
 
 (defn make-single-target-group
   "Create a TargetGroup with a single target.
@@ -833,7 +935,8 @@
     (->Settings stats-enabled 300 100000 health-check-enabled default-health-check-config
                 30000 1000 (parse-load-balancing-config nil)
                 (parse-access-log-config nil)
-                (parse-admin-api-config nil))))
+                (parse-admin-api-config nil)
+                (parse-cluster-config nil))))
 
 ;;; =============================================================================
 ;;; Configuration Modification
