@@ -21,6 +21,8 @@
             [lb.access-log :as access-log]
             [lb.admin :as admin]
             [lb.lb-manager :as lb-manager]
+            [lb.cluster :as cluster]
+            [lb.cluster.conntrack :as cluster-conntrack]
             [lb.util :as util]
             [clojure.tools.logging :as log]
             [clojure.tools.cli :refer [parse-opts]])
@@ -220,6 +222,15 @@
                 (log/info "Starting admin API server")
                 (admin/start! (get-in config [:settings :admin-api])))
 
+              ;; Start cluster if enabled
+              (when (get-in config [:settings :cluster :enabled])
+                (log/info "Starting cluster mode")
+                (let [cluster-config (get-in config [:settings :cluster])]
+                  (cluster/start! cluster-config)
+                  ;; Start conntrack sync for seamless failover
+                  (when (:sync-conntrack cluster-config)
+                    (cluster-conntrack/start! (:conntrack-map ebpf-maps)))))
+
               (log/info "Load balancer initialized successfully")
               state)))))
 
@@ -234,7 +245,14 @@
   (with-lb-state [state]
     (log/info "Shutting down load balancer")
 
-    ;; Stop admin API server first
+    ;; Stop cluster first (to gracefully leave)
+    (when (cluster/running?)
+      (log/info "Stopping cluster mode")
+      (when (cluster-conntrack/running?)
+        (cluster-conntrack/stop!))
+      (cluster/stop!))
+
+    ;; Stop admin API server
     (when (admin/running?)
       (admin/stop!))
 
