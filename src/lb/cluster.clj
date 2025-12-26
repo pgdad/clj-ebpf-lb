@@ -194,6 +194,21 @@
   []
   (manager/cluster-stats))
 
+(defn get-config
+  "Get current cluster configuration."
+  []
+  (manager/get-config))
+
+(defn get-all-nodes
+  "Get map of all known nodes: node-id -> NodeInfo."
+  []
+  (manager/get-all-nodes))
+
+(defn get-node-id
+  "Get this node's unique identifier."
+  []
+  (manager/get-node-id))
+
 ;;; =============================================================================
 ;;; Protocol Re-exports (for convenience)
 ;;; =============================================================================

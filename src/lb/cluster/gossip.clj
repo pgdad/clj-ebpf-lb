@@ -403,13 +403,14 @@
     (let [cfg @config
           bind-addr (:bind-address cfg)
           bind-port (:bind-port cfg)
+          inet-addr (java.net.InetAddress/getByName bind-addr)
           ;; Create UDP socket
-          udp-socket (DatagramSocket. bind-port (InetSocketAddress. bind-addr 0))
+          udp-socket (DatagramSocket. bind-port inet-addr)
           _ (.setSoTimeout udp-socket 1000)  ; 1s timeout for clean shutdown
           ;; Create TCP server
           tcp-server (ServerSocket.)
           _ (.setReuseAddress tcp-server true)
-          _ (.bind tcp-server (InetSocketAddress. bind-addr bind-port))
+          _ (.bind tcp-server (InetSocketAddress. inet-addr bind-port))
           _ (.setSoTimeout tcp-server 1000)
           ;; Create executor for periodic tasks
           executor (Executors/newScheduledThreadPool 2)]
