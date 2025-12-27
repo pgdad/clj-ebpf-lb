@@ -611,6 +611,237 @@ scrape_configs:
 (metrics/collect-metrics)
 ```
 
+### Cluster Mode (Distributed State Sharing)
+
+Run multiple load balancer instances with synchronized state for high availability. Cluster mode uses a peer-to-peer gossip protocol (SWIM-style) to share health status, circuit breaker states, drain coordination, and connection tracking across nodes.
+
+**Enable cluster mode in settings:**
+```clojure
+:settings
+{:cluster
+ {:enabled true
+  :node-id "auto"                    ; or explicit "lb-1", "lb-2", etc.
+  :bind-address "0.0.0.0"            ; Address for gossip communication
+  :bind-port 7946                    ; Port for gossip (UDP/TCP)
+  :seeds ["192.168.1.10:7946"        ; Seed nodes for initial discovery
+          "192.168.1.11:7946"]
+
+  ;; Gossip tuning (defaults optimized for small clusters)
+  :gossip-interval-ms 200            ; How often to gossip (default 200)
+  :gossip-fanout 2                   ; Peers to contact per interval
+  :push-pull-interval-ms 10000       ; Full state sync interval
+
+  ;; Failure detection
+  :ping-interval-ms 1000             ; Probe interval
+  :ping-timeout-ms 500               ; Probe timeout
+  :ping-req-count 3                  ; Indirect probes before suspicion
+  :suspicion-mult 3                  ; Suspicion timeout multiplier
+
+  ;; State synchronization toggles
+  :sync-health true                  ; Sync health check results
+  :sync-circuit-breaker true         ; Sync circuit breaker states
+  :sync-drain true                   ; Sync drain coordination
+  :sync-conntrack true}}             ; Sync connection tracking
+```
+
+**Minimal cluster configuration (2 nodes):**
+```clojure
+;; Node 1 (192.168.1.10)
+:settings
+{:cluster
+ {:enabled true
+  :node-id "lb-1"
+  :bind-port 7946
+  :seeds ["192.168.1.11:7946"]}}
+
+;; Node 2 (192.168.1.11)
+:settings
+{:cluster
+ {:enabled true
+  :node-id "lb-2"
+  :bind-port 7946
+  :seeds ["192.168.1.10:7946"]}}
+```
+
+**What Gets Synchronized:**
+
+| State Type | Description | Conflict Resolution |
+|------------|-------------|---------------------|
+| Health Status | Target health check results | Latest timestamp wins |
+| Circuit Breaker | Open/closed/half-open states | OPEN always wins (conservative) |
+| Drain Status | Which targets are draining | Draining wins over active |
+| Connection Tracking | Active connections for failover | Owner node wins, shadow on others |
+
+**Circuit Breaker Synchronization:**
+
+When a circuit breaker opens on any node, it propagates immediately to all nodes to prevent thundering herd:
+
+```clojure
+;; Configure circuit breaker (per-proxy)
+{:name "web"
+ :circuit-breaker
+ {:enabled true
+  :error-threshold 5                 ; Errors before opening
+  :error-rate-threshold 0.5          ; 50% error rate threshold
+  :half-open-requests 3              ; Test requests in half-open
+  :reset-timeout-ms 30000}}          ; Time before half-open
+```
+
+**Drain Coordination:**
+
+When draining a backend, all cluster nodes stop sending new connections:
+
+```clojure
+;; Drain on any node - propagates to all
+(lb/drain-backend! "web" "10.0.0.1:8080")
+
+;; All nodes will:
+;; 1. Stop routing new connections to this target
+;; 2. Wait for existing connections to complete
+;; 3. Report connection counts to originating node
+```
+
+**Connection Tracking Sync (Failover):**
+
+Connections are synchronized across nodes for seamless failover:
+
+```
+Node 1 (Owner)              Node 2 (Shadow)
+┌─────────────┐            ┌─────────────┐
+│ Connection  │  gossip    │   Shadow    │
+│  Created    │──────────→│   Entry     │
+│ (BPF map)   │            │ (userspace) │
+└─────────────┘            └─────────────┘
+       │                          │
+       │  Node 1 fails            │
+       ▼                          ▼
+                           ┌─────────────┐
+                           │  Promote    │
+                           │  to BPF     │
+                           │  (active)   │
+                           └─────────────┘
+```
+
+**Cluster API:**
+```clojure
+(require '[lb.cluster :as cluster])
+
+;; Start/stop cluster (usually done via config)
+(cluster/start! {:enabled true :bind-port 7946 :seeds [...]})
+(cluster/stop!)
+(cluster/running?)  ; => true/false
+
+;; Get cluster information
+(cluster/node-id)           ; => "lb-1"
+(cluster/cluster-size)      ; => 3
+(cluster/alive-nodes)       ; => #{"lb-1" "lb-2" "lb-3"}
+(cluster/all-nodes)         ; => {"lb-1" {...} "lb-2" {...}}
+
+;; Check node status
+(cluster/node-alive? "lb-2")     ; => true
+(cluster/node-suspected? "lb-2") ; => false
+(cluster/node-dead? "lb-2")      ; => false
+
+;; Get cluster statistics
+(cluster/stats)
+;; => {:status :running
+;;     :membership {:node-id "lb-1"
+;;                  :alive-count 3
+;;                  :suspected-count 0
+;;                  :dead-count 0}
+;;     :gossip {:running? true
+;;              :provider-count 4}}
+
+;; Subscribe to cluster events
+(def unsubscribe
+  (cluster/subscribe!
+    (fn [event]
+      (case (:event-type event)
+        :node-join (println "Node joined:" (:node-id event))
+        :node-leave (println "Node left:" (:node-id event))
+        :node-suspect (println "Node suspected:" (:node-id event))
+        :node-dead (println "Node confirmed dead:" (:node-id event))
+        nil))))
+
+;; Unsubscribe
+(unsubscribe)
+
+;; Manual state broadcast (usually automatic)
+(cluster/broadcast! :health "target-1" {:status :healthy})
+```
+
+**Admin API Endpoints:**
+
+When cluster mode is enabled, additional REST endpoints are available:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/v1/cluster/status` | GET | Cluster status and statistics |
+| `/api/v1/cluster/nodes` | GET | All known nodes and their states |
+| `/api/v1/cluster/sync` | GET | Sync status and lag metrics |
+| `/api/v1/cluster/sync` | POST | Force immediate full sync |
+
+```bash
+# Get cluster status
+curl http://localhost:8080/api/v1/cluster/status
+# {"status":"running","node-id":"lb-1","cluster-size":3,...}
+
+# Get all nodes
+curl http://localhost:8080/api/v1/cluster/nodes
+# {"lb-1":{"state":"alive",...},"lb-2":{"state":"alive",...}}
+
+# Force sync
+curl -X POST http://localhost:8080/api/v1/cluster/sync
+# {"success":true,"message":"Full sync initiated"}
+```
+
+**Cluster Metrics:**
+
+Additional Prometheus metrics when cluster mode is enabled:
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `lb_cluster_up` | gauge | - | Cluster mode running (1=yes) |
+| `lb_cluster_nodes_total` | gauge | state | Nodes by state (alive/suspected/dead) |
+| `lb_cluster_conntrack_sync` | gauge | - | Synced connection count |
+
+**Network Requirements:**
+
+- UDP port for gossip messages (default 7946)
+- TCP port for large state transfers (same port)
+- Low latency between nodes (<100ms recommended)
+- No NAT between cluster nodes (uses real IPs)
+
+**Failure Handling:**
+
+| Scenario | Behavior |
+|----------|----------|
+| Node unreachable | Marked suspected after ping-timeout × suspicion-mult |
+| Node confirmed dead | Connections promoted on remaining nodes |
+| Network partition | Each partition operates independently |
+| All peers dead | Single-node mode, full local functionality |
+
+**Configuration Parameters:**
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `enabled` | `false` | Enable cluster mode |
+| `node-id` | `"auto"` | Node identifier (auto-generates UUID) |
+| `bind-address` | `"0.0.0.0"` | Address for gossip communication |
+| `bind-port` | `7946` | Port for gossip (UDP and TCP) |
+| `seeds` | `[]` | Seed node addresses for discovery |
+| `gossip-interval-ms` | `200` | Gossip tick interval |
+| `gossip-fanout` | `2` | Peers to gossip to per tick |
+| `push-pull-interval-ms` | `10000` | Full state sync interval |
+| `ping-interval-ms` | `1000` | Failure detection probe interval |
+| `ping-timeout-ms` | `500` | Probe timeout |
+| `ping-req-count` | `3` | Indirect probes before suspicion |
+| `suspicion-mult` | `3` | Suspicion timeout multiplier |
+| `sync-health` | `true` | Sync health check results |
+| `sync-circuit-breaker` | `true` | Sync circuit breaker states |
+| `sync-drain` | `true` | Sync drain coordination |
+| `sync-conntrack` | `true` | Sync connection tracking |
+
 ## Programmatic API
 
 Use the load balancer as a library in your Clojure application:
