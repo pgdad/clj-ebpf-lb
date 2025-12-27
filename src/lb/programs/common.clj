@@ -4,6 +4,7 @@
             [clj-ebpf.dsl :as dsl]
             [clj-ebpf.maps.helpers :as mh]
             [clj-ebpf.net.bounds :as bounds]
+            [clj-ebpf.net.ipv6 :as ipv6]
             [clj-ebpf.ringbuf :as rb]))
 
 ;;; =============================================================================
@@ -40,14 +41,14 @@
 (def TCP-HLEN-MIN 20)
 (def UDP-HLEN 8)
 
-;; Header sizes - IPv6
-(def IPV6-HLEN 40)                  ; Fixed IPv6 header size (no options in base header)
+;; Header sizes - IPv6 (from clj-ebpf.net.ipv6)
+(def IPV6-HLEN ipv6/IPV6-HLEN)      ; Fixed IPv6 header size (no options in base header)
 
-;; IPv6 header field offsets (from start of IPv6 header)
-(def IPV6-OFF-NEXT-HEADER 6)        ; Next Header (protocol) at offset 6
-(def IPV6-OFF-HOP-LIMIT 7)          ; Hop Limit at offset 7
-(def IPV6-OFF-SRC 8)                ; Source address at offset 8 (16 bytes)
-(def IPV6-OFF-DST 24)               ; Destination address at offset 24 (16 bytes)
+;; IPv6 header field offsets (from clj-ebpf.net.ipv6)
+(def IPV6-OFF-NEXT-HEADER ipv6/IPV6-OFF-NEXT-HEADER) ; Next Header (protocol) at offset 6
+(def IPV6-OFF-HOP-LIMIT ipv6/IPV6-OFF-HOP-LIMIT)     ; Hop Limit at offset 7
+(def IPV6-OFF-SRC ipv6/IPV6-OFF-SRC)                 ; Source address at offset 8 (16 bytes)
+(def IPV6-OFF-DST ipv6/IPV6-OFF-DST)                 ; Destination address at offset 24 (16 bytes)
 
 ;; TLS constants for SNI parsing
 (def TLS-CONTENT-TYPE-HANDSHAKE 0x16)
@@ -241,93 +242,29 @@
       (when (pos? remaining-words)
         [(stx-w :r10 :r0 (+ stack-offset (* num-dwords 8)))]))))
 
-(defn build-load-ipv6-address
+;;; =============================================================================
+;;; IPv6 Address Helpers (delegating to clj-ebpf.net.ipv6)
+;;; =============================================================================
+
+(def build-load-ipv6-address
   "Generate instructions to load a 16-byte IPv6 address from packet to stack.
+   Delegates to clj-ebpf.net.ipv6/build-load-ipv6-address."
+  ipv6/build-load-ipv6-address)
 
-   Loads 4 consecutive 32-bit words from packet memory and stores them on stack.
-
-   src-reg: Register pointing to the start of the IPv6 address in packet
-   header-offset: Offset from src-reg to the address (e.g., IPV6-OFF-SRC or IPV6-OFF-DST)
-   stack-offset: Stack offset where to store the address (stores 16 bytes starting here)
-
-   Uses: r0 as scratch
-
-   Example: (build-load-ipv6-address :r9 IPV6-OFF-SRC -84)
-            Loads src IPv6 from r9+8 and stores to stack[-84..-69]"
-  [src-reg header-offset stack-offset]
-  [(ldx-w :r0 src-reg (+ header-offset 0))
-   (stx-w :r10 :r0 stack-offset)
-   (ldx-w :r0 src-reg (+ header-offset 4))
-   (stx-w :r10 :r0 (+ stack-offset 4))
-   (ldx-w :r0 src-reg (+ header-offset 8))
-   (stx-w :r10 :r0 (+ stack-offset 8))
-   (ldx-w :r0 src-reg (+ header-offset 12))
-   (stx-w :r10 :r0 (+ stack-offset 12))])
-
-(defn build-load-ipv4-unified
+(def build-load-ipv4-unified
   "Generate instructions to load a 4-byte IPv4 address into unified 16-byte format.
+   Delegates to clj-ebpf.net.ipv6/build-load-ipv4-unified."
+  ipv6/build-load-ipv4-unified)
 
-   Zeros the first 12 bytes, then stores the 4-byte IPv4 address at offset +12.
-   This creates an IPv4-mapped format compatible with IPv6 address storage.
-
-   src-reg: Register pointing to packet data
-   header-offset: Offset from src-reg to the IPv4 address (e.g., 12 for src, 16 for dst)
-   stack-offset: Stack offset for the 16-byte unified address
-
-   Uses: r0 as scratch
-
-   Example: (build-load-ipv4-unified :r9 12 -84)
-            Loads IPv4 src from r9+12, stores as 16-byte unified at stack[-84..-69]"
-  [src-reg header-offset stack-offset]
-  [(mov-imm :r0 0)
-   (stx-dw :r10 :r0 stack-offset)           ; zero bytes 0-7
-   (stx-w :r10 :r0 (+ stack-offset 8))      ; zero bytes 8-11
-   (ldx-w :r0 src-reg header-offset)        ; load 4-byte IPv4
-   (stx-w :r10 :r0 (+ stack-offset 12))])   ; store at bytes 12-15
-
-(defn build-copy-ipv6-address
+(def build-copy-ipv6-address
   "Generate instructions to copy a 16-byte IPv6 address from one stack location to another.
+   Delegates to clj-ebpf.net.ipv6/build-copy-ipv6-address."
+  ipv6/build-copy-ipv6-address)
 
-   src-stack-offset: Source stack offset (16 bytes)
-   dst-stack-offset: Destination stack offset (16 bytes)
-
-   Uses: r0 as scratch"
-  [src-stack-offset dst-stack-offset]
-  [(ldx-w :r0 :r10 src-stack-offset)
-   (stx-w :r10 :r0 dst-stack-offset)
-   (ldx-w :r0 :r10 (+ src-stack-offset 4))
-   (stx-w :r10 :r0 (+ dst-stack-offset 4))
-   (ldx-w :r0 :r10 (+ src-stack-offset 8))
-   (stx-w :r10 :r0 (+ dst-stack-offset 8))
-   (ldx-w :r0 :r10 (+ src-stack-offset 12))
-   (stx-w :r10 :r0 (+ dst-stack-offset 12))])
-
-(defn build-load-ipv6-address-adjusted
+(def build-load-ipv6-address-adjusted
   "Generate instructions to load a 16-byte IPv6 address with offset adjustment.
-
-   Like build-load-ipv6-address, but applies an additional offset adjustment.
-   Useful when the source register points to a position other than the IP header start.
-
-   src-reg: Register pointing to packet data
-   base-offset: Offset adjustment to apply (e.g., if r9 = data+58 and IPv6 header is at data+14,
-                use adjustment = -(58-14) = -44)
-   field-offset: Field offset within IPv6 header (IPV6-OFF-SRC or IPV6-OFF-DST)
-   stack-offset: Stack offset where to store the address
-
-   Uses: r0 as scratch
-
-   Example: (build-load-ipv6-address-adjusted :r9 -44 IPV6-OFF-SRC -56)
-            When r9 = data+58, loads src IPv6 (at data+14+8) to stack[-56..-41]"
-  [src-reg base-offset field-offset stack-offset]
-  (let [off (+ base-offset field-offset)]
-    [(ldx-w :r0 src-reg (+ off 0))
-     (stx-w :r10 :r0 stack-offset)
-     (ldx-w :r0 src-reg (+ off 4))
-     (stx-w :r10 :r0 (+ stack-offset 4))
-     (ldx-w :r0 src-reg (+ off 8))
-     (stx-w :r10 :r0 (+ stack-offset 8))
-     (ldx-w :r0 src-reg (+ off 12))
-     (stx-w :r10 :r0 (+ stack-offset 12))]))
+   Delegates to clj-ebpf.net.ipv6/build-load-ipv6-address-adjusted."
+  ipv6/build-load-ipv6-address-adjusted)
 
 
 ;;; =============================================================================
