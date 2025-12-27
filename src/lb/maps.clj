@@ -59,16 +59,24 @@
   "Create per-CPU hash map for connection tracking.
    Using per-CPU variant for lock-free concurrent access.
    Key: 5-tuple (16 bytes aligned)
-   Value: conntrack state (64 bytes):
-     orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2) +
-     created_ns(8) + last_seen_ns(8) + packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8)"
+   Value: conntrack state (128 bytes):
+     Bytes 0-63: NAT and stats fields
+       orig_dst_ip(4) + orig_dst_port(2) + pad(2) + nat_dst_ip(4) + nat_dst_port(2) + pad(2) +
+       created_ns(8) + last_seen_ns(8) + packets_fwd(8) + packets_rev(8) + bytes_fwd(8) + bytes_rev(8)
+     Bytes 64-95: Reserved for unified format compatibility
+     Bytes 96-127: PROXY protocol fields
+       conn_state(1) + proxy_flags(1) + pad(2) + seq_offset(4) +
+       orig_client_ip(16) + orig_client_port(2) + pad(6)
+
+   Note: XDP program only writes first 64 bytes; TC ingress reads PROXY fields at offset 96+."
   [{:keys [max-connections] :or {max-connections (:max-connections default-config)}}]
   (log/info "Creating conntrack per-CPU hash map with max-entries:" max-connections)
   ;; Use create-map directly to get identity serializers for byte arrays
   ;; Note: For per-CPU maps, the actual value size is value-size * num-cpus
+  ;; Value size is 128 bytes to support PROXY protocol fields accessed by TC ingress
   (bpf/create-map {:map-type :percpu-hash
                    :key-size 16
-                   :value-size 64
+                   :value-size 128
                    :max-entries max-connections
                    :map-name "proxy_conntrack"}))
 

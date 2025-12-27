@@ -907,13 +907,19 @@
 
 (defn encode-conntrack-value
   "Encode connection tracking value.
-   {orig_dst_ip (4) + orig_dst_port (2) + padding (2) + nat_dst_ip (4) + nat_dst_port (2) + padding (2) +
-    created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
-   Total: 64 bytes.
+   Bytes 0-63: NAT and stats fields
+     {orig_dst_ip (4) + orig_dst_port (2) + padding (2) + nat_dst_ip (4) + nat_dst_port (2) + padding (2) +
+      created_ns (8) + last_seen_ns (8) + packets_fwd (8) + packets_rev (8) + bytes_fwd (8) + bytes_rev (8)}
+   Bytes 64-95: Reserved (zeros for compatibility with unified format)
+   Bytes 96-127: PROXY protocol fields
+     {conn_state (1) + proxy_flags (1) + padding (2) + seq_offset (4) +
+      orig_client_ip (16) + orig_client_port (2) + padding (6)}
+   Total: 128 bytes.
    IPs and ports in network byte order (from packet), counters in native order."
   [{:keys [orig-dst-ip orig-dst-port nat-dst-ip nat-dst-port
-           created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev]}]
-  (let [buf (ByteBuffer/allocate 64)]
+           created-ns last-seen packets-fwd packets-rev bytes-fwd bytes-rev
+           conn-state proxy-flags seq-offset orig-client-ip orig-client-port]}]
+  (let [buf (ByteBuffer/allocate 128)]
     ;; IPs and ports in network byte order
     (.order buf ByteOrder/BIG_ENDIAN)
     (.putInt buf (unchecked-int (or orig-dst-ip 0)))
@@ -930,12 +936,28 @@
     (.putLong buf (or packets-rev 0))
     (.putLong buf (or bytes-fwd 0))
     (.putLong buf (or bytes-rev 0))
+    ;; Bytes 64-95: Reserved (zeros)
+    (dotimes [_ 32] (.put buf (byte 0)))
+    ;; Bytes 96-127: PROXY protocol fields
+    (.put buf (unchecked-byte (or conn-state 0)))
+    (.put buf (unchecked-byte (or proxy-flags 0)))
+    (.putShort buf (short 0))  ; padding
+    (.putInt buf (unchecked-int (or seq-offset 0)))
+    ;; orig_client_ip (16 bytes) - use zero IP if not provided
+    (if orig-client-ip
+      (.put buf ^bytes orig-client-ip)
+      (dotimes [_ 16] (.put buf (byte 0))))
+    (.putShort buf (unchecked-short (or orig-client-port 0)))
+    ;; padding (6 bytes)
+    (dotimes [_ 6] (.put buf (byte 0)))
     (.array buf)))
 
 (defn decode-conntrack-value
-  "Decode connection tracking value from byte array (64 bytes)."
+  "Decode connection tracking value from byte array (64 or 128 bytes).
+   Handles both legacy 64-byte and new 128-byte formats."
   [^bytes b]
-  (let [buf (ByteBuffer/wrap b)]
+  (let [buf (ByteBuffer/wrap b)
+        has-proxy-fields (>= (alength b) 128)]
     ;; IPs and ports in network byte order
     (.order buf ByteOrder/BIG_ENDIAN)
     (let [orig-dst-ip (Integer/toUnsignedLong (.getInt buf))
@@ -951,17 +973,35 @@
             packets-fwd (.getLong buf)
             packets-rev (.getLong buf)
             bytes-fwd (.getLong buf)
-            bytes-rev (.getLong buf)]
-        {:orig-dst-ip orig-dst-ip
-         :orig-dst-port orig-dst-port
-         :nat-dst-ip nat-dst-ip
-         :nat-dst-port nat-dst-port
-         :created-ns created-ns
-         :last-seen last-seen
-         :packets-fwd packets-fwd
-         :packets-rev packets-rev
-         :bytes-fwd bytes-fwd
-         :bytes-rev bytes-rev}))))
+            bytes-rev (.getLong buf)
+            ;; PROXY protocol fields (if 128-byte format)
+            proxy-fields (when has-proxy-fields
+                           ;; Skip reserved bytes 64-95
+                           (.position buf 96)
+                           (let [conn-state (bit-and (.get buf) 0xFF)
+                                 proxy-flags (bit-and (.get buf) 0xFF)
+                                 _ (.getShort buf)  ; padding
+                                 seq-offset (.getInt buf)
+                                 orig-client-ip (byte-array 16)
+                                 _ (.get buf orig-client-ip)
+                                 orig-client-port (bit-and (.getShort buf) 0xFFFF)]
+                             {:conn-state conn-state
+                              :proxy-flags proxy-flags
+                              :seq-offset seq-offset
+                              :orig-client-ip orig-client-ip
+                              :orig-client-port orig-client-port}))]
+        (merge
+          {:orig-dst-ip orig-dst-ip
+           :orig-dst-port orig-dst-port
+           :nat-dst-ip nat-dst-ip
+           :nat-dst-port nat-dst-port
+           :created-ns created-ns
+           :last-seen last-seen
+           :packets-fwd packets-fwd
+           :packets-rev packets-rev
+           :bytes-fwd bytes-fwd
+           :bytes-rev bytes-rev}
+          proxy-fields)))))
 
 (defn encode-stats-event
   "Encode a stats event for ring buffer.

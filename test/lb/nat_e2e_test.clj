@@ -107,7 +107,7 @@
       (is (= (:protocol key) (:protocol decoded))))))
 
 (deftest test-conntrack-value-encoding
-  (testing "Conntrack value encodes to 64 bytes"
+  (testing "Conntrack value encodes to 128 bytes"
     (let [value {:orig-dst-ip (util/ip-string->u32 "10.0.0.1")
                  :orig-dst-port 80
                  :nat-dst-ip (util/ip-string->u32 "10.1.1.5")
@@ -119,7 +119,7 @@
                  :bytes-fwd 15000
                  :bytes-rev 12000}
           encoded (util/encode-conntrack-value value)]
-      (is (= 64 (count encoded)))))
+      (is (= 128 (count encoded)))))
 
   (testing "Conntrack value round-trips correctly"
     (let [value {:orig-dst-ip (util/ip-string->u32 "10.0.0.1")
