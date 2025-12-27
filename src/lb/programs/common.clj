@@ -2,7 +2,8 @@
   "Common eBPF program fragments and DSL utilities shared between XDP and TC programs."
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
-            [clj-ebpf.maps.helpers :as mh]))
+            [clj-ebpf.maps.helpers :as mh]
+            [clj-ebpf.net.bounds :as bounds]))
 
 ;;; =============================================================================
 ;;; BPF Constants
@@ -326,6 +327,7 @@
      (ldx-w :r0 src-reg (+ off 12))
      (stx-w :r10 :r0 (+ stack-offset 12))]))
 
+
 ;;; =============================================================================
 ;;; Unified Stack Layout Constants
 ;;; =============================================================================
@@ -371,11 +373,11 @@
    is within packet bounds. Jumps forward by fail-offset if out of bounds.
 
    Assumes: r6 = data start, r7 = data end
-   Uses: r8 as scratch"
+   Uses: r8 as scratch
+
+   Delegates to clj-ebpf.net.bounds/build-bounds-check with r6/r7 convention."
   [offset size fail-offset]
-  [(mov-reg :r8 :r6)                 ;; r8 = data start
-   (add-imm :r8 (+ offset size))     ;; r8 = data + offset + size
-   (dsl/jmp-reg :jgt :r8 :r7 fail-offset)]) ;; if r8 > data_end, jump forward
+  (bounds/build-bounds-check :r6 :r7 offset size fail-offset))
 
 (defn build-parse-eth
   "Parse Ethernet header and check for IPv4.
@@ -666,9 +668,6 @@
    Uses: r0, r1 as scratch"
   []
   [(dsl/call BPF-FUNC-get-prandom-u32)
-   ;; r0 = r0 % 100
-   ;; BPF doesn't have modulo, so we use: r0 = r0 - (r0 / 100) * 100
-   ;; But there's a simpler approach: BPF has ALU mod operation
    (dsl/mod :r0 100)])
 
 ;;; =============================================================================
