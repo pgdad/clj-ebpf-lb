@@ -5,6 +5,7 @@
             [clj-ebpf.maps.helpers :as mh]
             [clj-ebpf.net.bounds :as bounds]
             [clj-ebpf.net.ipv6 :as ipv6]
+            [clj-ebpf.rate-limit :as rl]
             [clj-ebpf.ringbuf :as rb]
             [clj-ebpf.time :as time]))
 
@@ -111,8 +112,8 @@
 (def BPF-NOEXIST mh/BPF-NOEXIST)
 (def BPF-EXIST mh/BPF-EXIST)
 
-;; Rate limiting constants
-(def TOKEN-SCALE 1000)               ; Token scaling factor (same as in maps.clj)
+;; Rate limiting constants (from clj-ebpf.rate-limit)
+(def TOKEN-SCALE rl/TOKEN-SCALE)     ; Token scaling factor
 (def RATE-LIMIT-CONFIG-SRC 0)        ; Config map index for source rate limit
 (def RATE-LIMIT-CONFIG-BACKEND 1)    ; Config map index for backend rate limit
 
