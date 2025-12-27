@@ -3,6 +3,7 @@
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
             [clj-ebpf.maps.helpers :as mh]
+            [clj-ebpf.memory :as mem]
             [clj-ebpf.net.bounds :as bounds]
             [clj-ebpf.net.ipv6 :as ipv6]
             [clj-ebpf.rate-limit :as rl]
@@ -216,33 +217,13 @@
   (dsl/stx :dw dst src off))
 
 ;;; =============================================================================
-;;; Memory Operations
+;;; Memory Operations (delegating to clj-ebpf.memory)
 ;;; =============================================================================
 
-(defn build-zero-bytes
+(def build-zero-bytes
   "Generate instructions to zero a contiguous range of bytes on the stack.
-
-   stack-offset: Starting stack offset (negative, e.g., -84)
-   num-bytes: Number of bytes to zero (must be multiple of 4)
-
-   Uses: r0 as scratch
-
-   Example: (build-zero-bytes -84 12) zeros bytes at stack[-84] to stack[-73]"
-  [stack-offset num-bytes]
-  {:pre [(neg? stack-offset)
-         (pos? num-bytes)
-         (zero? (mod num-bytes 4))]}
-  (let [num-dwords (quot num-bytes 8)
-        remaining-words (quot (mod num-bytes 8) 4)]
-    (concat
-      ;; Set r0 = 0 once
-      [(mov-imm :r0 0)]
-      ;; Zero 8 bytes at a time with stx :dw
-      (for [i (range num-dwords)]
-        (stx-dw :r10 :r0 (+ stack-offset (* i 8))))
-      ;; Zero remaining 4-byte word if any
-      (when (pos? remaining-words)
-        [(stx-w :r10 :r0 (+ stack-offset (* num-dwords 8)))]))))
+   Delegates to clj-ebpf.memory/build-zero-bytes."
+  mem/build-zero-bytes)
 
 ;;; =============================================================================
 ;;; IPv6 Address Helpers (delegating to clj-ebpf.net.ipv6)
