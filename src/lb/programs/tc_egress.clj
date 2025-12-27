@@ -311,10 +311,7 @@
       ;; Call bpf_map_lookup_elem(conntrack_map, &key)
       (if conntrack-map-fd
         (concat
-          [(dsl/ld-map-fd :r1 conntrack-map-fd)
-           (dsl/mov-reg :r2 :r10)
-           (dsl/add :r2 -16)              ; r2 = &key (stack[-16])
-           (dsl/call 1)]                   ; bpf_map_lookup_elem
+          (common/build-map-lookup conntrack-map-fd -16)
           ;; r0 = value ptr or NULL
           [(asm/jmp-imm :jeq :r0 0 :pass) ; no entry = not tracked, pass through
            ;; Save map value pointer in r9
@@ -700,10 +697,7 @@
 
       (if conntrack-map-fd
         (concat
-          [(dsl/ld-map-fd :r1 conntrack-map-fd)
-           (dsl/mov-reg :r2 :r10)
-           (dsl/add :r2 -40)              ; r2 = &key (40 bytes)
-           (dsl/call 1)]
+          (common/build-map-lookup conntrack-map-fd -40)
           [(asm/jmp-imm :jeq :r0 0 :pass_unified)
            (dsl/mov-reg :r9 :r0)
            (asm/jmp :do_snat_unified)])

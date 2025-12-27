@@ -378,10 +378,7 @@
 
         (if conntrack-map-fd
           (concat
-            [(dsl/ld-map-fd :r1 conntrack-map-fd)
-             (dsl/mov-reg :r2 :r10)
-             (dsl/add :r2 -40)              ; r2 = &key (40 bytes)
-             (dsl/call BPF-FUNC-map-lookup-elem)]
+            (common/build-map-lookup conntrack-map-fd -40)
 
             ;; If no conntrack entry, pass (this connection not tracked)
             [(asm/jmp-imm :jeq :r0 0 :pass)]

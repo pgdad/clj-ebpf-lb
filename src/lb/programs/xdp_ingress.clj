@@ -632,10 +632,7 @@
           [(dsl/stx :dw :r10 :r3 -88)]
 
           ;; Look up SNI map
-          [(dsl/ld-map-fd :r1 sni-map-fd)
-           (dsl/mov-reg :r2 :r10)
-           (dsl/add :r2 -88)                   ; r2 = &sni_key
-           (dsl/call 1)]                       ; bpf_map_lookup_elem
+          (common/build-map-lookup sni-map-fd -88)
 
           ;; If found, use SNI route; otherwise fall through to listen map
           [(asm/jmp-imm :jeq :r0 0 :lookup_listen)
@@ -687,10 +684,7 @@
       ;; Only do lookup if we have a valid map FD
       (if listen-map-fd
         (concat
-          [(dsl/ld-map-fd :r1 listen-map-fd)
-           (dsl/mov-reg :r2 :r10)
-           (dsl/add :r2 -8)               ; r2 = &key
-           (dsl/call 1)]                   ; bpf_map_lookup_elem
+          (common/build-map-lookup listen-map-fd -8)
           ;; r0 = value ptr or NULL
           ;; If NULL, this port isn't being proxied - pass through
           [(asm/jmp-imm :jeq :r0 0 :pass)
@@ -1280,10 +1274,7 @@
       ;; Call bpf_map_lookup_elem(listen_map, &key)
       (if listen-map-fd
         (concat
-          [(dsl/ld-map-fd :r1 listen-map-fd)
-           (dsl/mov-reg :r2 :r10)
-           (dsl/add :r2 -8)
-           (dsl/call 1)]                 ; bpf_map_lookup_elem
+          (common/build-map-lookup listen-map-fd -8)
           [(asm/jmp-imm :jeq :r0 0 :pass)
            (dsl/mov-reg :r9 :r0)         ; r9 = map value ptr
            (asm/jmp :do_nat_unified)])

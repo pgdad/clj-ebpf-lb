@@ -1,7 +1,8 @@
 (ns lb.programs.common
   "Common eBPF program fragments and DSL utilities shared between XDP and TC programs."
   (:require [clj-ebpf.core :as bpf]
-            [clj-ebpf.dsl :as dsl]))
+            [clj-ebpf.dsl :as dsl]
+            [clj-ebpf.maps.helpers :as mh]))
 
 ;;; =============================================================================
 ;;; BPF Constants
@@ -82,10 +83,12 @@
 (def SKB-OFF-DATA 76)                      ; __u32 data at offset 76
 (def SKB-OFF-DATA-END 80)                  ; __u32 data_end at offset 80
 
-;; BPF helper function IDs
-(def BPF-FUNC-map-lookup-elem 1)
-(def BPF-FUNC-map-update-elem 2)
-(def BPF-FUNC-map-delete-elem 3)
+;; BPF helper function IDs (map operations from clj-ebpf.maps.helpers)
+(def BPF-FUNC-map-lookup-elem mh/BPF-FUNC-map-lookup-elem)
+(def BPF-FUNC-map-update-elem mh/BPF-FUNC-map-update-elem)
+(def BPF-FUNC-map-delete-elem mh/BPF-FUNC-map-delete-elem)
+
+;; Other BPF helper function IDs
 (def BPF-FUNC-ktime-get-ns 5)
 (def BPF-FUNC-get-prandom-u32 7)  ;; For weighted load balancing
 (def BPF-FUNC-redirect 23)
@@ -97,6 +100,11 @@
 (def BPF-FUNC-ringbuf-reserve 131)
 (def BPF-FUNC-ringbuf-submit 132)
 (def BPF-FUNC-ringbuf-discard 133)
+
+;; Map update flags (from clj-ebpf.maps.helpers)
+(def BPF-ANY mh/BPF-ANY)
+(def BPF-NOEXIST mh/BPF-NOEXIST)
+(def BPF-EXIST mh/BPF-EXIST)
 
 ;; Rate limiting constants
 (def TOKEN-SCALE 1000)               ; Token scaling factor (same as in maps.clj)
@@ -538,39 +546,28 @@
      (stx-h :r10 :r9 -48)]))
 
 ;;; =============================================================================
-;;; Map Lookup Helpers
+;;; Map Lookup Helpers (delegating to clj-ebpf.maps.helpers)
 ;;; =============================================================================
 
-(defn build-map-lookup
+(def build-map-lookup
   "Generate instructions for bpf_map_lookup_elem.
+   Delegates to clj-ebpf.maps.helpers/build-map-lookup."
+  mh/build-map-lookup)
 
-   Args:
-     map-fd: The map file descriptor (will be loaded as 64-bit immediate)
-     key-stack-off: Stack offset where key is stored (negative)
-
-   Returns: instructions that leave result pointer in r0 (or NULL)"
-  [map-fd key-stack-off]
-  [(dsl/ld-map-fd :r1 map-fd)     ;; r1 = map fd
-   (mov-reg :r2 :r10)             ;; r2 = frame pointer
-   (add-imm :r2 key-stack-off)    ;; r2 = &key
-   (dsl/call BPF-FUNC-map-lookup-elem)])
-
-(defn build-map-update
+(def build-map-update
   "Generate instructions for bpf_map_update_elem.
+   Delegates to clj-ebpf.maps.helpers/build-map-update."
+  mh/build-map-update)
 
-   Args:
-     map-fd: The map file descriptor
-     key-stack-off: Stack offset where key is stored
-     value-stack-off: Stack offset where value is stored
-     flags: Update flags (0 = any, 1 = noexist, 2 = exist)"
-  [map-fd key-stack-off value-stack-off flags]
-  [(dsl/ld-map-fd :r1 map-fd)
-   (mov-reg :r2 :r10)
-   (add-imm :r2 key-stack-off)
-   (mov-reg :r3 :r10)
-   (add-imm :r3 value-stack-off)
-   (mov-imm :r4 flags)
-   (dsl/call BPF-FUNC-map-update-elem)])
+(def build-map-delete
+  "Generate instructions for bpf_map_delete_elem.
+   Delegates to clj-ebpf.maps.helpers/build-map-delete."
+  mh/build-map-delete)
+
+(def build-map-lookup-or-init
+  "Generate instructions for map lookup with initialization if not found.
+   Delegates to clj-ebpf.maps.helpers/build-map-lookup-or-init."
+  mh/build-map-lookup-or-init)
 
 ;;; =============================================================================
 ;;; Checksum Helpers
