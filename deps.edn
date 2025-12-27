@@ -2,7 +2,7 @@
 
  :deps
  {org.clojure/clojure {:mvn/version "1.12.0"}
-  org.clojars.pgdad/clj-ebpf {:mvn/version "0.6.4"}
+  org.clojars.pgdad/clj-ebpf {:mvn/version "0.6.5"}
   org.clojure/core.async {:mvn/version "1.6.681"}
   org.clojure/data.json {:mvn/version "2.5.1"}
   org.clojure/tools.cli {:mvn/version "1.1.230"}

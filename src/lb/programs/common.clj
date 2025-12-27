@@ -5,7 +5,8 @@
             [clj-ebpf.maps.helpers :as mh]
             [clj-ebpf.net.bounds :as bounds]
             [clj-ebpf.net.ipv6 :as ipv6]
-            [clj-ebpf.ringbuf :as rb]))
+            [clj-ebpf.ringbuf :as rb]
+            [clj-ebpf.time :as time]))
 
 ;;; =============================================================================
 ;;; BPF Constants
@@ -91,9 +92,9 @@
 (def BPF-FUNC-map-update-elem mh/BPF-FUNC-map-update-elem)
 (def BPF-FUNC-map-delete-elem mh/BPF-FUNC-map-delete-elem)
 
-;; Other BPF helper function IDs
-(def BPF-FUNC-ktime-get-ns 5)
-(def BPF-FUNC-get-prandom-u32 7)  ;; For weighted load balancing
+;; Time and random helper function IDs (from clj-ebpf.time)
+(def BPF-FUNC-ktime-get-ns time/BPF-FUNC-ktime-get-ns)
+(def BPF-FUNC-get-prandom-u32 time/BPF-FUNC-get-prandom-u32)  ;; For weighted load balancing
 (def BPF-FUNC-redirect 23)
 (def BPF-FUNC-csum-diff 28)
 (def BPF-FUNC-l3-csum-replace 55)
@@ -566,32 +567,28 @@
   rb/build-ringbuf-discard)
 
 ;;; =============================================================================
-;;; Time Helper
+;;; Time Helpers (delegating to clj-ebpf.time)
 ;;; =============================================================================
 
-(defn build-ktime-get-ns
+(def build-ktime-get-ns
   "Get current time in nanoseconds.
-   Result in r0."
-  []
-  [(dsl/call BPF-FUNC-ktime-get-ns)])
+   Delegates to clj-ebpf.time/build-ktime-get-ns."
+  time/build-ktime-get-ns)
 
 ;;; =============================================================================
-;;; Random Number Helper (for Weighted Load Balancing)
+;;; Random Number Helpers (delegating to clj-ebpf.time)
 ;;; =============================================================================
 
-(defn build-get-prandom-u32
+(def build-get-prandom-u32
   "Get a pseudo-random 32-bit number.
-   Result in r0."
-  []
-  [(dsl/call BPF-FUNC-get-prandom-u32)])
+   Delegates to clj-ebpf.time/build-get-prandom-u32."
+  time/build-get-prandom-u32)
 
 (defn build-random-mod-100
   "Generate random number in range [0, 99].
-   Result in r0.
-   Uses: r0, r1 as scratch"
+   Delegates to clj-ebpf.time/build-random-mod."
   []
-  [(dsl/call BPF-FUNC-get-prandom-u32)
-   (dsl/mod :r0 100)])
+  (time/build-random-mod 100))
 
 ;;; =============================================================================
 ;;; Map Utilities
