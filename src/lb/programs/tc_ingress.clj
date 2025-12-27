@@ -307,24 +307,10 @@
         [(asm/label :ipv6_is_tcp)]
 
         ;; Build conntrack key: src_ip (16 bytes)
-        [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
-         (dsl/stx :w :r10 :r0 -40)
-         (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
-         (dsl/stx :w :r10 :r0 -36)
-         (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
-         (dsl/stx :w :r10 :r0 -32)
-         (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
-         (dsl/stx :w :r10 :r0 -28)]
+        (common/build-load-ipv6-address :r9 common/IPV6-OFF-SRC -40)
 
         ;; dst_ip (16 bytes)
-        [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
-         (dsl/stx :w :r10 :r0 -24)
-         (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
-         (dsl/stx :w :r10 :r0 -20)
-         (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
-         (dsl/stx :w :r10 :r0 -16)
-         (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
-         (dsl/stx :w :r10 :r0 -12)]
+        (common/build-load-ipv6-address :r9 common/IPV6-OFF-DST -24)
 
         ;; Store L4 offset
         [(dsl/mov :r0 (+ net/ETH-HLEN common/IPV6-HLEN))

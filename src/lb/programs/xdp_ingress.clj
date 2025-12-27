@@ -1149,26 +1149,13 @@
        (dsl/stx :b :r10 :r0 -105)]      ; store at stack[-105]
 
       ;; Load source IP (4 bytes) and store in unified format (16 bytes)
-      ;; Zero first 12 bytes, then store 4-byte IP
-      [(dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -84)       ; zero bytes 0-7 of src_ip
-       (dsl/stx :w :r10 :r0 -76)        ; zero bytes 8-11 of src_ip
-       (dsl/ldx :w :r0 :r9 12)          ; load src_ip (4 bytes)
-       (dsl/stx :w :r10 :r0 -72)]       ; store at bytes 12-15 (offset -84+12 = -72)
+      (common/build-load-ipv4-unified :r9 12 -84)  ; src_ip at stack[-84..-69]
 
       ;; Load destination IP and store in unified format
-      [(dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -44)       ; zero bytes 0-7 of old_dst_ip
-       (dsl/stx :w :r10 :r0 -36)        ; zero bytes 8-11 of old_dst_ip
-       (dsl/ldx :w :r0 :r9 16)          ; load dst_ip (4 bytes)
-       (dsl/stx :w :r10 :r0 -32)]       ; store at bytes 12-15 of old_dst_ip
+      (common/build-load-ipv4-unified :r9 16 -44)  ; old_dst_ip at stack[-44..-29]
 
       ;; Also store original dst_ip for conntrack
-      [(dsl/mov :r0 0)
-       (dsl/stx :dw :r10 :r0 -100)      ; zero bytes 0-7 of dst_ip_orig
-       (dsl/stx :w :r10 :r0 -92)        ; zero bytes 8-11 of dst_ip_orig
-       (dsl/ldx :w :r0 :r9 16)          ; load dst_ip again
-       (dsl/stx :w :r10 :r0 -88)]       ; store at bytes 12-15 of dst_ip_orig
+      (common/build-load-ipv4-unified :r9 16 -100) ; dst_ip_orig at stack[-100..-85]
 
       ;; Calculate L4 header offset (ETH_HLEN + 20 for min IP header)
       [(dsl/mov :r0 (+ net/ETH-HLEN net/IPV4-MIN-HLEN))
@@ -1199,34 +1186,13 @@
        (dsl/stx :b :r10 :r0 -105)]
 
       ;; Load source IP (16 bytes) at offset 8
-      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 0))
-       (dsl/stx :w :r10 :r0 -84)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 4))
-       (dsl/stx :w :r10 :r0 -80)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 8))
-       (dsl/stx :w :r10 :r0 -76)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-SRC 12))
-       (dsl/stx :w :r10 :r0 -72)]
+      (common/build-load-ipv6-address :r9 common/IPV6-OFF-SRC -84)
 
       ;; Load destination IP (16 bytes) at offset 24 - store as old_dst_ip
-      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
-       (dsl/stx :w :r10 :r0 -44)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
-       (dsl/stx :w :r10 :r0 -40)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
-       (dsl/stx :w :r10 :r0 -36)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
-       (dsl/stx :w :r10 :r0 -32)]
+      (common/build-load-ipv6-address :r9 common/IPV6-OFF-DST -44)
 
       ;; Also store as dst_ip_orig for conntrack
-      [(dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 0))
-       (dsl/stx :w :r10 :r0 -100)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 4))
-       (dsl/stx :w :r10 :r0 -96)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 8))
-       (dsl/stx :w :r10 :r0 -92)
-       (dsl/ldx :w :r0 :r9 (+ common/IPV6-OFF-DST 12))
-       (dsl/stx :w :r10 :r0 -88)]
+      (common/build-load-ipv6-address :r9 common/IPV6-OFF-DST -100)
 
       ;; Calculate L4 header offset (ETH_HLEN + 40 for IPv6 header)
       [(dsl/mov :r0 (+ net/ETH-HLEN common/IPV6-HLEN))

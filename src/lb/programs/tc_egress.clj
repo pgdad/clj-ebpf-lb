@@ -612,36 +612,18 @@
        (dsl/stx :b :r10 :r0 -61)]
 
       ;; Load source IP (backend, 16 bytes) - store as old_src_ip
-      ;; Source IP at IPv6 offset 8 = data + 22 = r9 - 36
-      [(dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 0) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -56)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 4) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -52)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 8) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -48)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 12) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -44)]
+      ;; r9 = data + 58 (L4 header), IPv6 header at data + 14
+      ;; Adjustment: -(58-14) = -44 = -(IPV6-HLEN + 4)
+      (common/build-load-ipv6-address-adjusted :r9 (- (+ common/IPV6-HLEN 4))
+                                               common/IPV6-OFF-SRC -56)
 
-      ;; key.dst_ip = backend (16 bytes)
-      [(dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 0) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -24)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 4) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -20)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 8) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -16)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-SRC 12) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -12)]
+      ;; key.dst_ip = backend (16 bytes) - same source address
+      (common/build-load-ipv6-address-adjusted :r9 (- (+ common/IPV6-HLEN 4))
+                                               common/IPV6-OFF-SRC -24)
 
       ;; Load destination IP (client, 16 bytes) - store as key.src_ip
-      ;; Dest IP at IPv6 offset 24 = data + 38 = r9 - 20
-      [(dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 0) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -40)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 4) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -36)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 8) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -32)
-       (dsl/ldx :w :r0 :r9 (- (+ common/IPV6-OFF-DST 12) (+ common/IPV6-HLEN 4)))
-       (dsl/stx :w :r10 :r0 -28)]
+      (common/build-load-ipv6-address-adjusted :r9 (- (+ common/IPV6-HLEN 4))
+                                               common/IPV6-OFF-DST -40)
 
       ;; r9 remains in register for TCP/UDP port access (r9 = data + 58)
 
