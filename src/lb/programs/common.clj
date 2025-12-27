@@ -3,7 +3,8 @@
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
             [clj-ebpf.maps.helpers :as mh]
-            [clj-ebpf.net.bounds :as bounds]))
+            [clj-ebpf.net.bounds :as bounds]
+            [clj-ebpf.ringbuf :as rb]))
 
 ;;; =============================================================================
 ;;; BPF Constants
@@ -98,9 +99,10 @@
 (def BPF-FUNC-l4-csum-replace 56)
 (def BPF-FUNC-redirect-map 51)
 (def BPF-FUNC-xdp-adjust-head 44)
-(def BPF-FUNC-ringbuf-reserve 131)
-(def BPF-FUNC-ringbuf-submit 132)
-(def BPF-FUNC-ringbuf-discard 133)
+;; Ring buffer helper function IDs (from clj-ebpf.ringbuf)
+(def BPF-FUNC-ringbuf-reserve rb/BPF-FUNC-ringbuf-reserve)
+(def BPF-FUNC-ringbuf-submit rb/BPF-FUNC-ringbuf-submit)
+(def BPF-FUNC-ringbuf-discard rb/BPF-FUNC-ringbuf-discard)
 
 ;; Map update flags (from clj-ebpf.maps.helpers)
 (def BPF-ANY mh/BPF-ANY)
@@ -608,39 +610,23 @@
    (dsl/call BPF-FUNC-l4-csum-replace)])
 
 ;;; =============================================================================
-;;; Ring Buffer Helpers
+;;; Ring Buffer Helpers (delegating to clj-ebpf.ringbuf)
 ;;; =============================================================================
 
-(defn build-ringbuf-reserve
+(def build-ringbuf-reserve
   "Reserve space in ring buffer.
+   Delegates to clj-ebpf.ringbuf/build-ringbuf-reserve."
+  rb/build-ringbuf-reserve)
 
-   ringbuf-fd: Ring buffer map FD
-   size: Size to reserve
-
-   Returns ptr in r0 (or NULL on failure)"
-  [ringbuf-fd size]
-  [(dsl/ld-map-fd :r1 ringbuf-fd)
-   (mov-imm :r2 size)
-   (mov-imm :r3 0)              ;; flags
-   (dsl/call BPF-FUNC-ringbuf-reserve)])
-
-(defn build-ringbuf-submit
+(def build-ringbuf-submit
   "Submit ring buffer entry.
+   Delegates to clj-ebpf.ringbuf/build-ringbuf-submit."
+  rb/build-ringbuf-submit)
 
-   ptr-reg: Register containing pointer from reserve"
-  [ptr-reg]
-  [(mov-reg :r1 ptr-reg)
-   (mov-imm :r2 0)              ;; flags
-   (dsl/call BPF-FUNC-ringbuf-submit)])
-
-(defn build-ringbuf-discard
+(def build-ringbuf-discard
   "Discard ring buffer reservation.
-
-   ptr-reg: Register containing pointer from reserve"
-  [ptr-reg]
-  [(mov-reg :r1 ptr-reg)
-   (mov-imm :r2 0)
-   (dsl/call BPF-FUNC-ringbuf-discard)])
+   Delegates to clj-ebpf.ringbuf/build-ringbuf-discard."
+  rb/build-ringbuf-discard)
 
 ;;; =============================================================================
 ;;; Time Helper
