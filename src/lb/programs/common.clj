@@ -9,6 +9,7 @@
             [clj-ebpf.net :as net]
             [clj-ebpf.net.bounds :as bounds]
             [clj-ebpf.net.checksum :as csum]
+            [clj-ebpf.net.ethernet :as eth]
             [clj-ebpf.net.ipv4 :as ipv4]
             [clj-ebpf.net.ipv6 :as ipv6]
             [clj-ebpf.net.tcp :as tcp]
@@ -18,7 +19,7 @@
             [clj-ebpf.time :as time]))
 
 ;;; =============================================================================
-;;; BPF Constants (using clj-ebpf 0.7.7 DSL modules)
+;;; BPF Constants (using clj-ebpf 0.7.8 DSL modules)
 ;;; =============================================================================
 
 ;; XDP return codes (from clj-ebpf.dsl.xdp)
@@ -303,6 +304,40 @@
   "Store UDP destination port from register to packet (network byte order).
    Delegates to clj-ebpf.net.udp/store-dport."
   udp/store-dport)
+
+;;; =============================================================================
+;;; Ethernet Helpers (new in 0.7.8, delegating to clj-ebpf.net.ethernet)
+;;; =============================================================================
+
+(def eth-is-ipv4
+  "Check if packet is IPv4 and jump to label if true.
+   Delegates to clj-ebpf.net.ethernet/is-ipv4."
+  eth/is-ipv4)
+
+(def eth-is-ipv6
+  "Check if packet is IPv6 and jump to label if true.
+   Delegates to clj-ebpf.net.ethernet/is-ipv6."
+  eth/is-ipv6)
+
+(def eth-is-not-ipv4
+  "Check if packet is NOT IPv4 and jump to label if true.
+   Delegates to clj-ebpf.net.ethernet/is-not-ipv4."
+  eth/is-not-ipv4)
+
+(def eth-load-ethertype
+  "Load ethertype from Ethernet header (network byte order).
+   Delegates to clj-ebpf.net.ethernet/load-ethertype."
+  eth/load-ethertype)
+
+(def eth-parse-ethernet
+  "Parse Ethernet header with bounds check and load ethertype.
+   Delegates to clj-ebpf.net.ethernet/parse-ethernet."
+  eth/parse-ethernet)
+
+(def eth-swap-macs
+  "Swap source and destination MAC addresses.
+   Delegates to clj-ebpf.net.ethernet/swap-macs."
+  eth/swap-macs)
 
 
 ;;; =============================================================================
