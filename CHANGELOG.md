@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2025-12-29
+
+### Changed
+- Updated clj-ebpf dependency from 0.7.4 to 0.7.5
+- Added new namespace requires in common.clj:
+  - `clj-ebpf.net.ipv4` - IPv4 packet helpers
+  - `clj-ebpf.net.tcp` - TCP packet helpers
+  - `clj-ebpf.net.udp` - UDP packet helpers
+- Added new 0.7.5 store helper delegations in common.clj:
+  - `ipv4-store-saddr` - Store IPv4 source address from register to packet
+  - `ipv4-store-daddr` - Store IPv4 destination address from register to packet
+  - `tcp-store-sport` - Store TCP source port from register to packet
+  - `tcp-store-dport` - Store TCP destination port from register to packet
+  - `udp-store-sport` - Store UDP source port from register to packet
+  - `udp-store-dport` - Store UDP destination port from register to packet
+
 ## [0.10.1] - 2025-12-29
 
 ### Changed
@@ -258,6 +274,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
+[0.10.2]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.8.0...v0.9.0
