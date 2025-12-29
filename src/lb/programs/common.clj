@@ -18,7 +18,7 @@
             [clj-ebpf.time :as time]))
 
 ;;; =============================================================================
-;;; BPF Constants (using clj-ebpf 0.7.5 DSL modules)
+;;; BPF Constants (using clj-ebpf 0.7.7 DSL modules)
 ;;; =============================================================================
 
 ;; XDP return codes (from clj-ebpf.dsl.xdp)
