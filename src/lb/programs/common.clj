@@ -15,7 +15,7 @@
             [clj-ebpf.time :as time]))
 
 ;;; =============================================================================
-;;; BPF Constants (using clj-ebpf 0.7.0 DSL modules)
+;;; BPF Constants (using clj-ebpf 0.7.4 DSL modules)
 ;;; =============================================================================
 
 ;; XDP return codes (from clj-ebpf.dsl.xdp)
@@ -252,6 +252,21 @@
   "Generate instructions to load a 16-byte IPv6 address with offset adjustment.
    Delegates to clj-ebpf.net.ipv6/build-load-ipv6-address-adjusted."
   ipv6/build-load-ipv6-address-adjusted)
+
+(def build-load-ipv6-src
+  "Generate instructions to load IPv6 source address from packet to stack.
+   Delegates to clj-ebpf.net.ipv6/build-load-ipv6-src."
+  ipv6/build-load-ipv6-src)
+
+(def build-load-ipv6-dst
+  "Generate instructions to load IPv6 destination address from packet to stack.
+   Delegates to clj-ebpf.net.ipv6/build-load-ipv6-dst."
+  ipv6/build-load-ipv6-dst)
+
+(def build-store-ipv6-address
+  "Generate instructions to store a 16-byte IPv6 address from stack to packet.
+   Delegates to clj-ebpf.net.ipv6/build-store-ipv6-address."
+  ipv6/build-store-ipv6-address)
 
 
 ;;; =============================================================================

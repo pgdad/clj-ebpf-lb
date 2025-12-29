@@ -978,17 +978,10 @@
        (dsl/add :r1 (+ net/ETH-HLEN common/IPV6-HLEN 20))
        (asm/jmp-reg :jgt :r1 :r8 :pass_unified)]
 
-      ;; Write new src_ip to IPv6 header
+      ;; Write new src_ip to IPv6 header using 0.7.4 helper
       [(dsl/mov-reg :r9 :r7)
-       (dsl/add :r9 net/ETH-HLEN)
-       (dsl/ldx :w :r1 :r10 -84)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 0))
-       (dsl/ldx :w :r1 :r10 -80)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 4))
-       (dsl/ldx :w :r1 :r10 -76)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 8))
-       (dsl/ldx :w :r1 :r10 -72)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 12))]
+       (dsl/add :r9 net/ETH-HLEN)]
+      (common/build-store-ipv6-address -84 :r9 common/IPV6-OFF-SRC)
 
       ;; Write new src_port to TCP header
       [(dsl/mov-reg :r0 :r7)
@@ -1095,16 +1088,9 @@
       [(dsl/mov-reg :r9 :r7)
        (dsl/add :r9 (+ net/ETH-HLEN common/IPV6-HLEN 8))  ; r9 = data + 62
        (asm/jmp-reg :jgt :r9 :r8 :pass_unified)           ; bounds check
-       (dsl/sub :r9 48)                                       ; r9 = data + 14 (IPv6 header)
-       ;; Write new src_ip (16 bytes at offset 8 in IPv6 header)
-       (dsl/ldx :w :r1 :r10 -84)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 0))
-       (dsl/ldx :w :r1 :r10 -80)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 4))
-       (dsl/ldx :w :r1 :r10 -76)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 8))
-       (dsl/ldx :w :r1 :r10 -72)
-       (dsl/stx :w :r9 :r1 (+ common/IPV6-OFF-SRC 12))]
+       (dsl/sub :r9 48)]                                  ; r9 = data + 14 (IPv6 header)
+      ;; Write new src_ip using 0.7.4 helper
+      (common/build-store-ipv6-address -84 :r9 common/IPV6-OFF-SRC)
 
       ;; Write new src_port to UDP header
       [(dsl/mov-reg :r0 :r7)
