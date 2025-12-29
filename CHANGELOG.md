@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.4] - 2025-12-29
+
+### Changed
+- Updated clj-ebpf dependency from 0.7.6 to 0.7.7
+- New helpers available in clj-ebpf 0.7.7 (for future use):
+  - IPv4: `decrement-ttl`, `load-ttl`, `store-ttl`
+  - TCP: `is-syn`, `is-ack`, `is-fin`, `is-rst`, `is-psh`, `is-syn-ack`, `is-syn-only`, `load-flags`, `parse-tcp-header`
+  - UDP: Port constants (DNS, DHCP, NTP, SNMP), `is-dns`, `is-dhcp-request`
+
 ## [0.10.3] - 2025-12-29
 
 ### Changed
@@ -279,6 +288,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
+[0.10.4]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.0...v0.10.1
