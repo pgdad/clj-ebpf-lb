@@ -9,13 +9,16 @@
             [clj-ebpf.net :as net]
             [clj-ebpf.net.bounds :as bounds]
             [clj-ebpf.net.checksum :as csum]
+            [clj-ebpf.net.ipv4 :as ipv4]
             [clj-ebpf.net.ipv6 :as ipv6]
+            [clj-ebpf.net.tcp :as tcp]
+            [clj-ebpf.net.udp :as udp]
             [clj-ebpf.rate-limit :as rl]
             [clj-ebpf.ringbuf :as rb]
             [clj-ebpf.time :as time]))
 
 ;;; =============================================================================
-;;; BPF Constants (using clj-ebpf 0.7.4 DSL modules)
+;;; BPF Constants (using clj-ebpf 0.7.5 DSL modules)
 ;;; =============================================================================
 
 ;; XDP return codes (from clj-ebpf.dsl.xdp)
@@ -267,6 +270,39 @@
   "Generate instructions to store a 16-byte IPv6 address from stack to packet.
    Delegates to clj-ebpf.net.ipv6/build-store-ipv6-address."
   ipv6/build-store-ipv6-address)
+
+;; IPv4 store helpers (new in 0.7.5)
+(def ipv4-store-saddr
+  "Store IPv4 source address from register to packet.
+   Delegates to clj-ebpf.net.ipv4/store-saddr."
+  ipv4/store-saddr)
+
+(def ipv4-store-daddr
+  "Store IPv4 destination address from register to packet.
+   Delegates to clj-ebpf.net.ipv4/store-daddr."
+  ipv4/store-daddr)
+
+;; TCP store helpers (new in 0.7.5)
+(def tcp-store-sport
+  "Store TCP source port from register to packet (network byte order).
+   Delegates to clj-ebpf.net.tcp/store-sport."
+  tcp/store-sport)
+
+(def tcp-store-dport
+  "Store TCP destination port from register to packet (network byte order).
+   Delegates to clj-ebpf.net.tcp/store-dport."
+  tcp/store-dport)
+
+;; UDP store helpers (new in 0.7.5)
+(def udp-store-sport
+  "Store UDP source port from register to packet (network byte order).
+   Delegates to clj-ebpf.net.udp/store-sport."
+  udp/store-sport)
+
+(def udp-store-dport
+  "Store UDP destination port from register to packet (network byte order).
+   Delegates to clj-ebpf.net.udp/store-dport."
+  udp/store-dport)
 
 
 ;;; =============================================================================
