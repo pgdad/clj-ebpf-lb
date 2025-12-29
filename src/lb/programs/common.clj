@@ -2,36 +2,40 @@
   "Common eBPF program fragments and DSL utilities shared between XDP and TC programs."
   (:require [clj-ebpf.core :as bpf]
             [clj-ebpf.dsl :as dsl]
+            [clj-ebpf.dsl.xdp :as dsl-xdp]
+            [clj-ebpf.dsl.tc :as dsl-tc]
             [clj-ebpf.maps.helpers :as mh]
             [clj-ebpf.memory :as mem]
+            [clj-ebpf.net :as net]
             [clj-ebpf.net.bounds :as bounds]
+            [clj-ebpf.net.checksum :as csum]
             [clj-ebpf.net.ipv6 :as ipv6]
             [clj-ebpf.rate-limit :as rl]
             [clj-ebpf.ringbuf :as rb]
             [clj-ebpf.time :as time]))
 
 ;;; =============================================================================
-;;; BPF Constants
+;;; BPF Constants (using clj-ebpf 0.7.0 DSL modules)
 ;;; =============================================================================
 
-;; XDP return codes (from bpf/xdp-action)
-(def XDP-ABORTED 0)
-(def XDP-DROP 1)
-(def XDP-PASS 2)
-(def XDP-TX 3)
-(def XDP-REDIRECT 4)
+;; XDP return codes (from clj-ebpf.dsl.xdp)
+(def XDP-ABORTED (dsl-xdp/xdp-action :aborted))
+(def XDP-DROP (dsl-xdp/xdp-action :drop))
+(def XDP-PASS (dsl-xdp/xdp-action :pass))
+(def XDP-TX (dsl-xdp/xdp-action :tx))
+(def XDP-REDIRECT (dsl-xdp/xdp-action :redirect))
 
-;; TC return codes
-(def TC-ACT-OK 0)
-(def TC-ACT-SHOT 2)
-(def TC-ACT-REDIRECT 7)
+;; TC return codes (from clj-ebpf.dsl.tc)
+(def TC-ACT-OK (dsl-tc/tc-action :ok))
+(def TC-ACT-SHOT (dsl-tc/tc-action :shot))
+(def TC-ACT-REDIRECT (dsl-tc/tc-action :redirect))
 
-;; Ethernet constants
-(def ETH-P-IP 0x0800)
-(def ETH-P-IPV6 0x86DD)
+;; Ethernet constants (from clj-ebpf.dsl.xdp)
+(def ETH-P-IP (:ipv4 dsl-xdp/ethertypes))
+(def ETH-P-IPV6 (:ipv6 dsl-xdp/ethertypes))
 (def ETH-P-IP-BE 0x0008)            ; IPv4 in big-endian (network byte order)
 (def ETH-P-IPV6-BE 0xDD86)          ; IPv6 in big-endian (network byte order)
-(def ETH-HLEN 14)
+(def ETH-HLEN dsl-xdp/ethernet-header-size)
 
 ;; IP protocol numbers
 (def IPPROTO-ICMP 1)
@@ -39,13 +43,13 @@
 (def IPPROTO-UDP 17)
 (def IPPROTO-ICMPV6 58)             ; ICMPv6 protocol number
 
-;; Header sizes - IPv4
-(def IP-HLEN-MIN 20)
-(def TCP-HLEN-MIN 20)
-(def UDP-HLEN 8)
+;; Header sizes - IPv4 (from clj-ebpf.dsl.xdp)
+(def IP-HLEN-MIN dsl-xdp/ipv4-header-min-size)
+(def TCP-HLEN-MIN dsl-xdp/tcp-header-min-size)
+(def UDP-HLEN dsl-xdp/udp-header-size)
 
-;; Header sizes - IPv6 (from clj-ebpf.net.ipv6)
-(def IPV6-HLEN ipv6/IPV6-HLEN)      ; Fixed IPv6 header size (no options in base header)
+;; Header sizes - IPv6 (from clj-ebpf.dsl.xdp and clj-ebpf.net.ipv6)
+(def IPV6-HLEN dsl-xdp/ipv6-header-size)  ; Fixed IPv6 header size (no options in base header)
 
 ;; IPv6 header field offsets (from clj-ebpf.net.ipv6)
 (def IPV6-OFF-NEXT-HEADER ipv6/IPV6-OFF-NEXT-HEADER) ; Next Header (protocol) at offset 6
@@ -84,10 +88,10 @@
 (def FNV1A-64-PRIME-LO 0x000001B3)        ; Lower 32 bits of 0x00000100000001B3
 (def FNV1A-64-PRIME-HI 0x00000100)        ; Upper 32 bits
 
-;; SKB (sk_buff) structure offsets for TC programs
-(def SKB-OFF-LEN 0)                        ; __u32 len at offset 0
-(def SKB-OFF-DATA 76)                      ; __u32 data at offset 76
-(def SKB-OFF-DATA-END 80)                  ; __u32 data_end at offset 80
+;; SKB (sk_buff) structure offsets for TC programs (from clj-ebpf.dsl.tc)
+(def SKB-OFF-LEN (dsl-tc/skb-offset :len))
+(def SKB-OFF-DATA (dsl-tc/skb-offset :data))
+(def SKB-OFF-DATA-END (dsl-tc/skb-offset :data-end))
 
 ;; BPF helper function IDs (map operations from clj-ebpf.maps.helpers)
 (def BPF-FUNC-map-lookup-elem mh/BPF-FUNC-map-lookup-elem)
@@ -118,9 +122,9 @@
 (def RATE-LIMIT-CONFIG-SRC 0)        ; Config map index for source rate limit
 (def RATE-LIMIT-CONFIG-BACKEND 1)    ; Config map index for backend rate limit
 
-;; BPF_F flags for checksum helpers
-(def BPF-F-RECOMPUTE-CSUM 0x01)
-(def BPF-F-PSEUDO-HDR 0x10)
+;; BPF_F flags for checksum helpers (from clj-ebpf.net.checksum)
+(def BPF-F-RECOMPUTE-CSUM csum/BPF-F-RECOMPUTE-CSUM)
+(def BPF-F-PSEUDO-HDR csum/BPF-F-PSEUDO-HDR)
 
 ;;; =============================================================================
 ;;; Register Allocation Convention
@@ -494,40 +498,31 @@
   mh/build-map-lookup-or-init)
 
 ;;; =============================================================================
-;;; Checksum Helpers
+;;; Checksum Helpers (delegating to clj-ebpf.net.checksum)
 ;;; =============================================================================
 
 (defn build-l3-csum-replace
   "Generate incremental IP checksum update.
+   Delegates to clj-ebpf.net.checksum/l3-csum-replace-4.
 
    skb-reg: Register containing skb/xdp_md pointer
    csum-off: Offset of checksum field in packet
-   old-val: Old value (in register)
-   new-val: New value (in register)"
+   old-reg: Old value (in register)
+   new-reg: New value (in register)"
   [skb-reg csum-off old-reg new-reg]
-  ;; bpf_l3_csum_replace(skb, offset, from, to, flags)
-  [(mov-reg :r1 skb-reg)
-   (mov-imm :r2 csum-off)
-   (mov-reg :r3 old-reg)
-   (mov-reg :r4 new-reg)
-   (mov-imm :r5 4)              ;; size = 4 bytes
-   (dsl/call BPF-FUNC-l3-csum-replace)])
+  (csum/l3-csum-replace-4 skb-reg csum-off old-reg new-reg))
 
 (defn build-l4-csum-replace
   "Generate incremental L4 (TCP/UDP) checksum update.
+   Delegates to clj-ebpf.net.checksum/l4-csum-replace-4.
 
    skb-reg: Register containing skb/xdp_md pointer
    csum-off: Offset of checksum field in packet
-   old-val: Old value (in register)
-   new-val: New value (in register)
+   old-reg: Old value (in register)
+   new-reg: New value (in register)
    flags: BPF_F flags (use BPF-F-PSEUDO-HDR for IP address changes)"
   [skb-reg csum-off old-reg new-reg flags]
-  [(mov-reg :r1 skb-reg)
-   (mov-imm :r2 csum-off)
-   (mov-reg :r3 old-reg)
-   (mov-reg :r4 new-reg)
-   (mov-imm :r5 flags)
-   (dsl/call BPF-FUNC-l4-csum-replace)])
+  (csum/l4-csum-replace-4 skb-reg csum-off old-reg new-reg (not= 0 (bit-and flags BPF-F-PSEUDO-HDR))))
 
 ;;; =============================================================================
 ;;; Ring Buffer Helpers (delegating to clj-ebpf.ringbuf)
