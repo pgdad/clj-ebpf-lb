@@ -18,6 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `build-load-ipv6-src` - Load IPv6 source address from packet to stack
   - `build-load-ipv6-dst` - Load IPv6 destination address from packet to stack
   - `build-store-ipv6-address` - Store IPv6 address from stack to packet
+- Updated all dependencies to latest versions:
+  - org.clojure/clojure: 1.12.0 → 1.12.4
+  - org.clojure/core.async: 1.6.681 → 1.8.741
+  - org.clojure/tools.cli: 1.1.230 → 1.2.245
+  - ch.qos.logback/logback-classic: 1.5.6 → 1.5.23
+  - io.github.clojure/tools.build: 0.10.6 → 0.10.7
 
 ## [0.10.0] - 2025-12-22
 

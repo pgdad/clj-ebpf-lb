@@ -1,13 +1,13 @@
 {:paths ["src" "resources"]
 
  :deps
- {org.clojure/clojure {:mvn/version "1.12.0"}
+ {org.clojure/clojure {:mvn/version "1.12.4"}
   org.clojars.pgdad/clj-ebpf {:mvn/version "0.7.4"}
-  org.clojure/core.async {:mvn/version "1.6.681"}
+  org.clojure/core.async {:mvn/version "1.8.741"}
   org.clojure/data.json {:mvn/version "2.5.1"}
-  org.clojure/tools.cli {:mvn/version "1.1.230"}
+  org.clojure/tools.cli {:mvn/version "1.2.245"}
   org.clojure/tools.logging {:mvn/version "1.3.0"}
-  ch.qos.logback/logback-classic {:mvn/version "1.5.6"}}
+  ch.qos.logback/logback-classic {:mvn/version "1.5.23"}}
 
  :aliases
  {:dev
@@ -44,6 +44,6 @@
 
   ;; Build jar for Clojars deployment
   :build
-  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.6"}
+  {:deps {io.github.clojure/tools.build {:mvn/version "0.10.7"}
           slipset/deps-deploy {:mvn/version "0.2.2"}}
    :ns-default build}}}
