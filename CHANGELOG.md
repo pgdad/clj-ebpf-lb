@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.5] - 2025-12-29
+
+### Changed
+- Updated clj-ebpf dependency from 0.7.7 to 0.7.8
+- Added `clj-ebpf.net.ethernet` namespace to common.clj
+- Added new ethernet helper delegations:
+  - `eth-is-ipv4` - Check if packet is IPv4 and jump to label
+  - `eth-is-ipv6` - Check if packet is IPv6 and jump to label
+  - `eth-is-not-ipv4` - Check if packet is NOT IPv4 and jump to label
+  - `eth-load-ethertype` - Load ethertype from Ethernet header
+  - `eth-parse-ethernet` - Parse Ethernet header with bounds check
+  - `eth-swap-macs` - Swap source and destination MACs
+
 ## [0.10.4] - 2025-12-29
 
 ### Changed
@@ -288,6 +301,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI/CD pipeline
 - Clojars publishing on version tags
 
+[0.10.5]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.4...v0.10.5
 [0.10.4]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.3...v0.10.4
 [0.10.3]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.2...v0.10.3
 [0.10.2]: https://github.com/pgdad/clj-ebpf-lb/compare/v0.10.1...v0.10.2
